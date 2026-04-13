@@ -182,6 +182,7 @@ dependencies = [
  "aster-network",
  "aster-rights",
  "aster-rights-proc",
+ "aster-rustshyper",
  "aster-softirq",
  "aster-systree",
  "aster-time",
@@ -305,6 +306,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.101",
+]
+
+[[package]]
+name = "aster-rustshyper"
+version = "0.1.0"
+dependencies = [
+ "aster-util",
+ "log",
+ "ostd",
+ "x86",
+ "x86_64",
 ]
 
 [[package]]

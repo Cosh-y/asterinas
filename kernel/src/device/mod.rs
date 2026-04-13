@@ -6,6 +6,7 @@ mod mem;
 pub mod misc;
 mod pty;
 mod registry;
+pub mod rustshyper;
 mod shm;
 pub mod tty;
 
@@ -141,6 +142,7 @@ pub fn init_in_first_process(ctx: &Context) -> Result<()> {
     tty::init_in_first_process()?;
     pty::init_in_first_process(&path_resolver, ctx)?;
     shm::init_in_first_process(&path_resolver, ctx)?;
+    rustshyper::init_in_first_process(&path_resolver)?;
     registry::init_in_first_process(&path_resolver)?;
 
     Ok(())

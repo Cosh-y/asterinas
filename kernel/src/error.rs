@@ -218,6 +218,25 @@ impl From<(Error, usize)> for Error {
     }
 }
 
+impl From<aster_rustshyper::Error> for Error {
+    fn from(err: aster_rustshyper::Error) -> Self {
+        use aster_rustshyper::Errno as RustShyperErrno;
+
+        let errno = match err.errno() {
+            RustShyperErrno::InvalidArgs => Errno::EINVAL,
+            RustShyperErrno::Fault => Errno::EFAULT,
+            RustShyperErrno::OstdError => Errno::EIO,
+            RustShyperErrno::NotFound => Errno::ENOENT,
+            RustShyperErrno::GuestRunFailed => Errno::EIO,
+        };
+
+        match err.message() {
+            Some(msg) => Error::with_message(errno, msg),
+            None => Error::new(errno),
+        }
+    }
+}
+
 impl From<aster_block::bio::BioEnqueueError> for Error {
     fn from(error: aster_block::bio::BioEnqueueError) -> Self {
         match error {
