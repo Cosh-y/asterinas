@@ -35,6 +35,7 @@ members = [
     "kernel/comps/mlsdisk",
     "kernel/comps/network",
     "kernel/comps/pci",
+    "kernel/comps/rustshyper",
     "kernel/comps/softirq",
     "kernel/comps/systree",
     "kernel/comps/time",

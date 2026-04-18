@@ -5,7 +5,7 @@
 use ostd::arch::virt::*;
 
 use super::error::*;
-use crate::emulate::apic::{Lapic, lapic_kick_to_service};
+use crate::emulate::apic::{lapic_kick_to_service, Lapic};
 
 const EVENT_TYPE_HWEXC: u32 = 3;
 const EVENT_TYPE_EXTINT: u32 = 0;
@@ -46,8 +46,9 @@ pub struct InterruptState {
 
 /// Handle a VM-exit caused by an external interrupt.
 ///
-/// Reads the VM-exit interruption-information field from the VMCS, extracts
-/// the vector, and dispatches it to the host interrupt subsystem.
+/// Reads the VM-exit interruption-information field from the VMCS and treats
+/// it as a notification that guest execution was preempted by a host external
+/// interrupt.
 pub fn handle_external_interrupt() -> Result<()> {
     let exit_intr_info = VmcsReadOnly32::VMEXIT_INTERRUPTION_INFO
         .read()
@@ -59,7 +60,11 @@ pub fn handle_external_interrupt() -> Result<()> {
 
     let vector = exit_intr_info & INTR_INFO_VECTOR_MASK;
 
-    // TODO: Deliver the physical interrupt to the host interrupt subsystem.
+    // RustShyper intentionally leaves "acknowledge interrupt on exit"
+    // disabled in the VMCS. That keeps the host interrupt pending across the
+    // VM-exit, so once the IRQ-disable guard around the VM-exit critical
+    // section is released, Asterinas can receive and process the interrupt via
+    // its normal trap/IRQ path without any explicit handoff from RustShyper.
     let _ = vector;
 
     Ok(())
@@ -170,18 +175,7 @@ pub fn inject_interrupt(
 /// Mirrors `handle_interrupt_window` from `injection.c`.
 pub fn handle_interrupt_window(lapic: &mut Lapic, intr: &mut InterruptState) -> Result<()> {
     disable_interrupt_window_exiting()?;
-
-    if !intr.pending {
-        return Ok(());
-    }
-    intr.pending = false;
-
-    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
-        .write(intr.intr_info)
-        .map_err(Error::from)?;
-    lapic_kick_to_service(lapic, (intr.intr_info & 0xFF) as u8);
-
-    Ok(())
+    try_inject_pending_interrupt(lapic, intr)
 }
 
 /// Queue a general-protection fault (#GP, vector 13) with error code 0.
@@ -205,6 +199,28 @@ fn vmx_interrupt_injectable() -> Result<bool> {
     let not_blocking = (interruptibility & (BLOCKING_BY_STI | BLOCKING_BY_MOV_SS)) == 0;
 
     Ok(if_set && not_blocking)
+}
+
+/// If a deferred interrupt is pending and the guest is now interruptible,
+/// write it into the VM-entry interruption-information field.
+pub fn try_inject_pending_interrupt(lapic: &mut Lapic, intr: &mut InterruptState) -> Result<()> {
+    if !intr.pending {
+        return Ok(());
+    }
+
+    if !vmx_interrupt_injectable()? {
+        enable_interrupt_window_exiting()?;
+        return Ok(());
+    }
+
+    intr.pending = false;
+    disable_interrupt_window_exiting()?;
+
+    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+        .write(intr.intr_info)
+        .map_err(Error::from)?;
+    lapic_kick_to_service(lapic, (intr.intr_info & INTR_INFO_VECTOR_MASK) as u8);
+    Ok(())
 }
 
 /// Enable interrupt-window exiting in the primary processor-based controls.

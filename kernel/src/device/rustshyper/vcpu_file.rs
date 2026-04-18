@@ -90,6 +90,11 @@ impl FileLike for VcpuFile {
                 self.vcpu.set_sregs(sregs)?;
                 Ok(0)
             }
+            cmd @ InjectInterrupt => {
+                let vector = cmd.read()?;
+                self.vcpu.inject_interrupt(vector)?;
+                Ok(0)
+            }
             _ => {
                 return_errno_with_message!(Errno::ENOTTY, "unknown VCPU ioctl command");
             }

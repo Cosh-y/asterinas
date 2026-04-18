@@ -2,7 +2,7 @@
 
 //! VM file descriptor implementation
 
-use aster_rustshyper::vm::{Vm, MemoryRegion};
+use aster_rustshyper::vm::{MemoryRegion, Vm};
 
 use super::{ioctl_defs, vcpu_file::VcpuFile};
 use crate::{
@@ -87,6 +87,11 @@ impl FileLike for VmFile {
                 let region = MemoryRegion::try_from(user_region)?;
 
                 self.vm.set_memory_region(region)?;
+                Ok(0)
+            }
+            cmd @ InjectIrq => {
+                let irq = cmd.read()?;
+                self.vm.inject_irq_line(irq as usize)?;
                 Ok(0)
             }
             cmd @ GetDirtyLog => {

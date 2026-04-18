@@ -14,15 +14,25 @@ use x86::vmx::vmcs::control::{
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
 use ostd::{
-    arch::{virt::*, cpu::cpuid::cpuid},
-    mm::{Frame, FrameAllocOptions, HasPaddr, VmIo, PAGE_SIZE},
+    arch::{cpu::cpuid::cpuid, read_tsc, tsc_freq, virt::*},
+    mm::{
+        kspace::{read_bytes_from_paddr, read_u64_from_paddr},
+        Frame, FrameAllocOptions, HasPaddr, VmIo, PAGE_SIZE,
+    },
     sync::Mutex,
 };
 
 use super::{
-    emulate::apic::{ApicTimer, Ioapic, Lapic, TscState},
+    emulate::apic::{
+        ioapic_kick_irq, lapic_check_pending_vector, lapic_on_timer_expire, lapic_set_irr,
+        lapic_timer_deadline, lapic_timer_deadline_tsc, ApicTimer, Ioapic, Lapic,
+        TimerExpireAction, TscState, IOAPIC_NUM_PINS,
+    },
     error::*,
-    interrupt::{ExceptionState, InterruptState},
+    interrupt::{
+        has_pending_exception, inject_interrupt, inject_pending_exception,
+        try_inject_pending_interrupt, ExceptionState, InterruptState,
+    },
 };
 
 const X86_CR0_ET: u64 = 1 << 4;
@@ -108,6 +118,7 @@ pub struct VcpuState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GuestMsrState {
+    pub apic_base: u64,
     pub efer: u64,
     pub pat: u64,
     pub fs_base: u64,
@@ -123,6 +134,7 @@ pub struct GuestMsrState {
 impl Default for GuestMsrState {
     fn default() -> Self {
         Self {
+            apic_base: (0xFEE0_0000_u64) | (1 << 11) | (1 << 8),
             efer: Msr::IA32_EFER.read(),
             pat: Msr::IA32_PAT.read(),
             fs_base: 0,
@@ -145,7 +157,10 @@ impl Vm {
             memory_regions: Mutex::new(BTreeMap::new()),
             ept: Mutex::new(EptPageTable::new()?),
             vcpus: Mutex::new(BTreeMap::new()),
-            ioapic: Mutex::new(Ioapic::default()),
+            ioapic: Mutex::new(Ioapic {
+                id: 1,
+                ..Ioapic::default()
+            }),
             next_vcpu_id: AtomicU32::new(0),
         }))
     }
@@ -283,6 +298,48 @@ impl Vm {
             .cloned()
             .ok_or_else(|| Error::with_message(Errno::InvalidArgs, "VCPU not found"))
     }
+
+    /// Inject an IRQ line through the emulated I/O APIC.
+    pub fn inject_irq_line(&self, irq: usize) -> Result<()> {
+        if irq >= IOAPIC_NUM_PINS {
+            return Err(Error::with_message(
+                Errno::InvalidArgs,
+                "IRQ line is out of range for the emulated I/O APIC",
+            ));
+        }
+
+        let vcpus: alloc::vec::Vec<_> = self
+            .vcpus
+            .lock()
+            .iter()
+            .map(|(&vcpu_id, vcpu)| (vcpu_id, vcpu.clone()))
+            .collect();
+
+        if vcpus.is_empty() {
+            return Err(Error::with_message(
+                Errno::InvalidArgs,
+                "cannot inject IRQ without any vCPU",
+            ));
+        }
+
+        let mut ioapic = self.ioapic.lock();
+        let mut state_guards: alloc::vec::Vec<_> = vcpus
+            .iter()
+            .map(|(vcpu_id, vcpu)| (*vcpu_id, vcpu.state.lock()))
+            .collect();
+        let lapic_ids: alloc::vec::Vec<_> = state_guards
+            .iter()
+            .map(|(_, state)| state.lapic.id)
+            .collect();
+        let mut lapics: alloc::vec::Vec<_> = lapic_ids
+            .iter()
+            .zip(state_guards.iter_mut())
+            .map(|(lapic_id, (_, state))| (lapic_id, &mut state.lapic))
+            .collect();
+
+        ioapic_kick_irq(&mut ioapic, &mut lapics, irq);
+        Ok(())
+    }
 }
 
 impl Vcpu {
@@ -307,6 +364,13 @@ impl Vcpu {
         state.initialized = false;
         state.launched = false;
         state.msrs = GuestMsrState::default();
+        if id != 0 {
+            state.msrs.apic_base &= !(1 << 8);
+        }
+        state.lapic.id = id;
+        state.lapic.ldr = (1_u32.checked_shl(id).unwrap_or(0)) << 24;
+        state.apic_timer.lvt_timer_bits = 1 << 16;
+        state.tsc.multiplier = (Msr::IA32_VMX_MISC.read() & 0x1f) as u8;
 
         Ok(Self {
             id,
@@ -333,9 +397,13 @@ impl Vcpu {
 
         use super::handler::vmexit_handler;
         loop {
+            vmptrld(self.vmcs_phys)?;
+            self.prepare_pending_events()?;
+            let _irq_guard = ostd::irq::disable_local();
+            self.prepare_guest_timing_before_entry()?;
             self.vmlaunch_or_vmresume()?;
-
             let exit_info = exit_info().map_err(Error::from)?;
+            self.note_vmexit_tsc()?;
             if let Some(run_state) = vmexit_handler(self, &exit_info)? {
                 return Ok(run_state);
             }
@@ -486,6 +554,7 @@ impl Vcpu {
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
         VmcsGuest64::IA32_PAT.write(msrs.pat)?;
         VmcsGuest64::IA32_EFER.write(msrs.efer)?;
+        VmcsControl64::TSC_OFFSET.write(0)?;
         Ok(())
     }
 
@@ -494,7 +563,10 @@ impl Vcpu {
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
-            (PinbasedControls::NMI_EXITING | PinbasedControls::VMX_PREEMPTION_TIMER).bits(),
+            (PinbasedControls::from_bits_truncate(1 << 0)
+                | PinbasedControls::NMI_EXITING
+                | PinbasedControls::VMX_PREEMPTION_TIMER)
+                .bits(),
             0,
         )?;
 
@@ -577,6 +649,20 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Queue a virtual interrupt for this vCPU's LAPIC.
+    pub fn inject_interrupt(&self, vector: u32) -> Result<()> {
+        if !(32..256).contains(&vector) {
+            return Err(Error::with_message(
+                Errno::InvalidArgs,
+                "interrupt vector must be in the external-interrupt range [32, 255]",
+            ));
+        }
+
+        let mut state = self.state.lock();
+        lapic_set_irr(&mut state.lapic, vector as u8);
+        Ok(())
+    }
+
     /// Gets general purpose registers
     pub fn get_regs(&self) -> Result<VcpuRegs> {
         let state = self.state.lock();
@@ -646,6 +732,222 @@ impl Vcpu {
         state.regs.rdx = edx_out as u64;
         Ok(())
     }
+
+    /// Record Guest TSC value at VM exit.
+    pub(crate) fn note_vmexit_tsc(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
+        Ok(())
+    }
+
+    /// Recompute the VMCS TSC offset right before VM-entry so the guest TSC
+    /// resumes from the last frozen guest-visible value instead of jumping by
+    /// the host time spent handling VM exits.
+    pub(crate) fn freeze_guest_tsc(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        state.tsc.tsc_offset = state.tsc.tsc_physical.wrapping_sub(read_tsc());
+        Ok(())
+    }
+
+    pub(crate) fn prepare_guest_timing_before_entry(&self) -> Result<()> {
+        self.freeze_guest_tsc()?;
+
+        let state = self.state.lock();
+        let preemption_timer = compute_preemption_timer_value(&state);
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(preemption_timer)?;
+        VmcsControl64::TSC_OFFSET.write(state.tsc.tsc_offset)?;
+        Ok(())
+    }
+
+    pub(crate) fn handle_lapic_timer_write_effect(
+        &self,
+        effect: super::emulate::apic::LapicWriteEffect,
+    ) -> Result<()> {
+        let mut state = self.state.lock();
+        match effect {
+            super::emulate::apic::LapicWriteEffect::None => {}
+            super::emulate::apic::LapicWriteEffect::StartTimer => {
+                start_apic_timer_locked(&mut state);
+            }
+            super::emulate::apic::LapicWriteEffect::StartTimerDeadline => {
+                start_apic_timer_deadline_locked(&mut state);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_preemption_timer_expire(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        if !state.tsc.activated {
+            return Ok(());
+        }
+
+        let tsc = state.tsc;
+        let action = lapic_on_timer_expire(&mut state.lapic, &mut state.apic_timer, &tsc);
+        match action {
+            TimerExpireAction::Rearm(deadline) => timer_activate_locked(&mut state, deadline),
+            TimerExpireAction::Deactivate => timer_deactivate_locked(&mut state),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn translate_guest_gpa(&self, gpa: u64) -> Result<u64> {
+        let vm = self
+            .vm
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
+        vm.ept
+            .lock()
+            .translate(gpa)
+            .map_err(|_| Error::with_message(Errno::Fault, "guest GPA is not mapped in EPT"))
+    }
+
+    pub(crate) fn translate_guest_gva(&self, gva: u64) -> Result<u64> {
+        const PTE_PRESENT: u64 = 1 << 0;
+        const PTE_HUGE: u64 = 1 << 7;
+        const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+        const PAGE_2M_MASK: u64 = (1 << 21) - 1;
+        const PAGE_1G_MASK: u64 = (1 << 30) - 1;
+
+        let cr0 = VmcsGuestNW::CR0.read().map_err(Error::from)? as u64;
+        if (cr0 & (1 << 31)) == 0 {
+            return Ok(gva);
+        }
+
+        let cr3 = (VmcsGuestNW::CR3.read().map_err(Error::from)? as u64) & !0xfff;
+        let pml4e = self.read_guest_phys_u64(cr3 + (((gva >> 39) & 0x1ff) * 8))?;
+        if (pml4e & PTE_PRESENT) == 0 {
+            return Err(Error::with_message(
+                Errno::Fault,
+                "guest PML4 entry is not present",
+            ));
+        }
+
+        let pdpte =
+            self.read_guest_phys_u64((pml4e & PTE_ADDR_MASK) + (((gva >> 30) & 0x1ff) * 8))?;
+        if (pdpte & PTE_PRESENT) == 0 {
+            return Err(Error::with_message(
+                Errno::Fault,
+                "guest PDPT entry is not present",
+            ));
+        }
+        if (pdpte & PTE_HUGE) != 0 {
+            return Ok((pdpte & PTE_ADDR_MASK) | (gva & PAGE_1G_MASK));
+        }
+
+        let pde =
+            self.read_guest_phys_u64((pdpte & PTE_ADDR_MASK) + (((gva >> 21) & 0x1ff) * 8))?;
+        if (pde & PTE_PRESENT) == 0 {
+            return Err(Error::with_message(
+                Errno::Fault,
+                "guest PD entry is not present",
+            ));
+        }
+        if (pde & PTE_HUGE) != 0 {
+            return Ok((pde & PTE_ADDR_MASK) | (gva & PAGE_2M_MASK));
+        }
+
+        let pte = self.read_guest_phys_u64((pde & PTE_ADDR_MASK) + (((gva >> 12) & 0x1ff) * 8))?;
+        if (pte & PTE_PRESENT) == 0 {
+            return Err(Error::with_message(
+                Errno::Fault,
+                "guest PT entry is not present",
+            ));
+        }
+
+        Ok((pte & PTE_ADDR_MASK) | (gva & 0xfff))
+    }
+
+    pub(crate) fn read_guest_memory(&self, gva: u64, buf: &mut [u8]) -> Result<()> {
+        for (index, byte) in buf.iter_mut().enumerate() {
+            let gpa = self.translate_guest_gva(gva.wrapping_add(index as u64))?;
+            let hpa = self.translate_guest_gpa(gpa)?;
+            read_bytes_from_paddr(hpa as usize, core::slice::from_mut(byte));
+        }
+        Ok(())
+    }
+
+    fn read_guest_phys_u64(&self, gpa: u64) -> Result<u64> {
+        let hpa = self.translate_guest_gpa(gpa)?;
+        Ok(read_u64_from_paddr(hpa as usize))
+    }
+
+    fn prepare_pending_events(&self) -> Result<()> {
+        let mut state = self.state.lock();
+
+        if has_pending_exception(&state.exception) {
+            let mut perf = [0_u32; 32];
+            inject_pending_exception(&mut state.exception, &mut perf)?;
+            return Ok(());
+        }
+
+        try_inject_pending_interrupt(&mut state.lapic, &mut state.interrupt)?;
+        if state.interrupt.pending {
+            return Ok(());
+        }
+
+        if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
+            let mut perf = [0_u32; 224];
+            inject_interrupt(
+                &mut state.lapic,
+                &mut state.interrupt,
+                &mut perf,
+                u32::from(vector),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn timer_deactivate_locked(state: &mut VcpuState) {
+    state.tsc.activated = false;
+    state.tsc.ddl_physical = 0;
+}
+
+fn timer_activate_locked(state: &mut VcpuState, deadline_ticks: u64) {
+    state.tsc.activated = true;
+    if deadline_ticks > state.tsc.tsc_physical {
+        state.tsc.ddl_physical = deadline_ticks;
+    } else {
+        let tsc = state.tsc;
+        let action = lapic_on_timer_expire(&mut state.lapic, &mut state.apic_timer, &tsc);
+        match action {
+            TimerExpireAction::Rearm(next_deadline) => timer_activate_locked(state, next_deadline),
+            TimerExpireAction::Deactivate => timer_deactivate_locked(state),
+        }
+    }
+}
+
+fn start_apic_timer_locked(state: &mut VcpuState) {
+    if let Some(deadline) = lapic_timer_deadline(&state.apic_timer, &state.tsc) {
+        timer_activate_locked(state, deadline);
+    } else {
+        timer_deactivate_locked(state);
+    }
+}
+
+fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
+    if let Some(deadline) = lapic_timer_deadline_tsc(&state.apic_timer, state.msrs.tsc_deadline) {
+        timer_activate_locked(state, deadline);
+    } else {
+        timer_deactivate_locked(state);
+    }
+}
+
+fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
+    let ticks = if state.tsc.activated {
+        state
+            .tsc
+            .ddl_physical
+            .saturating_sub(state.tsc.tsc_physical)
+    } else {
+        tsc_freq() / 20
+    };
+
+    let shifted = ticks >> state.tsc.multiplier;
+    let shifted = if shifted == 0 { 1 } else { shifted };
+    shifted.min(u64::from(u32::MAX)) as u32
 }
 
 fn sanitize_guest_cr0(value: u64) -> u64 {

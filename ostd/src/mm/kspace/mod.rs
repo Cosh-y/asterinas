@@ -46,19 +46,19 @@ use spin::Once;
 mod test;
 
 use super::{
-    Frame, HasSize, Paddr, PagingConstsTrait, Vaddr,
     frame::{
+        meta::{mapping, AnyFrameMeta, MetaPageMeta},
         Segment,
-        meta::{AnyFrameMeta, MetaPageMeta, mapping},
     },
     page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
     page_table::{PageTable, PageTableConfig},
+    Frame, HasSize, Paddr, PagingConstsTrait, Vaddr,
 };
 use crate::{
     arch::mm::{PageTableEntry, PagingConsts},
     boot::memory_region::MemoryRegionType,
     const_assert, info,
-    mm::{HasPaddr, PAGE_SIZE, PagingLevel, frame::FrameRef, page_table::largest_pages},
+    mm::{frame::FrameRef, page_table::largest_pages, HasPaddr, PagingLevel, PAGE_SIZE},
     task::disable_preempt,
 };
 
@@ -129,6 +129,22 @@ pub const LINEAR_MAPPING_VADDR_RANGE: Range<Vaddr> = LINEAR_MAPPING_BASE_VADDR..
 pub fn paddr_to_vaddr(pa: Paddr) -> usize {
     debug_assert!(pa < VMALLOC_BASE_VADDR - LINEAR_MAPPING_BASE_VADDR);
     pa + LINEAR_MAPPING_BASE_VADDR
+}
+
+/// Reads bytes from a physical address through the kernel linear mapping.
+pub fn read_bytes_from_paddr(pa: Paddr, buf: &mut [u8]) {
+    let src = paddr_to_vaddr(pa) as *const u8;
+    // SAFETY: The kernel linear mapping makes the physical range readable in kernel space.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
+    }
+}
+
+/// Reads a little-endian `u64` from a physical address through the kernel linear mapping.
+pub fn read_u64_from_paddr(pa: Paddr) -> u64 {
+    let src = paddr_to_vaddr(pa) as *const u64;
+    // SAFETY: The kernel linear mapping makes the physical address readable in kernel space.
+    unsafe { core::ptr::read_unaligned(src) }
 }
 
 /// The kernel page table instance.

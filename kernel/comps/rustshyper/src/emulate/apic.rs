@@ -73,10 +73,16 @@ pub struct ApicTimer {
 }
 
 /// TSC (time-stamp counter) tracking for APIC timer.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct TscState {
     pub activated: bool,
+    /// From VMX_MISC MSR: the VMX-preemption timer counts down by 1 every `multiplier` TSC ticks.
+    pub multiplier: u8,
+    pub tsc_offset: u64,
+    /// Frozen guest-visible TSC value. It is updated on VM-exit and used as
+    /// the resume point when the vCPU next enters the guest.
     pub tsc_physical: u64,
+    /// Deadline in the same frozen guest-TSC domain as `tsc_physical`.
     pub ddl_physical: u64,
 }
 
@@ -240,6 +246,27 @@ fn is_deadline_mode(timer: &ApicTimer) -> bool {
     ((timer.lvt_timer_bits >> 17) & 0b11) == 2
 }
 
+/// Compute the next deadline for one-shot / periodic APIC timer modes.
+pub fn lapic_timer_deadline(timer: &ApicTimer, tsc: &TscState) -> Option<u64> {
+    if timer.initial_count == 0 || is_deadline_mode(timer) {
+        return None;
+    }
+
+    Some(
+        tsc.tsc_physical
+            .wrapping_add((timer.initial_count as u64) << timer.divide_shift),
+    )
+}
+
+/// Compute the deadline for TSC-deadline mode.
+pub fn lapic_timer_deadline_tsc(timer: &ApicTimer, tsc_deadline: u64) -> Option<u64> {
+    if tsc_deadline == 0 || !is_deadline_mode(timer) {
+        return None;
+    }
+
+    Some(tsc_deadline)
+}
+
 /// Called by the timer subsystem when the APIC timer deadline is reached.
 ///
 /// Sets the IRR bit for the configured timer vector and, for periodic mode,
@@ -325,7 +352,7 @@ pub fn emulate_lapic_read(
             lapic.icr[((o - XLAPIC_RW_ICR_BASE) / 16) as usize] as u64
         }
         o if o >= XLAPIC_RO_TMR_BASE && o < XLAPIC_RO_TMR_BASE + XLAPIC_RO_TMR_SIZE => {
-            lapic.icr[((o - XLAPIC_RO_TMR_BASE) / 16) as usize] as u64
+            lapic.tmr[((o - XLAPIC_RO_TMR_BASE) / 16) as usize] as u64
         }
         _ => {
             log::warn!("MMIO.xLAPIC: Read at offset {:#05x} not supported", offset);
@@ -391,7 +418,7 @@ pub fn emulate_lapic_write(
                 log::debug!(
                     "vLAPIC: LDR set to {:#010x}, LAPIC.ID={:#010x}",
                     lapic.ldr,
-                    lapic.id >> 24
+                    lapic.id
                 );
             }
         }
@@ -505,7 +532,6 @@ pub fn emulate_ioapic_write(ioapic: &mut Ioapic, offset: u64, value: u64) -> boo
 
 /// Deliver an IRQ from the I/O APIC to the appropriate vCPU's LAPIC.
 ///
-/// Mirrors `ioapic_kick_irq` from the C implementation.
 /// `lapics` is a slice of (`lapic_id`, mutable `Lapic`) pairs, one per vCPU.
 pub fn ioapic_kick_irq(ioapic: &mut Ioapic, lapics: &mut [(&u32, &mut Lapic)], irq: usize) {
     if irq >= IOAPIC_NUM_PINS {
@@ -537,7 +563,7 @@ pub fn ioapic_kick_irq(ioapic: &mut Ioapic, lapics: &mut [(&u32, &mut Lapic)], i
     if entry.dest_mode == 0 {
         // Physical mode: send to a specific LAPIC
         for (lapic_id, lapic) in lapics.iter_mut() {
-            if (**lapic_id >> 24) as u8 == destination {
+            if **lapic_id as u8 == destination {
                 lapic_set_irr(lapic, vec);
                 break;
             }

@@ -1,10 +1,18 @@
 use ostd::arch::virt::*;
 
 use super::{
+    emulate::apic::{
+        emulate_ioapic_read, emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
+        IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
+    },
     error::*,
     vm::{GuestMsrState, Vcpu},
 };
-use crate::interrupt::{handle_external_interrupt, inject_gp_fault, inject_pending_exception};
+use crate::interrupt::{
+    handle_external_interrupt, handle_interrupt_window, inject_gp_fault, inject_pending_exception,
+};
+
+const MAX_INSN_LENGTH: usize = 15;
 
 pub const COM1: u16 = 0x3F8;
 pub const COM1_MAX: u16 = COM1 + 8;
@@ -21,6 +29,8 @@ const X86_CR4_PAE: u64 = 1 << 5;
 const X86_CR4_VMXE: u64 = 1 << 13;
 const X86_EFER_LMA: u64 = 1 << 10;
 
+const MSR_IA32_TSC: u32 = 0x0000_0010;
+const MSR_IA32_APIC_BASE: u32 = 0x0000_001B;
 const MSR_IA32_PAT: u32 = 0x0000_0277;
 const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
@@ -68,6 +78,13 @@ pub struct RunStateMessage {
     pub mmio: MmioInfo,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MmioInstruction {
+    is_read: bool,
+    size: u8,
+    reg: u8,
+}
+
 pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<RunStateMessage>> {
     if exit_info.entry_failure {
         return Err(Error::with_message(
@@ -84,7 +101,11 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
         Ok(VmxExitReason::TRIPLE_FAULT) | Ok(VmxExitReason::HLT) => {
             Ok(Some(build_run_state(exit_info)))
         }
-        Ok(VmxExitReason::INTERRUPT_WINDOW) => Ok(None),
+        Ok(VmxExitReason::INTERRUPT_WINDOW) => {
+            let mut state = vcpu.state.lock();
+            handle_interrupt_window(&mut state.lapic, &mut state.interrupt)?;
+            Ok(None)
+        }
         Ok(VmxExitReason::CPUID) => {
             vcpu.emulate_cpuid()?;
             advance_guest_rip()?;
@@ -107,8 +128,17 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             Ok(None)
         }
         Ok(VmxExitReason::IO_INSTRUCTION) => Ok(Some(build_io_run_state(vcpu, exit_info))),
-        Ok(VmxExitReason::EPT_VIOLATION) => Ok(Some(build_mmio_run_state(exit_info))),
-        Ok(VmxExitReason::PREEMPTION_TIMER) => Ok(None),
+        Ok(VmxExitReason::EPT_VIOLATION) => {
+            if emulate_apic_mmio(vcpu, exit_info.guest_phys_addr)? {
+                Ok(None)
+            } else {
+                Ok(Some(build_mmio_run_state(exit_info)))
+            }
+        }
+        Ok(VmxExitReason::PREEMPTION_TIMER) => {
+            vcpu.handle_preemption_timer_expire()?;
+            Ok(None)
+        }
         Ok(_) => Ok(Some(build_run_state(exit_info))),
         Err(_) => Ok(Some(build_run_state(exit_info))),
     }
@@ -284,6 +314,13 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
     if is_write {
         let msr_value = (state.regs.rax as u32 as u64) | ((state.regs.rdx as u32 as u64) << 32);
         match msr_index {
+            MSR_IA32_TSC => {
+                state.tsc.tsc_physical = msr_value;
+                state.tsc.tsc_offset = msr_value.wrapping_sub(ostd::arch::read_tsc());
+            }
+            MSR_IA32_APIC_BASE => {
+                state.msrs.apic_base = sanitize_apic_base(msr_value);
+            }
             MSR_EFER => state.msrs.efer = msr_value,
             MSR_IA32_PAT => state.msrs.pat = msr_value,
             MSR_FS_BASE => state.msrs.fs_base = msr_value,
@@ -293,7 +330,14 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
             MSR_LSTAR => state.msrs.lstar = msr_value,
             MSR_CSTAR => state.msrs.cstar = msr_value,
             MSR_SYSCALL_MASK => state.msrs.syscall_mask = msr_value,
-            MSR_IA32_TSC_DEADLINE => state.msrs.tsc_deadline = msr_value,
+            MSR_IA32_TSC_DEADLINE => {
+                state.msrs.tsc_deadline = msr_value;
+                drop(state);
+                vcpu.handle_lapic_timer_write_effect(
+                    crate::emulate::apic::LapicWriteEffect::StartTimerDeadline,
+                )?;
+                return Ok(());
+            }
             _ => {
                 log::warn!("rustshyper: unrecognized WRMSR #{:#x}", msr_index);
                 inject_gp_fault(&mut state.exception);
@@ -308,6 +352,8 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
     }
 
     let msr_value = match msr_index {
+        MSR_IA32_TSC => state.tsc.tsc_physical,
+        MSR_IA32_APIC_BASE => state.msrs.apic_base,
         MSR_EFER => state.msrs.efer,
         MSR_IA32_PAT => state.msrs.pat,
         MSR_FS_BASE => state.msrs.fs_base,
@@ -345,6 +391,13 @@ fn update_guest_msr_vmcs(msrs: &GuestMsrState) -> Result<()> {
         .write(msrs.gs_base as usize)
         .map_err(Error::from)?;
     Ok(())
+}
+
+fn sanitize_apic_base(value: u64) -> u64 {
+    const APIC_BASE_BSP: u64 = 1 << 8;
+    const APIC_BASE_ENABLE: u64 = 1 << 11;
+
+    LAPIC_BASE | APIC_BASE_ENABLE | (value & APIC_BASE_BSP)
 }
 
 fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
@@ -411,4 +464,158 @@ fn write_gpr(regs: &mut VcpuRegs, index: u8, size: u8, value: u64) {
         4 => value & 0xffff_ffff,
         _ => value,
     };
+}
+
+fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
+    let is_lapic = (LAPIC_BASE..(LAPIC_BASE + LAPIC_SIZE)).contains(&fault_gpa);
+    let is_ioapic = (IOAPIC_BASE..(IOAPIC_BASE + IOAPIC_SIZE)).contains(&fault_gpa);
+    if !is_lapic && !is_ioapic {
+        return Ok(false);
+    }
+
+    let guest_rip = VmcsGuestNW::RIP.read().map_err(Error::from)? as u64;
+    let mut insn_bytes = [0_u8; MAX_INSN_LENGTH];
+    vcpu.read_guest_memory(guest_rip, &mut insn_bytes)?;
+    let Some(insn) = decode_mmio_instruction(&insn_bytes) else {
+        return Ok(false);
+    };
+
+    if is_lapic {
+        if !emulate_lapic_mmio(vcpu, fault_gpa, insn)? {
+            return Ok(false);
+        }
+    } else {
+        if !emulate_ioapic_mmio(vcpu, fault_gpa, insn)? {
+            return Ok(false);
+        }
+    }
+
+    advance_guest_rip()?;
+    Ok(true)
+}
+
+fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Result<bool> {
+    let offset = fault_gpa - LAPIC_BASE;
+    if insn.is_read {
+        let mut state = vcpu.state.lock();
+        let (value, ok) = emulate_lapic_read(&state.lapic, &state.apic_timer, &state.tsc, offset);
+        if !ok {
+            return Ok(false);
+        }
+        write_gpr(&mut state.regs, insn.reg, insn.size, value);
+        return Ok(true);
+    }
+
+    let value = {
+        let state = vcpu.state.lock();
+        read_gpr(&state.regs, insn.reg, insn.size)
+    };
+    let vm = vcpu
+        .vm
+        .upgrade()
+        .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
+    let mut ioapic = vm.ioapic.lock();
+    let effect = {
+        let mut state = vcpu.state.lock();
+        let (effect, ok) = emulate_lapic_write(
+            &mut state.lapic,
+            &mut state.apic_timer,
+            &mut ioapic,
+            offset,
+            value,
+        );
+        if !ok {
+            return Ok(false);
+        }
+        effect
+    };
+    drop(ioapic);
+    vcpu.handle_lapic_timer_write_effect(effect)?;
+    Ok(true)
+}
+
+fn emulate_ioapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Result<bool> {
+    let offset = fault_gpa - IOAPIC_BASE;
+    let vm = vcpu
+        .vm
+        .upgrade()
+        .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
+    let mut ioapic = vm.ioapic.lock();
+
+    if insn.is_read {
+        let (value, ok) = emulate_ioapic_read(&ioapic, offset);
+        if !ok {
+            return Ok(false);
+        }
+        let mut state = vcpu.state.lock();
+        write_gpr(&mut state.regs, insn.reg, insn.size, value);
+        return Ok(true);
+    }
+
+    let value = {
+        let state = vcpu.state.lock();
+        read_gpr(&state.regs, insn.reg, insn.size)
+    };
+    if !emulate_ioapic_write(&mut ioapic, offset, value) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn decode_mmio_instruction(bytes: &[u8; MAX_INSN_LENGTH]) -> Option<MmioInstruction> {
+    let mut ptr = 0usize;
+    let mut op_size_16 = false;
+    let mut rex = 0u8;
+    let mut rex_w = false;
+
+    while ptr < bytes.len() {
+        let byte = bytes[ptr];
+        if byte == 0x66 {
+            op_size_16 = true;
+            ptr += 1;
+        } else if (byte & 0xf0) == 0x40 {
+            rex = byte;
+            rex_w = (byte & 0x08) != 0;
+            ptr += 1;
+        } else {
+            break;
+        }
+    }
+
+    let opcode = *bytes.get(ptr)?;
+    ptr += 1;
+
+    let (is_read, size) = match opcode {
+        0x88 => (false, 1),
+        0x8a => (true, 1),
+        0x89 => (
+            false,
+            if rex_w {
+                8
+            } else if op_size_16 {
+                2
+            } else {
+                4
+            },
+        ),
+        0x8b => (
+            true,
+            if rex_w {
+                8
+            } else if op_size_16 {
+                2
+            } else {
+                4
+            },
+        ),
+        _ => return None,
+    };
+
+    let modrm = *bytes.get(ptr)?;
+    let mut reg = (modrm >> 3) & 0x7;
+    if (rex & 0x04) != 0 {
+        reg |= 0x8;
+    }
+
+    Some(MmioInstruction { is_read, size, reg })
 }

@@ -9,6 +9,7 @@ pub(super) type CheckExtension = ioc!(RSH_CHECK_EXTENSION, b'H', 0x03, InData<i3
 
 // VM ioctls
 pub(super) type CreateVcpu = ioc!(RSH_CREATE_VCPU, b'H', 0x41, InData<u32>);
+pub(super) type InjectIrq = ioc!(RSH_INJECT_IRQ, b'H', 0x43, InData<u32>);
 pub(super) type SetUserMemoryRegion = ioc!(
     RSH_SET_USER_MEMORY_REGION,
     b'H',
@@ -23,6 +24,7 @@ pub(super) type GetRegs = ioc!(RSH_GET_REGS, b'H', 0x81, OutData<VcpuRegs>);
 pub(super) type SetRegs = ioc!(RSH_SET_REGS, b'H', 0x82, InData<VcpuRegs>);
 pub(super) type GetSregs = ioc!(RSH_GET_SREGS, b'H', 0x83, OutData<VcpuSregs>);
 pub(super) type SetSregs = ioc!(RSH_SET_SREGS, b'H', 0x84, InData<VcpuSregs>);
+pub(super) type InjectInterrupt = ioc!(RSH_INJECT_INTERRUPT, b'H', 0x85, InData<u32>);
 
 // Re-export types from parent module
 pub(super) use super::{VcpuRegs, VcpuSregs};
