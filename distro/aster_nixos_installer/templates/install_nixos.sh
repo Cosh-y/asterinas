@@ -152,4 +152,12 @@ nixos-install --root ${BUILD_DIR} --no-root-passwd \
     --system "${SYSTEM_CLOSURE}" \
     "${COMMON_NIX_ARGS[@]}"
 
+if [ -n "${RUSTSHYPER_VMM_HOST_BIN}" ] && [ -f "${RUSTSHYPER_VMM_HOST_BIN}" ]; then
+    mkdir -p "${BUILD_DIR}/root" "${BUILD_DIR}/usr/local/bin"
+    cp "${RUSTSHYPER_VMM_HOST_BIN}" "${BUILD_DIR}/root/rustshyper-vmm"
+    cp "${RUSTSHYPER_VMM_HOST_BIN}" "${BUILD_DIR}/usr/local/bin/rustshyper-vmm"
+    chmod 755 "${BUILD_DIR}/root/rustshyper-vmm" "${BUILD_DIR}/usr/local/bin/rustshyper-vmm"
+    echo "Installed rustshyper-vmm to /root/rustshyper-vmm and /usr/local/bin/rustshyper-vmm"
+fi
+
 echo "Congratulations! Asterinas NixOS has been installed successfully!"

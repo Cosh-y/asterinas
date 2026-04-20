@@ -85,8 +85,55 @@ struct MmioInstruction {
     reg: u8,
 }
 
+fn log_vmentry_guest_state(vcpu: &Vcpu, exit_info: &VmxExitInfo) {
+    let vm_instruction_error = VmcsReadOnly32::VM_INSTRUCTION_ERROR.read().ok();
+    let guest_rsp = VmcsGuestNW::RSP.read().ok();
+    let guest_rflags = VmcsGuestNW::RFLAGS.read().ok();
+    let guest_cr0 = VmcsGuestNW::CR0.read().ok();
+    let guest_cr3 = VmcsGuestNW::CR3.read().ok();
+    let guest_cr4 = VmcsGuestNW::CR4.read().ok();
+    let guest_efer = VmcsGuest64::IA32_EFER.read().ok();
+    let cs_selector = VmcsGuest16::CS_SELECTOR.read().ok();
+    let ss_selector = VmcsGuest16::SS_SELECTOR.read().ok();
+    let tr_selector = VmcsGuest16::TR_SELECTOR.read().ok();
+    let ldtr_selector = VmcsGuest16::LDTR_SELECTOR.read().ok();
+    let cs_ar = VmcsGuest32::CS_ACCESS_RIGHTS.read().ok();
+    let ss_ar = VmcsGuest32::SS_ACCESS_RIGHTS.read().ok();
+    let tr_ar = VmcsGuest32::TR_ACCESS_RIGHTS.read().ok();
+    let ldtr_ar = VmcsGuest32::LDTR_ACCESS_RIGHTS.read().ok();
+    let exit_reason_name = VmxExitReason::try_from(exit_info.exit_reason).ok();
+
+    log::error!(
+        "rustshyper: VM-entry failure for vcpu id={} exit_reason={:#x}({:?}) vm_instruction_error={:#x?} guest_rip={:#x} guest_rsp={:#x?} guest_rflags={:#x?} qualification={:#x}",
+        vcpu.id(),
+        exit_info.exit_reason,
+        exit_reason_name,
+        vm_instruction_error,
+        exit_info.guest_rip,
+        guest_rsp,
+        guest_rflags,
+        exit_info.exit_qualification
+    );
+    log::error!(
+        "rustshyper: guest state cr0={:#x?} cr3={:#x?} cr4={:#x?} efer={:#x?} cs={:#x?}/{:#x?} ss={:#x?}/{:#x?} tr={:#x?}/{:#x?} ldtr={:#x?}/{:#x?}",
+        guest_cr0,
+        guest_cr3,
+        guest_cr4,
+        guest_efer,
+        cs_selector,
+        cs_ar,
+        ss_selector,
+        ss_ar,
+        tr_selector,
+        tr_ar,
+        ldtr_selector,
+        ldtr_ar
+    );
+}
+
 pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<RunStateMessage>> {
     if exit_info.entry_failure {
+        log_vmentry_guest_state(vcpu, exit_info);
         return Err(Error::with_message(
             Errno::GuestRunFailed,
             "VM-entry failure while entering guest",
@@ -103,7 +150,10 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
         }
         Ok(VmxExitReason::INTERRUPT_WINDOW) => {
             let mut state = vcpu.state.lock();
-            handle_interrupt_window(&mut state.lapic, &mut state.interrupt)?;
+            let super::vm::VcpuState {
+                lapic, interrupt, ..
+            } = &mut *state;
+            handle_interrupt_window(lapic, interrupt)?;
             Ok(None)
         }
         Ok(VmxExitReason::CPUID) => {
@@ -517,13 +567,10 @@ fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Res
     let mut ioapic = vm.ioapic.lock();
     let effect = {
         let mut state = vcpu.state.lock();
-        let (effect, ok) = emulate_lapic_write(
-            &mut state.lapic,
-            &mut state.apic_timer,
-            &mut ioapic,
-            offset,
-            value,
-        );
+        let super::vm::VcpuState {
+            lapic, apic_timer, ..
+        } = &mut *state;
+        let (effect, ok) = emulate_lapic_write(lapic, apic_timer, &mut ioapic, offset, value);
         if !ok {
             return Ok(false);
         }

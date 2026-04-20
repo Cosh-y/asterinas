@@ -5,7 +5,7 @@
 use ostd::arch::virt::*;
 
 use super::error::*;
-use crate::emulate::apic::{lapic_kick_to_service, Lapic};
+use crate::emulate::apic::{Lapic, lapic_kick_to_service};
 
 const EVENT_TYPE_HWEXC: u32 = 3;
 const EVENT_TYPE_EXTINT: u32 = 0;
@@ -58,14 +58,11 @@ pub fn handle_external_interrupt() -> Result<()> {
         return Ok(());
     }
 
-    let vector = exit_intr_info & INTR_INFO_VECTOR_MASK;
-
     // RustShyper intentionally leaves "acknowledge interrupt on exit"
     // disabled in the VMCS. That keeps the host interrupt pending across the
     // VM-exit, so once the IRQ-disable guard around the VM-exit critical
     // section is released, Asterinas can receive and process the interrupt via
     // its normal trap/IRQ path without any explicit handoff from RustShyper.
-    let _ = vector;
 
     Ok(())
 }

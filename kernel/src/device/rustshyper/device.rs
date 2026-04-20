@@ -5,22 +5,23 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use device_id::{DeviceId, MajorId, MinorId};
 use aster_rustshyper::vm::Vm;
+use device_id::{DeviceId, MajorId, MinorId};
+use ostd::task::Task;
 
 use super::{
-    ioctl_defs, vm_file::VmFile, RUSTSHYPER_API_VERSION, RUSTSHYPER_MAJOR, RUSTSHYPER_MINOR,
+    RUSTSHYPER_API_VERSION, RUSTSHYPER_MAJOR, RUSTSHYPER_MINOR, ioctl_defs, vm_file::VmFile,
 };
 use crate::{
+    device::{Device, DeviceType},
     events::IoEvents,
     fs::{
-        device::{Device, DeviceType},
-        inode_handle::FileIo,
-        utils::{InodeIo, StatusFlags},
+        file::{FileIo, StatusFlags, file_table::FdFlags},
+        vfs::inode::InodeIo,
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
-    util::ioctl::{dispatch_ioctl, RawIoctl},
+    util::ioctl::{RawIoctl, dispatch_ioctl},
 };
 
 /// The main RustShyper device (/dev/rustshyper)
@@ -46,7 +47,7 @@ impl Device for RustShyperDevice {
     fn id(&self) -> DeviceId {
         DeviceId::new(
             MajorId::new(RUSTSHYPER_MAJOR),
-            MinorId::new(RUSTSHYPER_MINOR),
+            MinorId::new(u32::from(RUSTSHYPER_MINOR)),
         )
     }
 
@@ -118,13 +119,12 @@ impl FileIo for RustShyperDeviceFile {
                 let vm_file = Arc::new(VmFile::new(vm));
 
                 // Insert into the current process's file table
-                let current = current_thread!();
-                let file_table = current.file_table();
+                let current = Task::current().unwrap();
+                let mut file_table = current.as_thread_local().unwrap().borrow_file_table_mut();
                 let mut file_table_locked = file_table.unwrap().write();
-                let vm_fd =
-                    file_table_locked.insert(vm_file, crate::fs::file_table::FdFlags::empty());
+                let vm_fd = file_table_locked.insert(vm_file, FdFlags::empty());
 
-                Ok(vm_fd)
+                Ok(vm_fd.into())
             }
             cmd @ CheckExtension => {
                 let _extension = cmd.get();

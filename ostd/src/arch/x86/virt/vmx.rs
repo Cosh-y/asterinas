@@ -3,10 +3,8 @@
 //! This module provides wrappers for VMX instructions and VMCS access
 #![allow(missing_docs)]
 
-use log::{error, info};
-
 use super::types::*;
-use crate::{error::Error, prelude::*};
+use crate::{error, error::Error, info, prelude::*};
 
 /// VMCS revision identifier (read from MSR)
 static mut VMCS_REVISION: u32 = 0;

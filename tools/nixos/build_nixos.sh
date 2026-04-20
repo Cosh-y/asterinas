@@ -8,9 +8,22 @@ SCRIPT_DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
 ASTERINAS_DIR=$(realpath ${SCRIPT_DIR}/../..)
 ASTER_IMAGE_PATH=${ASTERINAS_DIR}/target/nixos/asterinas.img
 DISTRO_DIR=$(realpath ${ASTERINAS_DIR}/distro)
+WORKSPACE_DIR=$(realpath ${ASTERINAS_DIR}/..)
+RUSTSHYPER_VMM_DIR=${RUSTSHYPER_VMM_DIR:-${WORKSPACE_DIR}/rustshyper-vmm}
+RUSTSHYPER_VMM_TARGET=${RUSTSHYPER_VMM_TARGET:-x86_64-unknown-linux-musl}
+RUSTSHYPER_VMM_HOST_BIN=""
 # Accept config file name as parameter, default to "configuration.nix"
 CONFIG_FILE_NAME=${1:-"configuration.nix"}
 CONFIG_PATH=${DISTRO_DIR}/etc_nixos/${CONFIG_FILE_NAME}
+
+if [ -f "${RUSTSHYPER_VMM_DIR}/Cargo.toml" ]; then
+    echo "Building rustshyper-vmm from ${RUSTSHYPER_VMM_DIR} for ${RUSTSHYPER_VMM_TARGET}..."
+    (
+        cd "${RUSTSHYPER_VMM_DIR}"
+        cargo build --release --target "${RUSTSHYPER_VMM_TARGET}"
+    )
+    RUSTSHYPER_VMM_HOST_BIN="${RUSTSHYPER_VMM_DIR}/target/${RUSTSHYPER_VMM_TARGET}/release/rustshyper-vmm"
+fi
 
 pushd $DISTRO_DIR
 nix-build aster_nixos_installer/default.nix \
@@ -35,4 +48,5 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM ERR
 
-${DISTRO_DIR}/result/bin/install_aster_nixos.sh --config ${CONFIG_PATH} --disk ${DISK}
+RUSTSHYPER_VMM_HOST_BIN="${RUSTSHYPER_VMM_HOST_BIN}" \
+    ${DISTRO_DIR}/result/bin/install_aster_nixos.sh --config ${CONFIG_PATH} --disk ${DISK}

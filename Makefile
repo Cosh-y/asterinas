@@ -359,6 +359,10 @@ run_nixos:
         ./tools/nixos/run.sh nixos; \
     fi
 
+.PHONY: sync_rustshyper_vmm
+sync_rustshyper_vmm:
+	@./tools/nixos/sync_rustshyper_vmm.sh
+
 # Build the Asterinas NixOS patched packages
 cachix:
 	@nix-build distro/cachix \

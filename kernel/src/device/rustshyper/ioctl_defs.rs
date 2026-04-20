@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::util::ioctl::{ioc, InData, InOutData, NoData, OutData, PassByVal};
+use crate::util::ioctl::{InData, InOutData, NoData, OutData, PassByVal, ioc};
 
 // Main device ioctls
 pub(super) type GetApiVersion = ioc!(RSH_GET_API_VERSION, b'H', 0x00, NoData);
@@ -67,6 +67,7 @@ pub(super) struct IoExitInfo {
     pub is_repeat: u8,
     pub reserved: [u8; 2],
     pub count: u32,
+    pub padding: u32,
     pub data: u64,
 }
 

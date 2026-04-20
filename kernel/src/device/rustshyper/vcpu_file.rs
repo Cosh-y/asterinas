@@ -6,20 +6,26 @@ use aster_rustshyper::vm::Vcpu;
 
 use super::ioctl_defs;
 use crate::{
-    fs::{file_handle::FileLike, file_table::FdFlags},
+    fs::{
+        file::{FileLike, file_table::FdFlags},
+        pseudofs::AnonInodeFs,
+        vfs::path::Path,
+    },
     prelude::*,
-    util::ioctl::{dispatch_ioctl, RawIoctl},
+    util::ioctl::{RawIoctl, dispatch_ioctl},
 };
 
 /// VCPU file descriptor
 pub struct VcpuFile {
     vcpu: Arc<Vcpu>,
+    pseudo_path: Path,
 }
 
 impl VcpuFile {
     /// Creates a new VCPU file
     pub fn new(vcpu: Arc<Vcpu>) -> Self {
-        Self { vcpu }
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[rustshyper-vcpu]".to_string());
+        Self { vcpu, pseudo_path }
     }
 
     /// Gets the underlying VCPU
@@ -42,7 +48,21 @@ impl FileLike for VcpuFile {
 
         dispatch_ioctl!(match raw_ioctl {
             cmd @ Run => {
-                let run_state = self.vcpu.run()?;
+                let run_state = self.vcpu.run().map_err(|err| {
+                    match err.message() {
+                        Some(msg) => {
+                            error!(
+                                "rustshyper: RSH_RUN failed: errno={:?}, msg={}",
+                                err.errno(),
+                                msg
+                            );
+                        }
+                        None => {
+                            error!("rustshyper: RSH_RUN failed: errno={:?}", err.errno());
+                        }
+                    }
+                    Error::from(err)
+                })?;
                 let user_run_state = RunStateMessage {
                     exit_reason: run_state.exit_reason,
                     instruction_len: run_state.instruction_len,
@@ -57,6 +77,7 @@ impl FileLike for VcpuFile {
                         is_repeat: run_state.io.is_repeat,
                         reserved: run_state.io.reserved,
                         count: run_state.io.count,
+                        padding: 0,
                         data: run_state.io.data,
                     },
                     mmio: MmioInfo {
@@ -101,16 +122,12 @@ impl FileLike for VcpuFile {
         })
     }
 
-    fn path(&self) -> &crate::fs::path::Path {
-        // VCPU files don't have a real path
-        static VCPU_PATH: spin::Once<crate::fs::path::Path> = spin::Once::new();
-        VCPU_PATH.call_once(|| {
-            crate::fs::path::Path::new("anon_inode:[rustshyper-vcpu]".into()).unwrap()
-        })
+    fn path(&self) -> &Path {
+        &self.pseudo_path
     }
 
     fn dump_proc_fdinfo(self: Arc<Self>, _fd_flags: FdFlags) -> Box<dyn core::fmt::Display> {
-        Box::new(alloc::format!("vcpu_id: {}\n", self.vcpu.id()))
+        Box::new("rustshyper_vcpu\n")
     }
 }
 

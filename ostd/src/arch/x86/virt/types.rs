@@ -7,7 +7,7 @@ pub type MemSize = usize;
 
 /// Guest segment register state.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Pod)]
 pub struct VcpuSegment {
     pub base: u64,
     pub limit: u32,
@@ -26,7 +26,7 @@ pub struct VcpuSegment {
 
 /// Guest descriptor table state.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Pod)]
 pub struct VcpuDtable {
     pub base: u64,
     pub limit: u16,
@@ -38,7 +38,7 @@ pub struct VcpuDtable {
 /// This structure represents the guest CPU's general purpose registers
 /// that need to be saved/restored during VM entry/exit.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Pod)]
 pub struct VcpuRegs {
     pub rax: u64,
     pub rbx: u64,
@@ -62,7 +62,7 @@ pub struct VcpuRegs {
 
 /// Guest special register state.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Pod)]
 pub struct VcpuSregs {
     pub cs: VcpuSegment,
     pub ds: VcpuSegment,

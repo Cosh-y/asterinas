@@ -23,5 +23,7 @@ use crate::error::*;
 /// Initializes the RustShyper subsystem
 pub fn init() -> Result<()> {
     log::info!("Initializing RustShyper hypervisor");
+    ostd::arch::virt::init_vmx().map_err(Error::from)?;
+    log::info!("RustShyper VMX backend initialized");
     Ok(())
 }

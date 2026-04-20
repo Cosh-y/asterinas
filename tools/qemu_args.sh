@@ -22,6 +22,7 @@ VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 NETDEV=${NETDEV:-"user"}
 CONSOLE=${CONSOLE:-"hvc0"}
+ENABLE_KVM=${ENABLE_KVM:-"1"}
 
 SSH_RAND_PORT=${SSH_PORT:-$(shuf -i 1024-65535 -n 1)}
 NGINX_RAND_PORT=${NGINX_PORT:-$(shuf -i 1024-65535 -n 1)}
@@ -85,8 +86,15 @@ if [ "$1" = "tdx" ]; then
     exit 0
 fi
 
+CPU_ARGS="-cpu Icelake-Server,+x2apic"
+if [ "$ENABLE_KVM" = "1" ]; then
+    # RustShyper needs nested VMX. KVM acceleration alone does not expose it
+    # unless the guest CPU model advertises the VMX CPUID bit explicitly.
+    CPU_ARGS="${CPU_ARGS},+vmx"
+fi
+
 COMMON_QEMU_ARGS="\
-    -cpu Icelake-Server,+x2apic \
+    ${CPU_ARGS} \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \
     --no-reboot \

@@ -8,30 +8,31 @@ use core::{
     arch::x86_64::CpuidResult,
     sync::atomic::{AtomicU32, Ordering},
 };
+
+use ostd::{
+    arch::{cpu::cpuid::cpuid, read_tsc, tsc_freq, virt::*},
+    mm::{
+        Frame, FrameAllocOptions, HasPaddr, PAGE_SIZE, VmIo, VmSpace,
+        kspace::{read_bytes_from_paddr, read_u64_from_paddr},
+        vm_space::VmQueriedItem,
+    },
+    sync::Mutex,
+};
 use x86::vmx::vmcs::control::{
     EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
 };
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
-use ostd::{
-    arch::{cpu::cpuid::cpuid, read_tsc, tsc_freq, virt::*},
-    mm::{
-        kspace::{read_bytes_from_paddr, read_u64_from_paddr},
-        Frame, FrameAllocOptions, HasPaddr, VmIo, PAGE_SIZE,
-    },
-    sync::Mutex,
-};
-
 use super::{
     emulate::apic::{
-        ioapic_kick_irq, lapic_check_pending_vector, lapic_on_timer_expire, lapic_set_irr,
-        lapic_timer_deadline, lapic_timer_deadline_tsc, ApicTimer, Ioapic, Lapic,
-        TimerExpireAction, TscState, IOAPIC_NUM_PINS,
+        ApicTimer, IOAPIC_NUM_PINS, Ioapic, Lapic, TimerExpireAction, TscState, ioapic_kick_irq,
+        lapic_check_pending_vector, lapic_on_timer_expire, lapic_set_irr, lapic_timer_deadline,
+        lapic_timer_deadline_tsc,
     },
     error::*,
     interrupt::{
-        has_pending_exception, inject_interrupt, inject_pending_exception,
-        try_inject_pending_interrupt, ExceptionState, InterruptState,
+        ExceptionState, InterruptState, has_pending_exception, inject_interrupt,
+        inject_pending_exception, try_inject_pending_interrupt,
     },
 };
 
@@ -39,6 +40,7 @@ const X86_CR0_ET: u64 = 1 << 4;
 const X86_CR0_NE: u64 = 1 << 5;
 const X86_CR4_VMXE: u64 = 1 << 13;
 const X86_EFER_LMA: u64 = 1 << 10;
+const VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK: u8 = 0;
 
 /// Represents a virtual machine instance
 pub struct Vm {
@@ -171,19 +173,14 @@ impl Vm {
     }
 
     /// Sets a user memory region
-    pub fn set_memory_region(&self, region: MemoryRegion) -> Result<()> {
-        self.map_memory_region(region)?;
+    pub fn set_memory_region(&self, region: MemoryRegion, vm_space: &Arc<VmSpace>) -> Result<()> {
+        self.map_memory_region(region, vm_space)?;
         self.memory_regions.lock().insert(region.slot, region);
         Ok(())
     }
 
     /// Maps a user memory region
-    pub fn map_memory_region(&self, region: MemoryRegion) -> Result<()> {
-        use ostd::{
-            mm::{vm_space::VmQueriedItem, HasPaddr, VmSpace, PAGE_SIZE},
-            task::Task,
-        };
-
+    pub fn map_memory_region(&self, region: MemoryRegion, vm_space: &Arc<VmSpace>) -> Result<()> {
         if region.guest_phys_addr % PAGE_SIZE as u64 != 0 {
             return Err(Error::with_message(
                 Errno::InvalidArgs,
@@ -202,21 +199,6 @@ impl Vm {
                 "memory size must be a non-zero multiple of PAGE_SIZE",
             ));
         }
-
-        // Get the current task's VmSpace to translate user virtual address to host physical address
-        let task = Task::current().ok_or(Error::with_message(
-            Errno::NotFound,
-            "No current task found",
-        ))?;
-
-        // Get the VmSpace from the current process
-        let vm_space: &Arc<VmSpace> =
-            task.data()
-                .downcast_ref::<Arc<VmSpace>>()
-                .ok_or(Error::with_message(
-                    Errno::Fault,
-                    "Failed to get VmSpace from current task",
-                ))?;
 
         let userspace_end = region
             .userspace_addr
@@ -238,27 +220,14 @@ impl Vm {
         // The supported interface today is VmSpace::cursor(...).query(), which
         // lets us inspect each mapped userspace page and recover its backing
         // frame or I/O-memory physical address.
-        let preempt_guard = ostd::task::disable_preempt();
-        let mut ept = self.ept.lock();
         let mut userspace_addr = region.userspace_addr;
         let mut guest_phys_addr = region.guest_phys_addr;
 
         while userspace_addr < userspace_end && guest_phys_addr < guest_end {
-            let page_range = userspace_addr..(userspace_addr + PAGE_SIZE);
-            let mut cursor = vm_space.cursor(&preempt_guard, &page_range)?;
-
-            let hpa = match cursor.query()?.1 {
-                Some(VmQueriedItem::MappedRam { frame, .. }) => frame.paddr(),
-                Some(VmQueriedItem::MappedIoMem { paddr, .. }) => paddr,
-                None => {
-                    return Err(Error::with_message(
-                        Errno::Fault,
-                        "userspace page is not mapped",
-                    ));
-                }
-            };
-
-            ept.map_range(guest_phys_addr, hpa as _, PAGE_SIZE)?;
+            let hpa = query_userspace_page_hpa(vm_space, userspace_addr)?;
+            let mut ept = self.ept.lock();
+            ept.map_range(guest_phys_addr, hpa as _, PAGE_SIZE)
+                .map_err(Error::from)?;
             userspace_addr += PAGE_SIZE;
             guest_phys_addr += PAGE_SIZE as u64;
         }
@@ -342,7 +311,68 @@ impl Vm {
     }
 }
 
+fn query_userspace_page_hpa(vm_space: &Arc<VmSpace>, userspace_addr: VirtAddr) -> Result<PhysAddr> {
+    debug_assert!(userspace_addr.is_multiple_of(PAGE_SIZE));
+
+    loop {
+        let page_range = userspace_addr..(userspace_addr + PAGE_SIZE);
+        let preempt_guard = ostd::task::disable_preempt();
+        let mut cursor = vm_space.cursor(&preempt_guard, &page_range).map_err(|_| {
+            Error::with_message(
+                Errno::Fault,
+                "failed to create vm_space cursor for guest memory",
+            )
+        })?;
+
+        let queried_item = cursor
+            .query()
+            .map_err(|_| {
+                Error::with_message(
+                    Errno::Fault,
+                    "failed to query vm_space mapping for guest memory",
+                )
+            })?
+            .1;
+
+        match queried_item {
+            Some(VmQueriedItem::MappedRam { frame, .. }) => return Ok(frame.paddr() as _),
+            Some(VmQueriedItem::MappedIoMem { paddr, .. }) => return Ok(paddr as _),
+            None => (),
+        }
+
+        drop(cursor);
+        drop(preempt_guard);
+
+        touch_userspace_page(vm_space, userspace_addr)?;
+    }
+}
+
+fn touch_userspace_page(vm_space: &Arc<VmSpace>, userspace_addr: VirtAddr) -> Result<()> {
+    let mut reader = vm_space.reader(userspace_addr, 1).map_err(|err| {
+        let _ = err;
+        Error::with_message(
+            Errno::Fault,
+            "failed to create userspace reader while faulting in guest memory",
+        )
+    })?;
+
+    let _: u8 = reader.read_val().map_err(|err| {
+        let _ = err;
+        Error::with_message(
+            Errno::Fault,
+            "failed to fault in userspace page for guest memory",
+        )
+    })?;
+
+    Ok(())
+}
+
 impl Vcpu {
+    /// Gets the VCPU ID
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     pub fn new(id: u32, vm: Weak<Vm>) -> Result<Self> {
         use ostd::arch::virt::*;
         // Allocate VMCS
@@ -370,7 +400,11 @@ impl Vcpu {
         state.lapic.id = id;
         state.lapic.ldr = (1_u32.checked_shl(id).unwrap_or(0)) << 24;
         state.apic_timer.lvt_timer_bits = 1 << 16;
-        state.tsc.multiplier = (Msr::IA32_VMX_MISC.read() & 0x1f) as u8;
+        // Some virtualized environments expose enough VMX state to run the guest
+        // but still #GP on RDMSR IA32_VMX_MISC (0x485). Using a conservative
+        // fallback keeps vCPU creation from crashing the kernel. The preemption
+        // timer then counts directly in TSC ticks.
+        state.tsc.multiplier = VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK;
 
         Ok(Self {
             id,
@@ -392,6 +426,16 @@ impl Vcpu {
                 .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?
                 .get_eptp();
 
+            let regs = self.get_regs()?;
+            log::info!(
+                "rustshyper: initializing vcpu id={} vmcs={:#x} eptp={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
+                self.id,
+                self.vmcs_phys,
+                eptp,
+                regs.rip,
+                regs.rsp,
+                regs.rflags
+            );
             self.init(eptp)?;
         }
 
@@ -640,6 +684,22 @@ impl Vcpu {
         let launched: u64 = if self.state.lock().launched { 1 } else { 0 };
         let ret = vcpu_run(&mut self.state.lock().regs, launched);
         if ret != 0 {
+            let vm_instruction_error = VmcsReadOnly32::VM_INSTRUCTION_ERROR.read().ok();
+            let exit_reason = VmcsReadOnly32::EXIT_REASON.read().ok();
+            let guest_rip = VmcsGuestNW::RIP.read().ok();
+            let guest_rsp = VmcsGuestNW::RSP.read().ok();
+            let guest_rflags = VmcsGuestNW::RFLAGS.read().ok();
+            log::error!(
+                "rustshyper: {} failed for vcpu id={} vmcs={:#x} vm_instruction_error={:#x?} exit_reason={:#x?} guest_rip={:#x?} guest_rsp={:#x?} guest_rflags={:#x?}",
+                if launched == 0 { "vmlaunch" } else { "vmresume" },
+                self.id,
+                self.vmcs_phys,
+                vm_instruction_error,
+                exit_reason,
+                guest_rip,
+                guest_rsp,
+                guest_rflags
+            );
             return Err(Error::with_message(
                 Errno::GuestRunFailed,
                 "vcpu_run failed",
@@ -783,7 +843,12 @@ impl Vcpu {
         }
 
         let tsc = state.tsc;
-        let action = lapic_on_timer_expire(&mut state.lapic, &mut state.apic_timer, &tsc);
+        let action = {
+            let VcpuState {
+                lapic, apic_timer, ..
+            } = &mut *state;
+            lapic_on_timer_expire(lapic, apic_timer, &tsc)
+        };
         match action {
             TimerExpireAction::Rearm(deadline) => timer_activate_locked(&mut state, deadline),
             TimerExpireAction::Deactivate => timer_deactivate_locked(&mut state),
@@ -881,19 +946,22 @@ impl Vcpu {
             return Ok(());
         }
 
-        try_inject_pending_interrupt(&mut state.lapic, &mut state.interrupt)?;
+        {
+            let VcpuState {
+                lapic, interrupt, ..
+            } = &mut *state;
+            try_inject_pending_interrupt(lapic, interrupt)?;
+        }
         if state.interrupt.pending {
             return Ok(());
         }
 
         if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
             let mut perf = [0_u32; 224];
-            inject_interrupt(
-                &mut state.lapic,
-                &mut state.interrupt,
-                &mut perf,
-                u32::from(vector),
-            )?;
+            let VcpuState {
+                lapic, interrupt, ..
+            } = &mut *state;
+            inject_interrupt(lapic, interrupt, &mut perf, u32::from(vector))?;
         }
 
         Ok(())
@@ -911,7 +979,12 @@ fn timer_activate_locked(state: &mut VcpuState, deadline_ticks: u64) {
         state.tsc.ddl_physical = deadline_ticks;
     } else {
         let tsc = state.tsc;
-        let action = lapic_on_timer_expire(&mut state.lapic, &mut state.apic_timer, &tsc);
+        let action = {
+            let VcpuState {
+                lapic, apic_timer, ..
+            } = &mut *state;
+            lapic_on_timer_expire(lapic, apic_timer, &tsc)
+        };
         match action {
             TimerExpireAction::Rearm(next_deadline) => timer_activate_locked(state, next_deadline),
             TimerExpireAction::Deactivate => timer_deactivate_locked(state),
