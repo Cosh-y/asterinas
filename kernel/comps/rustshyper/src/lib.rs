@@ -5,7 +5,6 @@
 
 #![no_std]
 #![deny(unsafe_code)]
-#![feature(trait_upcasting)]
 
 extern crate alloc;
 

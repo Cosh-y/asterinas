@@ -61,6 +61,8 @@ DNS_SERVER ?= none
 
 # NixOS settings
 NIXOS_DISK_SIZE_IN_MB ?= 8192
+export NIXOS_BOOT_SIZE_IN_MB ?= 1024
+export NIXOS_PRUNE_BOOT ?= true
 NIXOS_DISABLE_SYSTEMD ?= false
 # The following option is only effective when NIXOS_DISABLE_SYSTEMD is set to 'true'.
 # Use a login shell to ensure that environment variables are initialized correctly.
@@ -362,6 +364,11 @@ run_nixos:
 .PHONY: sync_rustshyper_vmm
 sync_rustshyper_vmm:
 	@./tools/nixos/sync_rustshyper_vmm.sh
+
+.PHONY: capture_rustshyper_vmm
+capture_rustshyper_vmm: OVMF = off
+capture_rustshyper_vmm:
+	@./tools/nixos/capture_rustshyper_vmm.py
 
 # Build the Asterinas NixOS patched packages
 cachix:

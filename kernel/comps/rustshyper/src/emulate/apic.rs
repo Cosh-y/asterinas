@@ -2,12 +2,6 @@
 //!
 //! Use pure software emulate for now.
 
-use alloc::sync::Arc;
-
-use ostd::sync::Mutex;
-
-use super::super::vm::{Vcpu, Vm};
-
 // ===== LAPIC MMIO Register Offsets =====
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
 pub const LAPIC_SIZE: u64 = 0x400;
@@ -43,6 +37,7 @@ const XLAPIC_RW_LVT_LINT1: u64 = 0x360;
 const XLAPIC_RW_LVT_ERROR: u64 = 0x370;
 const XLAPIC_RW_TIMER_INIT: u64 = 0x380;
 const XLAPIC_RO_TIMER_CURR: u64 = 0x390;
+const XLAPIC_WO_SELF_IPI: u64 = 0x3F0;
 const XLAPIC_RW_TIMER_DIVI: u64 = 0x3E0;
 
 pub const IOAPIC_NUM_PINS: usize = 24;
@@ -94,8 +89,6 @@ pub struct IoapicRedent {
     pub delivery_mode: u8,
     /// Destination mode: 0 = Physical, 1 = Logical
     pub dest_mode: u8,
-    pub delivery_status: u8,
-    pub polarity: u8,
     pub remote_irr: bool,
     /// Trigger mode: 0 = Edge, 1 = Level
     pub trigger_mode: bool,
@@ -116,8 +109,6 @@ impl IoapicRedtbl {
             vector: (self.bits & 0xFF) as u8,
             delivery_mode: ((self.bits >> 8) & 0x7) as u8,
             dest_mode: ((self.bits >> 11) & 0x1) as u8,
-            delivery_status: ((self.bits >> 12) & 0x1) as u8,
-            polarity: ((self.bits >> 13) & 0x1) as u8,
             remote_irr: ((self.bits >> 14) & 0x1) != 0,
             trigger_mode: ((self.bits >> 15) & 0x1) != 0,
             mask: ((self.bits >> 16) & 0x1) != 0,
@@ -146,7 +137,7 @@ impl Default for Ioapic {
     fn default() -> Self {
         Self {
             ioregsel: 0,
-            id: 0,
+            id: 1,
             redtbl: [IoapicRedtbl::default(); IOAPIC_NUM_PINS],
         }
     }
@@ -202,14 +193,6 @@ pub fn lapic_set_irr(lapic: &mut Lapic, vec: u8) {
 
 pub fn lapic_clear_irr(lapic: &mut Lapic, vec: u8) {
     lapic_clear_bit(&mut lapic.irr, vec);
-}
-
-pub fn lapic_set_tmr(lapic: &mut Lapic, vec: u8) {
-    lapic_set_bit(&mut lapic.tmr, vec);
-}
-
-pub fn lapic_clear_tmr(lapic: &mut Lapic, vec: u8) {
-    lapic_clear_bit(&mut lapic.tmr, vec);
 }
 
 /// Move an IRR vector into service (set ISR, clear IRR, update PPR).
@@ -325,7 +308,7 @@ pub fn emulate_lapic_read(
         XLAPIC_RW_LDR => lapic.ldr as u64,
         XLAPIC_RW_DFR => 0xFFFF_FFFF,
         XLAPIC_RW_SIVR => 0x1FF,
-        XLAPIC_RW_LVT_CMCI => (1u64 << 16),
+        XLAPIC_RW_LVT_CMCI => 1u64 << 16,
         XLAPIC_RW_LVT_THERM | XLAPIC_RW_LVT_PERF | XLAPIC_RW_LVT_LINT0 | XLAPIC_RW_LVT_LINT1
         | XLAPIC_RW_LVT_ERROR => 0x10000,
         XLAPIC_RW_LVT_TIMER => timer.lvt_timer_bits as u64,
@@ -336,7 +319,7 @@ pub fn emulate_lapic_read(
         }
         XLAPIC_RO_TIMER_CURR => {
             if tsc.activated && tsc.ddl_physical > tsc.tsc_physical {
-                tsc.ddl_physical - tsc.tsc_physical
+                (tsc.ddl_physical - tsc.tsc_physical) >> timer.divide_shift
             } else {
                 0
             }
@@ -397,16 +380,6 @@ pub fn emulate_lapic_write(
             if let Some(isr_vec) = lapic_find_highest_isr(lapic) {
                 lapic_clear_isr(lapic, isr_vec);
                 lapic_update_ppr(lapic);
-
-                // Re-assert any level-triggered IRQ that is still pending
-                if let Some(irr_vec) = lapic_find_highest_irr(lapic) {
-                    if (irr_vec & 0xF0) > lapic.ppr {
-                        lapic_clear_irr(lapic, irr_vec);
-                        lapic_set_irr(lapic, irr_vec);
-                        lapic_update_ppr(lapic);
-                    }
-                }
-
                 ioapic_eoi(ioapic, isr_vec);
             }
         }
@@ -449,8 +422,11 @@ pub fn emulate_lapic_write(
         }
         XLAPIC_RW_TIMER_DIVI => {
             let shift = (value & 0b11) | ((value & 0b1000) >> 1);
-            timer.divide_shift = (((shift + 1) & 0b111) as u8);
+            timer.divide_shift = ((shift + 1) & 0b111) as u8;
             return (LapicWriteEffect::StartTimer, true);
+        }
+        XLAPIC_WO_SELF_IPI => {
+            lapic_set_irr(lapic, (value & 0xFF) as u8);
         }
         XLAPIC_RW_ESR => {
             if value != 0 {
@@ -461,7 +437,14 @@ pub fn emulate_lapic_write(
             }
         }
         o if o >= XLAPIC_RW_ICR_BASE && o < XLAPIC_RW_ICR_BASE + XLAPIC_RW_ICR_SIZE => {
-            lapic.icr[((o - XLAPIC_RW_ICR_BASE) / 16) as usize] = value as u32;
+            let index = ((o - XLAPIC_RW_ICR_BASE) / 16) as usize;
+            lapic.icr[index] = value as u32;
+            if o == XLAPIC_RW_ICR_BASE {
+                if value >> 32 != 0 {
+                    lapic.icr[1] = (value >> 32) as u32;
+                }
+                deliver_icr_fixed_interrupt(lapic, value as u32, lapic.icr[1]);
+            }
         }
         _ => {
             log::warn!(
@@ -473,6 +456,35 @@ pub fn emulate_lapic_write(
         }
     }
     (LapicWriteEffect::None, true)
+}
+
+fn deliver_icr_fixed_interrupt(lapic: &mut Lapic, low: u32, high: u32) {
+    let vector = (low & 0xFF) as u8;
+    let delivery_mode = (low >> 8) & 0x7;
+    let destination_mode = (low >> 11) & 0x1;
+    let shorthand = (low >> 18) & 0x3;
+
+    if delivery_mode != 0 || vector < 16 {
+        return;
+    }
+
+    let matches_destination = match shorthand {
+        0 => {
+            let destination = (high >> 24) as u8;
+            if destination_mode == 0 {
+                destination == lapic.id as u8
+            } else {
+                ((lapic.ldr >> 24) as u8) & destination != 0
+            }
+        }
+        1 | 2 => true,
+        3 => false,
+        _ => false,
+    };
+
+    if matches_destination {
+        lapic_set_irr(lapic, vector);
+    }
 }
 
 // ===== I/O APIC emulation =====

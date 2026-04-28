@@ -15,7 +15,7 @@
 #  - CONSOLE: "hvc0" to enable virtio console;
 #  - SMP: number of CPUs;
 #  - MEM: amount of memory, e.g. "8G";
-#  - VNC_PORT: VNC port, default is "42".
+#  - VNC_PORT: VNC port, disabled by default. Set to a display number to enable VNC.
 
 OVMF=${OVMF:-"on"}
 VHOST=${VHOST:-"off"}
@@ -55,6 +55,12 @@ if [ "$CONSOLE" = "hvc0" ]; then
     CONSOLE_ARGS="-device virtconsole,chardev=mux -serial file:qemu-serial.log"
 else
     CONSOLE_ARGS="-serial chardev:mux"
+fi
+
+if [ -n "${VNC_PORT:-}" ]; then
+    DISPLAY_ARGS="-vnc 0.0.0.0:${VNC_PORT}"
+else
+    DISPLAY_ARGS="-display none"
 fi
 
 if [ "$1" = "tdx" ]; then
@@ -99,7 +105,7 @@ COMMON_QEMU_ARGS="\
     -m ${MEM:-8G} \
     --no-reboot \
     -nographic \
-    -display vnc=0.0.0.0:${VNC_PORT:-42} \
+    ${DISPLAY_ARGS} \
     -monitor chardev:mux \
     -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
     $NETDEV_ARGS \

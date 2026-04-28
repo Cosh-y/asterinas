@@ -54,10 +54,6 @@ impl VmFile {
         Self { vm, pseudo_path }
     }
 
-    /// Gets the underlying VM
-    pub fn vm(&self) -> &Arc<Vm> {
-        &self.vm
-    }
 }
 
 fn log_vm_error(context: &str, err: &Error) {
@@ -158,7 +154,7 @@ impl FileLike for VmFile {
                 self.vm.inject_irq_line(irq as usize)?;
                 Ok(0)
             }
-            cmd @ GetDirtyLog => {
+            GetDirtyLog => {
                 // TODO: Implement dirty log tracking
                 return_errno_with_message!(Errno::ENOSYS, "GetDirtyLog not yet implemented");
             }

@@ -16,6 +16,23 @@ BZIMAGE_PATH=${BZIMAGE_PATH:-"${WORKSPACE_DIR}/bzImage"}
 INITRAMFS_PATH=${INITRAMFS_PATH:-"${WORKSPACE_DIR}/initramfs.cpio.gz"}
 MOUNT_DIR=${MOUNT_DIR:-/mnt/asterinas-root}
 
+build_rustshyper_vmm() {
+    echo "Building rustshyper-vmm from ${RUSTSHYPER_VMM_DIR} for ${RUSTSHYPER_VMM_TARGET}..."
+
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        local sudo_home
+        sudo_home=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+        sudo -H -u "${SUDO_USER}" env \
+            PATH="${sudo_home}/.cargo/bin:${PATH}" \
+            bash -lc "cd \"${RUSTSHYPER_VMM_DIR}\" && cargo build --release --target \"${RUSTSHYPER_VMM_TARGET}\""
+    else
+        (
+            cd "${RUSTSHYPER_VMM_DIR}"
+            cargo build --release --target "${RUSTSHYPER_VMM_TARGET}"
+        )
+    fi
+}
+
 usage() {
     cat <<EOF
 Usage: $0
@@ -25,6 +42,8 @@ Environment variables:
   RUSTSHYPER_VMM_DIR    Path to rustshyper-vmm source tree
   RUSTSHYPER_VMM_TARGET Cargo target used to build rustshyper-vmm
   RUSTSHYPER_VMM_BIN    Path to a prebuilt rustshyper-vmm binary
+  RUSTSHYPER_VMM_SKIP_BUILD
+                         Set to 1 to skip the default incremental VMM build
   BZIMAGE_PATH          Path to the Linux bzImage to sync into /root/bzImage
   INITRAMFS_PATH        Path to the Linux initramfs to sync into /root/initramfs.cpio.gz
   MOUNT_DIR             Temporary mount point for the root partition
@@ -41,17 +60,13 @@ if [ ! -f "${ASTERINAS_IMG}" ]; then
     exit 1
 fi
 
-if [ ! -f "${RUSTSHYPER_VMM_BIN}" ]; then
+if [ "${RUSTSHYPER_VMM_SKIP_BUILD:-0}" != "1" ]; then
     if [ ! -f "${RUSTSHYPER_VMM_DIR}/Cargo.toml" ]; then
         echo "Error: rustshyper-vmm source tree not found at ${RUSTSHYPER_VMM_DIR}" >&2
         exit 1
     fi
 
-    echo "Building rustshyper-vmm from ${RUSTSHYPER_VMM_DIR} for ${RUSTSHYPER_VMM_TARGET}..."
-    (
-        cd "${RUSTSHYPER_VMM_DIR}"
-        cargo build --release --target "${RUSTSHYPER_VMM_TARGET}"
-    )
+    build_rustshyper_vmm
 fi
 
 if [ ! -f "${RUSTSHYPER_VMM_BIN}" ]; then
@@ -92,6 +107,13 @@ trap cleanup EXIT INT TERM ERR
 echo "Attaching ${ASTERINAS_IMG}..."
 LOOP_DEV=$(${SUDO} losetup -fP --show "${ASTERINAS_IMG}")
 ROOT_PART="${LOOP_DEV}p2"
+
+for _ in $(seq 1 20); do
+    if [ -b "${ROOT_PART}" ]; then
+        break
+    fi
+    sleep 0.1
+done
 
 if [ ! -b "${ROOT_PART}" ]; then
     echo "Error: root partition ${ROOT_PART} not found" >&2

@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 pub use x86::{dtables::DescriptorTablePointer, segmentation::SegmentSelector};
-pub use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
+pub use x86_64::registers::control::{Cr0, Cr0Flags, Cr2, Cr3, Cr4, Cr4Flags};
 
 #[repr(C)]
 struct TssDescriptor64 {
@@ -41,6 +41,23 @@ pub fn gs() -> SegmentSelector {
 
 pub fn tr() -> SegmentSelector {
     unsafe { x86::task::tr() }
+}
+
+pub fn read_cr2_raw() -> u64 {
+    Cr2::read_raw()
+}
+
+pub fn write_cr2_raw(value: u64) {
+    // SAFETY: CR2 is the page-fault linear-address register. Updating it does
+    // not change paging, privilege, or memory mappings; RustShyper uses this to
+    // swap host and guest CR2 values around VM entry/exit.
+    unsafe {
+        core::arch::asm!(
+            "mov cr2, {}",
+            in(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 pub fn sgdt(gdtp: &mut DescriptorTablePointer<u64>) {

@@ -28,10 +28,6 @@ impl VcpuFile {
         Self { vcpu, pseudo_path }
     }
 
-    /// Gets the underlying VCPU
-    pub fn vcpu(&self) -> &Arc<Vcpu> {
-        &self.vcpu
-    }
 }
 
 impl FileLike for VcpuFile {

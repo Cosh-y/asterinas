@@ -20,6 +20,7 @@ fi
 MODE=$1
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+ENABLE_KVM=${ENABLE_KVM:-1}
 
 # Change to Asterinas root directory to ensure all scripts run from the correct location.
 cd "${ASTERINAS_DIR}"
@@ -66,6 +67,10 @@ esac
 
 if [ "${ENABLE_KVM}" = "1" ]; then
     QEMU_ARGS="${QEMU_ARGS} -accel kvm"
+fi
+
+if [ "${ASTERINAS_QEMU_SNAPSHOT:-0}" = "1" ]; then
+    QEMU_ARGS="${QEMU_ARGS} -snapshot"
 fi
 
 COMMON_QEMU_ARGS=$(${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)

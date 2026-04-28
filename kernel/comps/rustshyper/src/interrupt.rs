@@ -125,54 +125,78 @@ pub fn inject_pending_exception(
     Ok(())
 }
 
-/// Inject a virtual interrupt (vector >= 32) into the guest.
+/// Clear the VM-entry event-injection control field.
+pub fn clear_event_injection() -> Result<()> {
+    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+        .write(0)
+        .map_err(Error::from)
+}
+
+/// Clears interrupt shadow after an emulated HLT wakeup.
+pub fn clear_interrupt_shadow_after_hlt() -> Result<()> {
+    let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE
+        .read()
+        .map_err(Error::from)?;
+    VmcsGuest32::INTERRUPTIBILITY_STATE
+        .write(interruptibility & !BLOCKING_BY_STI)
+        .map_err(Error::from)
+}
+
+/// Queues an external interrupt for direct VM-entry delivery.
+pub fn queue_external_interrupt(intr: &mut InterruptState, vector: u32) -> Result<()> {
+    if !(32..256).contains(&vector) {
+        return Err(Error::with_message(
+            Errno::InvalidArgs,
+            "interrupt vector must be in the external-interrupt range [32, 255]",
+        ));
+    }
+
+    intr.intr_info = vector | INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+    intr.pending = true;
+    Ok(())
+}
+
+/// Try to inject the highest-priority virtual LAPIC interrupt.
 ///
-/// If the guest is not currently ready to receive an interrupt (i.e.
-/// `IF` is clear or blocking-by-STI/MOV-SS is active), the injection is
-/// deferred and interrupt-window exiting is enabled so that the
-/// hypervisor re-enters and injects when the guest opens its window.
-///
-/// Mirrors `inject_interrupt` from `injection.c`.
-pub fn inject_interrupt(
+/// If the guest is not interruptible yet, keep the vector in the LAPIC IRR and
+/// request an interrupt-window exit. This avoids mirroring LAPIC vectors into a
+/// second pending queue and only moves IRR to ISR at the VM-entry injection
+/// point.
+pub fn inject_lapic_interrupt(
     lapic: &mut Lapic,
-    intr: &mut InterruptState,
     perf_interrupt_count: &mut [u32; 224],
     vector: u32,
 ) -> Result<()> {
     if vector < 32 {
-        // Only external interrupts (>= 32) are handled here.
         return Ok(());
     }
 
     let intr_info = vector | INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+    let injectable = vmx_interrupt_injectable()?;
 
+    if !injectable {
+        enable_interrupt_window_exiting()?;
+        return Ok(());
+    }
+
+    disable_interrupt_window_exiting()?;
+    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+        .write(intr_info)
+        .map_err(Error::from)?;
+    lapic_kick_to_service(lapic, vector as u8);
     perf_interrupt_count[(vector - 32) as usize] =
         perf_interrupt_count[(vector - 32) as usize].saturating_add(1);
-
-    if vmx_interrupt_injectable()? {
-        VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
-            .write(intr_info)
-            .map_err(Error::from)?;
-        lapic_kick_to_service(lapic, vector as u8);
-    } else {
-        // Defer until the guest opens an interrupt window.
-        intr.intr_info = intr_info;
-        intr.pending = true;
-        enable_interrupt_window_exiting()?;
-    }
 
     Ok(())
 }
 
 /// Handle a VM-exit caused by "interrupt-window exiting".
 ///
-/// Disables the interrupt-window exiting control bit and, if a deferred
-/// interrupt is pending, injects it now.
-///
-/// Mirrors `handle_interrupt_window` from `injection.c`.
-pub fn handle_interrupt_window(lapic: &mut Lapic, intr: &mut InterruptState) -> Result<()> {
-    disable_interrupt_window_exiting()?;
-    try_inject_pending_interrupt(lapic, intr)
+/// The next VCPU loop iteration calls `prepare_pending_events`, which owns
+/// writing VM-entry event injection. Injecting here would be cleared by that
+/// preparation step before the guest re-enters.
+pub fn handle_interrupt_window() -> Result<()> {
+    disable_interrupt_window_exiting()
 }
 
 /// Queue a general-protection fault (#GP, vector 13) with error code 0.

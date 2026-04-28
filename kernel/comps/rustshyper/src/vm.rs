@@ -10,13 +10,17 @@ use core::{
 };
 
 use ostd::{
-    arch::{cpu::cpuid::cpuid, read_tsc, tsc_freq, virt::*},
+    arch::{
+        cpu::{context::FpuContext, cpuid::cpuid},
+        read_tsc, tsc_freq,
+        virt::*,
+    },
     mm::{
-        Frame, FrameAllocOptions, HasPaddr, PAGE_SIZE, VmIo, VmSpace,
         kspace::{read_bytes_from_paddr, read_u64_from_paddr},
         vm_space::VmQueriedItem,
+        Frame, FrameAllocOptions, HasPaddr, VmIo, VmSpace, PAGE_SIZE,
     },
-    sync::Mutex,
+    sync::{Mutex, SpinLock},
 };
 use x86::vmx::vmcs::control::{
     EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
@@ -25,22 +29,32 @@ use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
 use super::{
     emulate::apic::{
-        ApicTimer, IOAPIC_NUM_PINS, Ioapic, Lapic, TimerExpireAction, TscState, ioapic_kick_irq,
-        lapic_check_pending_vector, lapic_on_timer_expire, lapic_set_irr, lapic_timer_deadline,
-        lapic_timer_deadline_tsc,
+        ioapic_kick_irq, lapic_check_pending_vector, lapic_on_timer_expire,
+        lapic_timer_deadline, lapic_timer_deadline_tsc, ApicTimer, Ioapic, Lapic,
+        TimerExpireAction, TscState, IOAPIC_NUM_PINS,
     },
     error::*,
     interrupt::{
-        ExceptionState, InterruptState, has_pending_exception, inject_interrupt,
-        inject_pending_exception, try_inject_pending_interrupt,
+        clear_event_injection, clear_interrupt_shadow_after_hlt, has_pending_exception,
+        inject_lapic_interrupt, inject_pending_exception, queue_external_interrupt,
+        try_inject_pending_interrupt, ExceptionState, InterruptState,
     },
 };
 
+const X86_CR0_PE: u64 = 1 << 0;
 const X86_CR0_ET: u64 = 1 << 4;
 const X86_CR0_NE: u64 = 1 << 5;
 const X86_CR4_VMXE: u64 = 1 << 13;
+const X86_CR4_FSGSBASE: u64 = 1 << 16;
+const X86_CR0_PG: u64 = 1 << 31;
+const X86_EFER_LME: u64 = 1 << 8;
 const X86_EFER_LMA: u64 = 1 << 10;
+const PRIMARY_CTL_PAUSE_EXITING: u32 = 1 << 30;
 const VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK: u8 = 0;
+const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 1_000;
+const HLT_WAIT_MAX_TSC_FREQ_DIVISOR: u64 = 100;
+const HLT_WAIT_MAX_FALLBACK_TICKS: u64 = 25_000_000;
+const CPUID_TSC_CRYSTAL_HZ: u32 = 1_000_000;
 
 /// Represents a virtual machine instance
 pub struct Vm {
@@ -49,11 +63,11 @@ pub struct Vm {
     /// Memory regions mapped to this VM
     memory_regions: Mutex<BTreeMap<u32, MemoryRegion>>,
     /// EPT Table used by this VM
-    ept: Mutex<EptPageTable>,
+    ept: SpinLock<EptPageTable>,
     /// VCPUs belonging to this VM
     vcpus: Mutex<BTreeMap<u32, Arc<Vcpu>>>,
     /// Shared IOAPIC state.
-    pub(crate) ioapic: Mutex<Ioapic>,
+    pub(crate) ioapic: SpinLock<Ioapic>,
     /// Next VCPU ID
     next_vcpu_id: AtomicU32,
 }
@@ -80,7 +94,7 @@ pub struct Vcpu {
     /// Parent VM reference
     pub(crate) vm: Weak<Vm>,
     /// VCPU state
-    pub(crate) state: Mutex<VcpuState>,
+    pub(crate) state: SpinLock<VcpuState>,
     /// VMCS physical address
     vmcs_phys: PhysAddr,
     /// IO bitmap A for trapping lower port range accesses.
@@ -89,6 +103,8 @@ pub struct Vcpu {
     io_bitmap_b: Frame<()>,
     /// MSR bitmap for trapping RDMSR/WRMSR accesses.
     msr_bitmap: Frame<()>,
+    /// Guest-owned FPU/SIMD context.
+    guest_fpu: SpinLock<FpuContext>,
 }
 
 /// VCPU state
@@ -119,6 +135,35 @@ pub struct VcpuState {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct HostRunMsrs {
+    star: u64,
+    lstar: u64,
+    cstar: u64,
+    syscall_mask: u64,
+    kernel_gs_base: u64,
+}
+
+impl HostRunMsrs {
+    fn read_current() -> Self {
+        Self {
+            star: Msr::IA32_STAR.read(),
+            lstar: Msr::IA32_LSTAR.read(),
+            cstar: Msr::IA32_CSTAR.read(),
+            syscall_mask: Msr::IA32_FMASK.read(),
+            kernel_gs_base: Msr::IA32_KERNEL_GSBASE.read(),
+        }
+    }
+
+    fn restore(self) {
+        Msr::IA32_STAR.write(self.star);
+        Msr::IA32_LSTAR.write(self.lstar);
+        Msr::IA32_CSTAR.write(self.cstar);
+        Msr::IA32_FMASK.write(self.syscall_mask);
+        Msr::IA32_KERNEL_GSBASE.write(self.kernel_gs_base);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct GuestMsrState {
     pub apic_base: u64,
     pub efer: u64,
@@ -131,12 +176,19 @@ pub struct GuestMsrState {
     pub cstar: u64,
     pub syscall_mask: u64,
     pub tsc_deadline: u64,
+    pub tsc_aux: u64,
+    pub sysenter_cs: u64,
+    pub sysenter_esp: u64,
+    pub sysenter_eip: u64,
 }
 
 impl Default for GuestMsrState {
     fn default() -> Self {
+        const APIC_BASE_BSP: u64 = 1 << 8;
+        const APIC_BASE_ENABLE: u64 = 1 << 11;
+
         Self {
-            apic_base: (0xFEE0_0000_u64) | (1 << 11) | (1 << 8),
+            apic_base: 0xFEE0_0000_u64 | APIC_BASE_BSP | APIC_BASE_ENABLE,
             efer: Msr::IA32_EFER.read(),
             pat: Msr::IA32_PAT.read(),
             fs_base: 0,
@@ -147,6 +199,10 @@ impl Default for GuestMsrState {
             cstar: 0,
             syscall_mask: 0,
             tsc_deadline: 0,
+            tsc_aux: 0,
+            sysenter_cs: 0,
+            sysenter_esp: 0,
+            sysenter_eip: 0,
         }
     }
 }
@@ -157,9 +213,9 @@ impl Vm {
         Ok(Arc::new(Self {
             id,
             memory_regions: Mutex::new(BTreeMap::new()),
-            ept: Mutex::new(EptPageTable::new()?),
+            ept: SpinLock::new(EptPageTable::new()?),
             vcpus: Mutex::new(BTreeMap::new()),
-            ioapic: Mutex::new(Ioapic {
+            ioapic: SpinLock::new(Ioapic {
                 id: 1,
                 ..Ioapic::default()
             }),
@@ -401,9 +457,8 @@ impl Vcpu {
         state.lapic.ldr = (1_u32.checked_shl(id).unwrap_or(0)) << 24;
         state.apic_timer.lvt_timer_bits = 1 << 16;
         // Some virtualized environments expose enough VMX state to run the guest
-        // but still #GP on RDMSR IA32_VMX_MISC (0x485). Using a conservative
-        // fallback keeps vCPU creation from crashing the kernel. The preemption
-        // timer then counts directly in TSC ticks.
+        // but still #GP on RDMSR IA32_VMX_MISC (0x485). Use a marker value and
+        // poll active virtual deadlines at a bounded interval.
         state.tsc.multiplier = VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK;
 
         Ok(Self {
@@ -413,7 +468,8 @@ impl Vcpu {
             io_bitmap_a,
             io_bitmap_b,
             msr_bitmap,
-            state: Mutex::new(state),
+            guest_fpu: SpinLock::new(FpuContext::new()),
+            state: SpinLock::new(state),
         })
     }
 
@@ -440,15 +496,51 @@ impl Vcpu {
         }
 
         use super::handler::vmexit_handler;
+        let mut host_fpu = FpuContext::new();
         loop {
             vmptrld(self.vmcs_phys)?;
             self.prepare_pending_events()?;
-            let _irq_guard = ostd::irq::disable_local();
-            self.prepare_guest_timing_before_entry()?;
-            self.vmlaunch_or_vmresume()?;
-            let exit_info = exit_info().map_err(Error::from)?;
-            self.note_vmexit_tsc()?;
-            if let Some(run_state) = vmexit_handler(self, &exit_info)? {
+            let (exit_info, run_state) = {
+                let _irq_guard = ostd::irq::disable_local();
+                self.prepare_guest_timing_before_entry()?;
+                let host_cr2 = read_cr2_raw();
+                self.load_guest_cr2();
+                let host_run_msrs = HostRunMsrs::read_current();
+                self.load_guest_run_msrs();
+                let run_result = {
+                    let mut guest_fpu = self.guest_fpu.lock();
+                    host_fpu.save();
+                    guest_fpu.load();
+                    let run_result = self.vmlaunch_or_vmresume();
+                    guest_fpu.save();
+                    host_fpu.load();
+                    run_result
+                };
+                let msr_sync_result = self.save_guest_run_msrs();
+                host_run_msrs.restore();
+                let guest_cr2 = read_cr2_raw();
+                write_cr2_raw(host_cr2);
+                self.save_guest_cr2(guest_cr2);
+                run_result?;
+                msr_sync_result?;
+                let exit_info = exit_info().map_err(Error::from)?;
+                self.note_vmexit_tsc()?;
+                let run_state = vmexit_handler(self, &exit_info)?;
+                (exit_info, run_state)
+            };
+
+            if matches!(
+                VmxExitReason::try_from(exit_info.exit_reason),
+                Ok(VmxExitReason::HLT)
+            ) && run_state.is_some()
+                && self.wait_for_hlt_wakeup()?
+            {
+                clear_interrupt_shadow_after_hlt()?;
+                super::handler::advance_guest_rip()?;
+                continue;
+            }
+
+            if let Some(run_state) = run_state {
                 return Ok(run_state);
             }
         }
@@ -517,18 +609,20 @@ impl Vcpu {
         let msrs = state.msrs;
         drop(state);
 
-        let cr0_host_owned =
-            Cr0Flags::NUMERIC_ERROR | Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE;
+        let cr0_host_owned = Cr0Flags::from_bits_truncate(X86_CR0_PE | X86_CR0_PG)
+            | Cr0Flags::NUMERIC_ERROR
+            | Cr0Flags::NOT_WRITE_THROUGH
+            | Cr0Flags::CACHE_DISABLE;
         let guest_cr0 = sanitize_guest_cr0(sregs.cr0);
         VmcsGuestNW::CR0.write(guest_cr0 as _)?;
         VmcsControlNW::CR0_GUEST_HOST_MASK.write((cr0_host_owned.bits()) as _)?;
         VmcsControlNW::CR0_READ_SHADOW.write(sregs.cr0 as _)?;
 
-        let cr4_host_owned = Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS;
+        let cr4_host_owned = Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits() | X86_CR4_FSGSBASE;
         let guest_cr4 = sanitize_guest_cr4(sregs.cr4);
         VmcsGuestNW::CR4.write(guest_cr4 as _)?;
-        VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4_host_owned.bits() as _)?;
-        VmcsControlNW::CR4_READ_SHADOW.write(sregs.cr4 as _)?;
+        VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4_host_owned as _)?;
+        VmcsControlNW::CR4_READ_SHADOW.write(guest_cr4_read_shadow(sregs.cr4) as _)?;
 
         {
             use VmcsGuest16::*;
@@ -586,9 +680,9 @@ impl Vcpu {
         VmcsGuestNW::RIP.write(regs.rip as usize)?;
         VmcsGuestNW::RFLAGS.write((regs.rflags | 0x2) as usize)?;
         VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
-        VmcsGuestNW::IA32_SYSENTER_ESP.write(0)?;
-        VmcsGuestNW::IA32_SYSENTER_EIP.write(0)?;
-        VmcsGuest32::IA32_SYSENTER_CS.write(0)?;
+        VmcsGuestNW::IA32_SYSENTER_ESP.write(msrs.sysenter_esp as usize)?;
+        VmcsGuestNW::IA32_SYSENTER_EIP.write(msrs.sysenter_eip as usize)?;
+        VmcsGuest32::IA32_SYSENTER_CS.write(msrs.sysenter_cs as u32)?;
 
         VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
         VmcsGuest32::ACTIVITY_STATE.write(0)?;
@@ -597,7 +691,7 @@ impl Vcpu {
         VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
         VmcsGuest64::IA32_PAT.write(msrs.pat)?;
-        VmcsGuest64::IA32_EFER.write(msrs.efer)?;
+        VmcsGuest64::IA32_EFER.write(sanitize_guest_efer(msrs.efer, sregs.cr0))?;
         VmcsControl64::TSC_OFFSET.write(0)?;
         Ok(())
     }
@@ -619,10 +713,12 @@ impl Vcpu {
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
             (PrimaryControls::USE_TSC_OFFSETTING
+                | PrimaryControls::HLT_EXITING
                 | PrimaryControls::USE_IO_BITMAPS
                 | PrimaryControls::USE_MSR_BITMAPS
                 | PrimaryControls::SECONDARY_CONTROLS)
-                .bits(),
+                .bits()
+                | PRIMARY_CTL_PAUSE_EXITING,
             (PrimaryControls::CR3_LOAD_EXITING | PrimaryControls::CR3_STORE_EXITING).bits(),
         )?;
 
@@ -652,9 +748,11 @@ impl Vcpu {
 
         let mut entry_controls =
             (EntryControls::LOAD_IA32_PAT | EntryControls::LOAD_IA32_EFER).bits();
-        if self.state.lock().msrs.efer & X86_EFER_LMA != 0 {
+        let state = self.state.lock();
+        if guest_ia32e_mode_active(state.msrs.efer, state.sregs.cr0) {
             entry_controls |= EntryControls::IA32E_MODE_GUEST.bits();
         }
+        drop(state);
 
         set_control(
             VmcsControl32::VMENTRY_CONTROLS,
@@ -709,23 +807,21 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Queue a virtual interrupt for this vCPU's LAPIC.
+    /// Queues a virtual external interrupt for this vCPU.
     pub fn inject_interrupt(&self, vector: u32) -> Result<()> {
-        if !(32..256).contains(&vector) {
-            return Err(Error::with_message(
-                Errno::InvalidArgs,
-                "interrupt vector must be in the external-interrupt range [32, 255]",
-            ));
-        }
-
         let mut state = self.state.lock();
-        lapic_set_irr(&mut state.lapic, vector as u8);
-        Ok(())
+        queue_external_interrupt(&mut state.interrupt, vector)
     }
 
     /// Gets general purpose registers
     pub fn get_regs(&self) -> Result<VcpuRegs> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        if state.initialized {
+            vmptrld(self.vmcs_phys)?;
+            state.regs.rsp = VmcsGuestNW::RSP.read().map_err(Error::from)? as u64;
+            state.regs.rip = VmcsGuestNW::RIP.read().map_err(Error::from)? as u64;
+            state.regs.rflags = VmcsGuestNW::RFLAGS.read().map_err(Error::from)? as u64;
+        }
         Ok(state.regs)
     }
 
@@ -733,12 +829,28 @@ impl Vcpu {
     pub fn set_regs(&self, regs: VcpuRegs) -> Result<()> {
         let mut state = self.state.lock();
         state.regs = regs;
+        if state.initialized {
+            drop(state);
+            vmptrld(self.vmcs_phys)?;
+            VmcsGuestNW::RSP.write(regs.rsp as usize)
+                .map_err(Error::from)?;
+            VmcsGuestNW::RIP.write(regs.rip as usize)
+                .map_err(Error::from)?;
+            VmcsGuestNW::RFLAGS
+                .write((regs.rflags | 0x2) as usize)
+                .map_err(Error::from)?;
+        }
         Ok(())
     }
 
     /// Gets special registers.
     pub fn get_sregs(&self) -> Result<VcpuSregs> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        if state.initialized {
+            vmptrld(self.vmcs_phys)?;
+            sync_sregs_from_vmcs(&mut state.sregs)?;
+            state.sregs.apic_base = state.msrs.apic_base;
+        }
         Ok(state.sregs)
     }
 
@@ -752,38 +864,107 @@ impl Vcpu {
         Ok(())
     }
 
+    pub(crate) fn guest_cr2(&self) -> u64 {
+        self.state.lock().sregs.cr2
+    }
+
+    pub(crate) fn set_guest_cr2(&self, value: u64) {
+        self.state.lock().sregs.cr2 = value;
+    }
+
     pub(crate) fn emulate_cpuid(&self) -> Result<()> {
+        const CPUID_1_ECX_VMX: u32 = 1 << 5;
+        const CPUID_1_ECX_FMA: u32 = 1 << 12;
+        const CPUID_1_ECX_PCID: u32 = 1 << 17;
+        const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
+        const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;
+        const CPUID_1_ECX_AVX: u32 = 1 << 28;
+        const CPUID_7_EBX_FSGSBASE: u32 = 1 << 0;
+        const CPUID_7_EBX_HLE: u32 = 1 << 4;
+        const CPUID_7_EBX_AVX2: u32 = 1 << 5;
+        const CPUID_7_EBX_RTM: u32 = 1 << 11;
+        const CPUID_7_EBX_INVPCID: u32 = 1 << 10;
+        const CPUID_7_EBX_AVX512F: u32 = 1 << 16;
+        const CPUID_7_EBX_AVX512DQ: u32 = 1 << 17;
+        const CPUID_7_EBX_AVX512CD: u32 = 1 << 28;
+        const CPUID_7_EBX_AVX512BW: u32 = 1 << 30;
+        const CPUID_7_EBX_AVX512VL: u32 = 1 << 31;
+        const CPUID_7_ECX_AVX512VBMI: u32 = 1 << 1;
+        const CPUID_7_ECX_VAES: u32 = 1 << 9;
+        const CPUID_7_ECX_VPCLMULQDQ: u32 = 1 << 10;
+        const CPUID_7_ECX_AVX512VNNI: u32 = 1 << 11;
+        const CPUID_7_ECX_AVX512BITALG: u32 = 1 << 12;
+        const CPUID_7_ECX_AVX512VPOPCNTDQ: u32 = 1 << 14;
+
         let mut state = self.state.lock();
         let eax = state.regs.rax as u32;
         let ecx = state.regs.rcx as u32;
-        let Some(CpuidResult {
-            eax: eax_out,
-            ebx: ebx_out,
-            ecx: mut ecx_out,
-            edx: edx_out,
-        }) = cpuid(eax, ecx)
-        else {
-            state.regs.rax = 0;
-            state.regs.rbx = 0;
-            state.regs.rcx = 0;
-            state.regs.rdx = 0;
-            return Ok(());
+        let (
+            mut eax_out,
+            mut ebx_out,
+            mut ecx_out,
+            mut edx_out,
+        ) = if let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(eax, ecx) {
+            (eax, ebx, ecx, edx)
+        } else {
+            (0, 0, 0, 0)
         };
 
+        if eax == 0 {
+            eax_out = eax_out.max(0x16);
+        }
+
         if eax == 1 {
-            ecx_out &= !(1 << 21);
-            ecx_out &= !(1 << 5);
-            ecx_out &= !(1 << 28);
-            ecx_out &= !(1 << 26);
+            ecx_out &= !(CPUID_1_ECX_VMX
+                | CPUID_1_ECX_FMA
+                | CPUID_1_ECX_PCID
+                | CPUID_1_ECX_XSAVE
+                | CPUID_1_ECX_OSXSAVE
+                | CPUID_1_ECX_AVX);
         }
 
         if eax == 7 && ecx == 0 {
-            let masked_ebx = ebx_out & !(1 << 5);
-            state.regs.rax = eax_out as u64;
-            state.regs.rbx = masked_ebx as u64;
-            state.regs.rcx = ecx_out as u64;
-            state.regs.rdx = edx_out as u64;
-            return Ok(());
+            ebx_out &= !(CPUID_7_EBX_FSGSBASE
+                | CPUID_7_EBX_HLE
+                | CPUID_7_EBX_AVX2
+                | CPUID_7_EBX_RTM
+                | CPUID_7_EBX_INVPCID
+                | CPUID_7_EBX_AVX512F
+                | CPUID_7_EBX_AVX512DQ
+                | CPUID_7_EBX_AVX512CD
+                | CPUID_7_EBX_AVX512BW
+                | CPUID_7_EBX_AVX512VL);
+            ecx_out &= !(CPUID_7_ECX_AVX512VBMI
+                | CPUID_7_ECX_VAES
+                | CPUID_7_ECX_VPCLMULQDQ
+                | CPUID_7_ECX_AVX512VNNI
+                | CPUID_7_ECX_AVX512BITALG
+                | CPUID_7_ECX_AVX512VPOPCNTDQ);
+        }
+
+        if eax == 0xd {
+            eax_out = 0;
+            ebx_out = 0;
+            ecx_out = 0;
+            edx_out = 0;
+        }
+
+        if eax == 0x15 {
+            if let Some(tsc_mhz) = virtual_tsc_mhz() {
+                eax_out = 1;
+                ebx_out = tsc_mhz;
+                ecx_out = CPUID_TSC_CRYSTAL_HZ;
+                edx_out = 0;
+            }
+        }
+
+        if eax == 0x16 {
+            if let Some(tsc_mhz) = virtual_tsc_mhz() {
+                eax_out = tsc_mhz;
+                ebx_out = tsc_mhz;
+                ecx_out = 0;
+                edx_out = 0;
+            }
         }
 
         state.regs.rax = eax_out as u64;
@@ -800,17 +981,56 @@ impl Vcpu {
         Ok(())
     }
 
-    /// Recompute the VMCS TSC offset right before VM-entry so the guest TSC
-    /// resumes from the last frozen guest-visible value instead of jumping by
-    /// the host time spent handling VM exits.
-    pub(crate) fn freeze_guest_tsc(&self) -> Result<()> {
+    /// Refreshes the guest-visible TSC before VM-entry.
+    pub(crate) fn refresh_guest_tsc(&self) -> Result<()> {
         let mut state = self.state.lock();
-        state.tsc.tsc_offset = state.tsc.tsc_physical.wrapping_sub(read_tsc());
+        state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
+        Ok(())
+    }
+
+    fn load_guest_cr2(&self) {
+        let cr2 = self.state.lock().sregs.cr2;
+        write_cr2_raw(cr2);
+    }
+
+    fn save_guest_cr2(&self, cr2: u64) {
+        self.state.lock().sregs.cr2 = cr2;
+    }
+
+    fn load_guest_run_msrs(&self) {
+        let state = self.state.lock();
+
+        Msr::IA32_STAR.write(state.msrs.star);
+        Msr::IA32_LSTAR.write(state.msrs.lstar);
+        Msr::IA32_CSTAR.write(state.msrs.cstar);
+        Msr::IA32_FMASK.write(state.msrs.syscall_mask);
+        Msr::IA32_KERNEL_GSBASE.write(state.msrs.kernel_gs_base);
+    }
+
+    fn save_guest_run_msrs(&self) -> Result<()> {
+        let star = Msr::IA32_STAR.read();
+        let lstar = Msr::IA32_LSTAR.read();
+        let cstar = Msr::IA32_CSTAR.read();
+        let syscall_mask = Msr::IA32_FMASK.read();
+        let kernel_gs_base = Msr::IA32_KERNEL_GSBASE.read();
+        let fs_base = VmcsGuestNW::FS_BASE.read().map_err(Error::from)? as u64;
+        let gs_base = VmcsGuestNW::GS_BASE.read().map_err(Error::from)? as u64;
+
+        let mut state = self.state.lock();
+        state.msrs.star = star;
+        state.msrs.lstar = lstar;
+        state.msrs.cstar = cstar;
+        state.msrs.syscall_mask = syscall_mask;
+        state.msrs.kernel_gs_base = kernel_gs_base;
+        state.msrs.fs_base = fs_base;
+        state.msrs.gs_base = gs_base;
+        state.sregs.fs.base = fs_base;
+        state.sregs.gs.base = gs_base;
         Ok(())
     }
 
     pub(crate) fn prepare_guest_timing_before_entry(&self) -> Result<()> {
-        self.freeze_guest_tsc()?;
+        self.refresh_guest_tsc()?;
 
         let state = self.state.lock();
         let preemption_timer = compute_preemption_timer_value(&state);
@@ -841,19 +1061,61 @@ impl Vcpu {
         if !state.tsc.activated {
             return Ok(());
         }
-
-        let tsc = state.tsc;
-        let action = {
-            let VcpuState {
-                lapic, apic_timer, ..
-            } = &mut *state;
-            lapic_on_timer_expire(lapic, apic_timer, &tsc)
-        };
-        match action {
-            TimerExpireAction::Rearm(deadline) => timer_activate_locked(&mut state, deadline),
-            TimerExpireAction::Deactivate => timer_deactivate_locked(&mut state),
+        if state.tsc.ddl_physical > state.tsc.tsc_physical {
+            return Ok(());
         }
+
+        expire_lapic_timer_locked(&mut state);
         Ok(())
+    }
+
+    pub(crate) fn poll_expired_lapic_timer(&self) -> Result<bool> {
+        let mut state = self.state.lock();
+        if !state.tsc.activated || state.tsc.ddl_physical > state.tsc.tsc_physical {
+            return Ok(false);
+        }
+
+        expire_lapic_timer_locked(&mut state);
+        Ok(true)
+    }
+
+    pub(crate) fn wait_for_hlt_wakeup(&self) -> Result<bool> {
+        {
+            let mut state = self.state.lock();
+            refresh_tsc_locked(&mut state);
+            if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
+                return Ok(true);
+            }
+            if !state.tsc.activated {
+                return Ok(false);
+            }
+            if state.tsc.ddl_physical <= state.tsc.tsc_physical {
+                expire_lapic_timer_locked(&mut state);
+                return Ok(true);
+            }
+        }
+
+        let wait_started_tsc = read_tsc();
+        let max_wait_ticks = hlt_wait_max_ticks();
+        loop {
+            let mut state = self.state.lock();
+            refresh_tsc_locked(&mut state);
+            if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
+                return Ok(true);
+            }
+            if state.tsc.activated && state.tsc.ddl_physical <= state.tsc.tsc_physical {
+                expire_lapic_timer_locked(&mut state);
+                return Ok(true);
+            }
+            debug_assert!(state.tsc.activated);
+            let raw_tsc = read_tsc();
+            if raw_tsc.saturating_sub(wait_started_tsc) >= max_wait_ticks {
+                return Ok(false);
+            }
+            drop(state);
+
+            core::hint::spin_loop();
+        }
     }
 
     pub(crate) fn translate_guest_gpa(&self, gpa: u64) -> Result<u64> {
@@ -940,6 +1202,8 @@ impl Vcpu {
     fn prepare_pending_events(&self) -> Result<()> {
         let mut state = self.state.lock();
 
+        clear_event_injection()?;
+
         if has_pending_exception(&state.exception) {
             let mut perf = [0_u32; 32];
             inject_pending_exception(&mut state.exception, &mut perf)?;
@@ -958,10 +1222,7 @@ impl Vcpu {
 
         if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
             let mut perf = [0_u32; 224];
-            let VcpuState {
-                lapic, interrupt, ..
-            } = &mut *state;
-            inject_interrupt(lapic, interrupt, &mut perf, u32::from(vector))?;
+            inject_lapic_interrupt(&mut state.lapic, &mut perf, u32::from(vector))?;
         }
 
         Ok(())
@@ -971,6 +1232,36 @@ impl Vcpu {
 fn timer_deactivate_locked(state: &mut VcpuState) {
     state.tsc.activated = false;
     state.tsc.ddl_physical = 0;
+}
+
+fn refresh_tsc_locked(state: &mut VcpuState) {
+    state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
+}
+
+fn expire_lapic_timer_locked(state: &mut VcpuState) {
+    let tsc = state.tsc;
+    let action = {
+        let VcpuState {
+            lapic, apic_timer, ..
+        } = state;
+        lapic_on_timer_expire(lapic, apic_timer, &tsc)
+    };
+    match action {
+        TimerExpireAction::Rearm(deadline) => timer_activate_locked(state, deadline),
+        TimerExpireAction::Deactivate => timer_deactivate_locked(state),
+    }
+}
+
+fn virtual_tsc_mhz() -> Option<u32> {
+    let mhz = (tsc_freq().saturating_add(500_000)) / 1_000_000;
+    u32::try_from(mhz).ok().filter(|&mhz| mhz != 0)
+}
+
+fn hlt_wait_max_ticks() -> u64 {
+    match tsc_freq() {
+        0 => HLT_WAIT_MAX_FALLBACK_TICKS,
+        freq => (freq / HLT_WAIT_MAX_TSC_FREQ_DIVISOR).max(1),
+    }
 }
 
 fn timer_activate_locked(state: &mut VcpuState, deadline_ticks: u64) {
@@ -1009,26 +1300,62 @@ fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
 }
 
 fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
-    let ticks = if state.tsc.activated {
-        state
-            .tsc
-            .ddl_physical
-            .saturating_sub(state.tsc.tsc_physical)
-    } else {
-        tsc_freq() / 20
-    };
+    if !state.tsc.activated {
+        return VMX_PREEMPTION_TIMER_POLL_VALUE;
+    }
+
+    let ticks = state
+        .tsc
+        .ddl_physical
+        .saturating_sub(state.tsc.tsc_physical);
+
+    if state.tsc.multiplier == VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK {
+        return ticks
+            .min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE))
+            .max(1) as u32;
+    }
 
     let shifted = ticks >> state.tsc.multiplier;
     let shifted = if shifted == 0 { 1 } else { shifted };
-    shifted.min(u64::from(u32::MAX)) as u32
+    shifted.min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE)) as u32
 }
 
-fn sanitize_guest_cr0(value: u64) -> u64 {
-    value | X86_CR0_ET | X86_CR0_NE
+pub(super) fn sanitize_guest_cr0(value: u64) -> u64 {
+    let mut fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+    let fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+
+    // unrestricted guest relaxes PE/PG only
+    fixed0 &= !(X86_CR0_PE | X86_CR0_PG);
+
+    (value | fixed0 | X86_CR0_ET | X86_CR0_NE) & fixed1
 }
 
-fn sanitize_guest_cr4(value: u64) -> u64 {
-    value & !X86_CR4_VMXE
+pub(super) fn sanitize_guest_cr4(value: u64) -> u64 {
+    let fixed0 = Msr::IA32_VMX_CR4_FIXED0.read();
+    let fixed1 = Msr::IA32_VMX_CR4_FIXED1.read();
+
+    // actual hardware CR4 in VMCS must satisfy fixed bits
+    ((value | fixed0 | X86_CR4_VMXE) & fixed1) & !X86_CR4_FSGSBASE
+}
+
+pub(super) fn guest_cr4_read_shadow(value: u64) -> u64 {
+    value & !X86_CR4_FSGSBASE
+}
+
+pub(super) fn sanitize_guest_efer(value: u64, guest_cr0: u64) -> u64 {
+    let mut actual = value;
+
+    if (value & X86_EFER_LME) != 0 && (guest_cr0 & X86_CR0_PG) != 0 {
+        actual |= X86_EFER_LMA;
+    } else {
+        actual &= !X86_EFER_LMA;
+    }
+
+    actual
+}
+
+pub(super) fn guest_ia32e_mode_active(value: u64, guest_cr0: u64) -> bool {
+    (sanitize_guest_efer(value, guest_cr0) & X86_EFER_LMA) != 0
 }
 
 fn segment_access_rights(segment: &VcpuSegment) -> u32 {
@@ -1042,6 +1369,118 @@ fn segment_access_rights(segment: &VcpuSegment) -> u32 {
     rights |= u32::from(segment.g & 0x1) << 15;
     rights |= u32::from(segment.unusable & 0x1) << 16;
     rights
+}
+
+fn sync_sregs_from_vmcs(sregs: &mut VcpuSregs) -> Result<()> {
+    let cr0 = VmcsGuestNW::CR0.read().map_err(Error::from)? as u64;
+    let cr0_mask = VmcsControlNW::CR0_GUEST_HOST_MASK
+        .read()
+        .map_err(Error::from)? as u64;
+    let cr0_shadow = VmcsControlNW::CR0_READ_SHADOW
+        .read()
+        .map_err(Error::from)? as u64;
+    sregs.cr0 = merge_guest_control_register(cr0, cr0_mask, cr0_shadow);
+
+    let cr4 = VmcsGuestNW::CR4.read().map_err(Error::from)? as u64;
+    let cr4_mask = VmcsControlNW::CR4_GUEST_HOST_MASK
+        .read()
+        .map_err(Error::from)? as u64;
+    let cr4_shadow = VmcsControlNW::CR4_READ_SHADOW
+        .read()
+        .map_err(Error::from)? as u64;
+    sregs.cr4 = merge_guest_control_register(cr4, cr4_mask, cr4_shadow);
+
+    sregs.cr3 = VmcsGuestNW::CR3.read().map_err(Error::from)? as u64;
+    sregs.efer = VmcsGuest64::IA32_EFER.read().map_err(Error::from)?;
+    sregs.gdt = read_dtable_from_vmcs(VmcsGuestNW::GDTR_BASE, VmcsGuest32::GDTR_LIMIT)?;
+    sregs.idt = read_dtable_from_vmcs(VmcsGuestNW::IDTR_BASE, VmcsGuest32::IDTR_LIMIT)?;
+
+    sregs.cs = read_segment_from_vmcs(
+        VmcsGuest16::CS_SELECTOR,
+        VmcsGuestNW::CS_BASE,
+        VmcsGuest32::CS_LIMIT,
+        VmcsGuest32::CS_ACCESS_RIGHTS,
+    )?;
+    sregs.ds = read_segment_from_vmcs(
+        VmcsGuest16::DS_SELECTOR,
+        VmcsGuestNW::DS_BASE,
+        VmcsGuest32::DS_LIMIT,
+        VmcsGuest32::DS_ACCESS_RIGHTS,
+    )?;
+    sregs.es = read_segment_from_vmcs(
+        VmcsGuest16::ES_SELECTOR,
+        VmcsGuestNW::ES_BASE,
+        VmcsGuest32::ES_LIMIT,
+        VmcsGuest32::ES_ACCESS_RIGHTS,
+    )?;
+    sregs.fs = read_segment_from_vmcs(
+        VmcsGuest16::FS_SELECTOR,
+        VmcsGuestNW::FS_BASE,
+        VmcsGuest32::FS_LIMIT,
+        VmcsGuest32::FS_ACCESS_RIGHTS,
+    )?;
+    sregs.gs = read_segment_from_vmcs(
+        VmcsGuest16::GS_SELECTOR,
+        VmcsGuestNW::GS_BASE,
+        VmcsGuest32::GS_LIMIT,
+        VmcsGuest32::GS_ACCESS_RIGHTS,
+    )?;
+    sregs.ss = read_segment_from_vmcs(
+        VmcsGuest16::SS_SELECTOR,
+        VmcsGuestNW::SS_BASE,
+        VmcsGuest32::SS_LIMIT,
+        VmcsGuest32::SS_ACCESS_RIGHTS,
+    )?;
+    sregs.tr = read_segment_from_vmcs(
+        VmcsGuest16::TR_SELECTOR,
+        VmcsGuestNW::TR_BASE,
+        VmcsGuest32::TR_LIMIT,
+        VmcsGuest32::TR_ACCESS_RIGHTS,
+    )?;
+    sregs.ldt = read_segment_from_vmcs(
+        VmcsGuest16::LDTR_SELECTOR,
+        VmcsGuestNW::LDTR_BASE,
+        VmcsGuest32::LDTR_LIMIT,
+        VmcsGuest32::LDTR_ACCESS_RIGHTS,
+    )?;
+
+    Ok(())
+}
+
+fn merge_guest_control_register(value: u64, mask: u64, shadow: u64) -> u64 {
+    (value & !mask) | (shadow & mask)
+}
+
+fn read_dtable_from_vmcs(base_field: VmcsGuestNW, limit_field: VmcsGuest32) -> Result<VcpuDtable> {
+    Ok(VcpuDtable {
+        base: base_field.read().map_err(Error::from)? as u64,
+        limit: limit_field.read().map_err(Error::from)? as u16,
+        padding: [0; 3],
+    })
+}
+
+fn read_segment_from_vmcs(
+    selector_field: VmcsGuest16,
+    base_field: VmcsGuestNW,
+    limit_field: VmcsGuest32,
+    rights_field: VmcsGuest32,
+) -> Result<VcpuSegment> {
+    let rights = rights_field.read().map_err(Error::from)?;
+    Ok(VcpuSegment {
+        base: base_field.read().map_err(Error::from)? as u64,
+        limit: limit_field.read().map_err(Error::from)?,
+        selector: selector_field.read().map_err(Error::from)?,
+        type_: (rights & 0x0f) as u8,
+        s: ((rights >> 4) & 0x1) as u8,
+        dpl: ((rights >> 5) & 0x3) as u8,
+        present: ((rights >> 7) & 0x1) as u8,
+        avl: ((rights >> 12) & 0x1) as u8,
+        l: ((rights >> 13) & 0x1) as u8,
+        db: ((rights >> 14) & 0x1) as u8,
+        g: ((rights >> 15) & 0x1) as u8,
+        unusable: ((rights >> 16) & 0x1) as u8,
+        padding: 0,
+    })
 }
 
 fn validate_guest_state(state: &VcpuState) -> Result<()> {
