@@ -76,12 +76,29 @@ impl Default for SessionDesc {
 pub struct Session {
     desc: SessionDesc,
     pty_session: PtySession,
+    command_seq: usize,
 }
 
 impl Session {
     /// Creates a new session with the given PTY session and descriptor.
     pub(super) fn new(desc: SessionDesc, pty_session: PtySession) -> Self {
-        Self { desc, pty_session }
+        Self {
+            desc,
+            pty_session,
+            command_seq: 0,
+        }
+    }
+
+    fn next_command_marker(&mut self) -> String {
+        let marker = format!("__ASTERINAS_CMD_DONE_{}__", self.command_seq);
+        self.command_seq += 1;
+        marker
+    }
+
+    fn marker_print_command(marker: &str) -> String {
+        let split_at = marker.len() / 2;
+        let (head, tail) = marker.split_at(split_at);
+        format!("printf '\\n%s%s\\n' '{}' '{}'", head, tail)
     }
 
     fn output_error(error: &Error) {
@@ -141,11 +158,12 @@ impl Session {
     /// ```
     pub fn run_cmd(&mut self, command: &str) -> Result<(), Error> {
         println!("--> Running: {}", command);
+        let marker = self.next_command_marker();
         self.pty_session.send_line(command)?;
-        // Read and consume the echoed command line
-        self.pty_session.exp_string(command).unwrap();
+        self.pty_session
+            .send_line(&Self::marker_print_command(&marker))?;
 
-        if let Err(e) = self.pty_session.exp_string(self.desc.prompt) {
+        if let Err(e) = self.pty_session.exp_string(&marker) {
             Self::output_error(&e);
             return Err(e);
         }
@@ -183,11 +201,12 @@ impl Session {
     /// ```
     pub fn run_cmd_and_expect(&mut self, command: &str, expected: &str) -> Result<(), Error> {
         println!("--> Running: {} (expecting: {})", command, expected);
+        let marker = self.next_command_marker();
         self.pty_session.send_line(command)?;
-        // Read and consume the echoed command line
-        self.pty_session.exp_string(command).unwrap();
+        self.pty_session
+            .send_line(&Self::marker_print_command(&marker))?;
 
-        match self.pty_session.exp_string(self.desc.prompt) {
+        match self.pty_session.exp_string(&marker) {
             Ok(unread) => {
                 let cleaned_unread =
                     String::from_utf8_lossy(&strip_ansi_escapes::strip(&unread)).to_string();

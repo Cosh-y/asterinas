@@ -28,6 +28,7 @@ fi
 BASE_FILE="$1"
 EXTRA_FILE="$2"
 MERGED_FILE="$3"
+EXTRA_DIR="$(cd "$(dirname "$EXTRA_FILE")" && pwd)"
 
 # Check if input files exist
 if [ ! -f "$BASE_FILE" ]; then
@@ -42,6 +43,7 @@ fi
 
 BASE_CONTENT=$(cat "$BASE_FILE")
 EXTRA_CONTENT=$(cat "$EXTRA_FILE")
+EXTRA_DIR_NIX_STRING=$(printf '%s' "$EXTRA_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 # Create the merged configuration file by embedding the file contents directly.
 cat > "$MERGED_FILE" <<EOF
@@ -50,6 +52,11 @@ cat > "$MERGED_FILE" <<EOF
 
 { config, lib, pkgs, ... }:
 let
+  # The extra module is embedded below, so relative paths inside it would resolve
+  # against this generated file. Use this path when a test module needs assets
+  # from its original test directory.
+  extraFileDir = /. + "$EXTRA_DIR_NIX_STRING";
+
   # The content of the original modules is embedded here.
   baseModule = (
 $BASE_CONTENT
