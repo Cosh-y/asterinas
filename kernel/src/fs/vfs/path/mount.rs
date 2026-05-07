@@ -32,7 +32,16 @@ pub enum MountPropType {
     /// do not propagate to or from the private mounts.
     #[default]
     Private,
-    // TODO: Implement other propagation types.
+    /// A shared mount propagates mount and unmount events to its peer group.
+    Shared,
+    /// A slave mount receives propagation from its master but does not
+    /// propagate events back. Asterinas does not support shared peer groups
+    /// yet, so slave mounts currently have no master and behave like private
+    /// mounts for propagation.
+    Slave,
+    /// An unbindable mount cannot be used as a source for bind mounts.
+    Unbindable,
+    // TODO: Implement peer groups, master/slave links, and unbindable checks.
 }
 
 static ID_ALLOCATOR: Once<SpinLock<IdAlloc>> = Once::new();
@@ -174,6 +183,8 @@ pub struct Mount {
     source: Option<String>,
     /// The parent mount node.
     parent: RwLock<Option<Weak<Mount>>>,
+    /// The source mount from which this mount was cloned by a bind mount.
+    bind_master: RwLock<Option<Weak<Mount>>>,
     /// Child mount nodes which are mounted on one dentry of self.
     pub(super) children: RwLock<HashMap<DentryKey, Arc<Self>>>,
     /// The associated mount namespace.
@@ -232,6 +243,7 @@ impl Mount {
             root_dentry: Dentry::new_root(fs.root_inode()),
             mountpoint: RwLock::new(None),
             parent: RwLock::new(parent_mount),
+            bind_master: RwLock::new(None),
             children: RwLock::new(HashMap::new()),
             propagation: RwLock::new(MountPropType::default()),
             fs,
@@ -322,6 +334,7 @@ impl Mount {
             root_dentry: root_dentry.clone(),
             mountpoint: RwLock::new(None),
             parent: RwLock::new(None),
+            bind_master: RwLock::new(None),
             children: RwLock::new(HashMap::new()),
             propagation: RwLock::new(MountPropType::default()),
             fs: self.fs.clone(),
@@ -381,6 +394,20 @@ impl Mount {
         new_root_mount
     }
 
+    /// Records the mount whose events should propagate into this bind clone.
+    pub(super) fn set_bind_master(&self, master: &Arc<Mount>, recursive: bool) {
+        *self.bind_master.write() = Some(Arc::downgrade(master));
+        if !recursive {
+            return;
+        }
+
+        let mut worklist: VecDeque<Arc<Mount>> = self.children.read().values().cloned().collect();
+        while let Some(mount) = worklist.pop_front() {
+            *mount.bind_master.write() = Some(Arc::downgrade(master));
+            worklist.extend(mount.children.read().values().cloned());
+        }
+    }
+
     /// Sets the propagation type of this mount.
     pub(super) fn set_propagation(&self, prop: MountPropType, recursive: bool) {
         *self.propagation.write() = prop;
@@ -426,6 +453,61 @@ impl Mount {
     pub(super) fn graft_mount_tree(&self, target_path: &Path) {
         self.detach_from_parent();
         self.attach_to_path(target_path);
+        self.propagate_graft_to_bind_clones(target_path);
+    }
+
+    /// Grafts the mount node tree without further propagation.
+    fn graft_propagated_mount_tree(&self, target_path: &Path) {
+        self.detach_from_parent();
+        self.attach_to_path(target_path);
+    }
+
+    /// Propagates a newly grafted mount to slave/shared bind clones.
+    ///
+    /// Kata's virtio-fs setup bind-mounts a writable shared directory to a
+    /// read-only export directory and then mounts container rootfs trees under
+    /// the writable side. The later mount events must become visible through the
+    /// exported bind clone.
+    fn propagate_graft_to_bind_clones(&self, target_path: &Path) {
+        let Some(mnt_ns) = target_path.mount_node().mnt_ns().upgrade() else {
+            return;
+        };
+
+        let mut worklist = VecDeque::new();
+        worklist.push_back(mnt_ns.root().clone());
+
+        while let Some(mount) = worklist.pop_front() {
+            worklist.extend(mount.children.read().values().cloned());
+
+            if Arc::ptr_eq(&mount, target_path.mount_node()) {
+                continue;
+            }
+
+            let prop = *mount.propagation.read();
+            if !matches!(prop, MountPropType::Shared | MountPropType::Slave) {
+                continue;
+            }
+
+            let Some(master) = mount.bind_master.read().as_ref().and_then(Weak::upgrade) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&master, target_path.mount_node()) {
+                continue;
+            }
+            if !target_path
+                .dentry()
+                .is_equal_or_descendant_of(mount.root_dentry())
+            {
+                continue;
+            }
+
+            let propagated_mount =
+                self.clone_mount_tree(self.root_dentry(), Some(&Arc::downgrade(&mnt_ns)), true);
+            propagated_mount.graft_propagated_mount_tree(&Path::new(
+                mount.clone(),
+                target_path.dentry().clone(),
+            ));
+        }
     }
 
     /// Gets a child mount node from the mountpoint if any.

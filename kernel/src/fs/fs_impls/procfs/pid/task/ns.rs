@@ -22,7 +22,10 @@ use crate::{
     },
     net::uts_ns::UtsNamespace,
     prelude::*,
-    process::{NsProxy, UserNamespace, posix_thread::AsPosixThread},
+    process::{
+        IpcNamespace, NetNamespace, NsProxy, PidNamespace, UserNamespace,
+        posix_thread::AsPosixThread,
+    },
 };
 
 /// Represents the inode at `/proc/[pid]/task/[tid]/ns` (and also `/proc/[pid]/ns`).
@@ -49,21 +52,37 @@ impl NsDirOps {
 enum NsProxyEntry {
     /// The cgroup namespace.
     Cgroup,
+    /// The IPC namespace.
+    Ipc,
     /// The mount namespace.
     Mnt,
+    /// The network namespace.
+    Net,
+    /// The PID namespace.
+    Pid,
     /// The UTS namespace.
     Uts,
 }
 
 impl NsProxyEntry {
     /// All supported `NsProxy`-backed namespace entries.
-    const ALL: &[Self] = &[Self::Cgroup, Self::Mnt, Self::Uts];
+    const ALL: &[Self] = &[
+        Self::Cgroup,
+        Self::Ipc,
+        Self::Mnt,
+        Self::Net,
+        Self::Pid,
+        Self::Uts,
+    ];
 
     /// Returns the filename of this namespace entry under `/proc/[pid]/ns/`.
     fn as_str(self) -> &'static str {
         match self {
             Self::Cgroup => "cgroup",
+            Self::Ipc => "ipc",
             Self::Mnt => "mnt",
+            Self::Net => "net",
+            Self::Pid => "pid",
             Self::Uts => "uts",
         }
     }
@@ -72,7 +91,10 @@ impl NsProxyEntry {
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "cgroup" => Some(Self::Cgroup),
+            "ipc" => Some(Self::Ipc),
             "mnt" => Some(Self::Mnt),
+            "net" => Some(Self::Net),
+            "pid" => Some(Self::Pid),
             "uts" => Some(Self::Uts),
             _ => None,
         }
@@ -84,9 +106,18 @@ impl NsProxyEntry {
             Self::Cgroup => {
                 NsSymOps::<CgroupNamespace>::new_inode(ns_proxy.cgroup_ns().get_path(), parent)
             }
+            Self::Ipc => NsSymOps::<IpcNamespace>::new_inode(
+                IpcNamespace::get_init_singleton().get_path(),
+                parent,
+            ),
             Self::Mnt => {
                 NsSymOps::<MountNamespace>::new_inode(ns_proxy.mnt_ns().get_path(), parent)
             }
+            Self::Net => NsSymOps::<NetNamespace>::new_inode(ns_proxy.net_ns().get_path(), parent),
+            Self::Pid => NsSymOps::<PidNamespace>::new_inode(
+                PidNamespace::get_init_singleton().get_path(),
+                parent,
+            ),
             Self::Uts => NsSymOps::<UtsNamespace>::new_inode(ns_proxy.uts_ns().get_path(), parent),
         }
     }
@@ -95,7 +126,10 @@ impl NsProxyEntry {
     fn current_path(self, ns_proxy: &NsProxy) -> Path {
         match self {
             Self::Cgroup => ns_proxy.cgroup_ns().get_path(),
+            Self::Ipc => IpcNamespace::get_init_singleton().get_path(),
             Self::Mnt => ns_proxy.mnt_ns().get_path(),
+            Self::Net => ns_proxy.net_ns().get_path(),
+            Self::Pid => PidNamespace::get_init_singleton().get_path(),
             Self::Uts => ns_proxy.uts_ns().get_path(),
         }
     }
@@ -108,7 +142,16 @@ fn cached_ns_path(inode: &dyn Inode) -> Option<&Path> {
     if let Some(sym) = inode.downcast_ref::<NsSymlink<CgroupNamespace>>() {
         return Some(&sym.inner().ns_path);
     }
+    if let Some(sym) = inode.downcast_ref::<NsSymlink<IpcNamespace>>() {
+        return Some(&sym.inner().ns_path);
+    }
     if let Some(sym) = inode.downcast_ref::<NsSymlink<MountNamespace>>() {
+        return Some(&sym.inner().ns_path);
+    }
+    if let Some(sym) = inode.downcast_ref::<NsSymlink<NetNamespace>>() {
+        return Some(&sym.inner().ns_path);
+    }
+    if let Some(sym) = inode.downcast_ref::<NsSymlink<PidNamespace>>() {
         return Some(&sym.inner().ns_path);
     }
     if let Some(sym) = inode.downcast_ref::<NsSymlink<UserNamespace>>() {
@@ -239,8 +282,20 @@ impl DirOps for NsDirOps {
             return cached_path == &ns_proxy.cgroup_ns().get_path();
         }
 
+        if child.downcast_ref::<NsSymlink<IpcNamespace>>().is_some() {
+            return cached_path == &IpcNamespace::get_init_singleton().get_path();
+        }
+
         if child.downcast_ref::<NsSymlink<MountNamespace>>().is_some() {
             return cached_path == &ns_proxy.mnt_ns().get_path();
+        }
+
+        if child.downcast_ref::<NsSymlink<NetNamespace>>().is_some() {
+            return cached_path == &ns_proxy.net_ns().get_path();
+        }
+
+        if child.downcast_ref::<NsSymlink<PidNamespace>>().is_some() {
+            return cached_path == &PidNamespace::get_init_singleton().get_path();
         }
 
         if child.downcast_ref::<NsSymlink<UtsNamespace>>().is_some() {

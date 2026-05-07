@@ -365,7 +365,8 @@ impl Path {
 
         let current_ns_proxy = ctx.thread_local.borrow_ns_proxy();
         let current_mnt_ns = current_ns_proxy.unwrap().mnt_ns();
-        if !current_mnt_ns.owns(&self.mount) {
+        let is_pseudo_source = self.mount.flags().contains(PerMountFlags::KERNMOUNT);
+        if !current_mnt_ns.owns(&self.mount) && !is_pseudo_source {
             return_errno_with_message!(
                 Errno::EINVAL,
                 "the source path is not in this mount namespace"
@@ -378,7 +379,11 @@ impl Path {
             );
         }
 
-        let new_mount = self.mount.clone_mount_tree(&self.dentry, None, recursive);
+        let new_ns = Arc::downgrade(current_mnt_ns);
+        let new_mount = self
+            .mount
+            .clone_mount_tree(&self.dentry, Some(&new_ns), recursive);
+        new_mount.set_bind_master(&self.mount, recursive);
         new_mount.graft_mount_tree(dst_path);
         Ok(())
     }
