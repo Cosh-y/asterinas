@@ -49,4 +49,4 @@ cleanup() {
 trap cleanup EXIT INT TERM ERR
 
 RUSTSHYPER_VMM_HOST_BIN="${RUSTSHYPER_VMM_HOST_BIN}" \
-    ${DISTRO_DIR}/result/bin/install_aster_nixos.sh --config ${CONFIG_PATH} --disk ${DISK}
+    ${DISTRO_DIR}/result/bin/install_aster_nixos.sh --config ${CONFIG_PATH} --disk ${DISK} --force-format-disk

@@ -18,6 +18,8 @@
 #  - VNC_PORT: VNC port, default is "42".
 
 OVMF=${OVMF:-"on"}
+OVMF_PATH=${OVMF_PATH:-"/root/ovmf/release/OVMF.fd"}
+MICROVM_OVMF_PATH=${MICROVM_OVMF_PATH:-"/root/ovmf/release/microvm/MICROVM.fd"}
 VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 NETDEV=${NETDEV:-"user"}
@@ -184,11 +186,11 @@ fi
 if [ "$OVMF" = "on" ]; then
     if [ "$1" = "microvm" ]; then
         QEMU_ARGS="${QEMU_ARGS} \
-            -bios /root/ovmf/release/microvm/MICROVM.fd \
+            -bios ${MICROVM_OVMF_PATH} \
         "
     else
         QEMU_ARGS="${QEMU_ARGS} \
-            -bios /root/ovmf/release/OVMF.fd \
+            -bios ${OVMF_PATH} \
         "
     fi
 fi
