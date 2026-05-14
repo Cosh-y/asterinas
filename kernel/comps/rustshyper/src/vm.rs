@@ -37,7 +37,7 @@ use super::{
     interrupt::{
         clear_event_injection, clear_interrupt_shadow_after_hlt, has_pending_exception,
         inject_lapic_interrupt, inject_pending_exception, queue_external_interrupt,
-        try_inject_pending_interrupt, ExceptionState, InterruptState,
+        inject_pending_interrupt, ExceptionState, InterruptState,
     },
     utils::*,
 };
@@ -104,8 +104,6 @@ pub struct Vcpu {
     io_bitmap_b: Frame<()>,
     /// MSR bitmap for trapping RDMSR/WRMSR accesses.
     msr_bitmap: Frame<()>,
-    /// Guest-owned FPU/SIMD context.
-    guest_fpu: SpinLock<FpuContext>,
 }
 
 /// VCPU state
@@ -115,6 +113,8 @@ pub struct VcpuState {
     pub regs: VcpuRegs,
     /// Special registers and descriptor tables provided by userspace.
     pub sregs: VcpuSregs,
+    /// FPU/SIMD context.
+    pub fpu: FpuContext,
     /// Running state
     pub running: bool,
     /// Vcpu has been launched
@@ -133,6 +133,32 @@ pub struct VcpuState {
     pub apic_timer: ApicTimer,
     /// TSC-tracking state for virtual timer emulation.
     pub tsc: TscState,
+}
+
+#[derive(Debug, Clone)]
+/// 不能被 VMCS 自动保存恢复的 Host 上下文
+struct HostContext {
+    msrs: HostRunMsrs,
+    fpu: FpuContext,
+    cr2: u64,
+}
+
+impl HostContext {
+    fn save() -> Self {
+        let mut fpu = FpuContext::new();
+        fpu.save();
+        Self {
+            msrs: HostRunMsrs::read_current(),
+            fpu,
+            cr2: read_cr2_raw(),
+        }
+    }
+
+    fn restore(mut self) {
+        write_cr2_raw(self.cr2);
+        self.fpu.load();
+        self.msrs.restore();
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -469,7 +495,6 @@ impl Vcpu {
             io_bitmap_a,
             io_bitmap_b,
             msr_bitmap,
-            guest_fpu: SpinLock::new(FpuContext::new()),
             state: SpinLock::new(state),
         })
     }
@@ -497,41 +522,33 @@ impl Vcpu {
         }
 
         use super::handler::vmexit_handler;
-        let mut host_fpu = FpuContext::new();
         loop {
+            let irq_guard = ostd::irq::disable_local();
+            
             vmptrld(self.vmcs_phys)?;
             self.prepare_pending_events()?;
-            let (exit_info, run_state) = {
-                let _irq_guard = ostd::irq::disable_local();
-                self.prepare_guest_timing_before_entry()?;
+            self.prepare_guest_timing_before_entry()?;
 
-                let host_cr2 = read_cr2_raw();
-                self.load_guest_cr2();
+            let mut host_context = HostContext::save();
+            
+            let (exit_info, run_state) = {                
+                self.restore_context();
                 
-                let host_run_msrs = HostRunMsrs::read_current();
-                self.load_guest_run_msrs();
-                let run_result = {
-                    let mut guest_fpu = self.guest_fpu.lock();
-                    host_fpu.save();
-                    guest_fpu.load();
-                    let run_result = self.vmlaunch_or_vmresume();
-                    guest_fpu.save();
-                    host_fpu.load();
-                    run_result
-                };
-                let msr_sync_result = self.save_guest_run_msrs();
-                host_run_msrs.restore();
+                let run_result = self.vmlaunch_or_vmresume();
                 
-                self.save_guest_cr2();
-                write_cr2_raw(host_cr2);
+                let save_context_result = self.save_context();
+                host_context.restore();
                 
                 run_result?;
-                msr_sync_result?;
+                save_context_result?;
+
                 let exit_info = exit_info().map_err(Error::from)?;
                 self.note_vmexit_tsc()?;
                 let run_state = vmexit_handler(self, &exit_info)?;
                 (exit_info, run_state)
             };
+
+            drop(irq_guard);
 
             if let Some(run_state) = run_state {
                 return Ok(run_state);
@@ -801,6 +818,20 @@ impl Vcpu {
         Ok(())
     }
 
+    fn restore_context(&self) {
+        let cr2 = self.state.lock().sregs.cr2;
+        write_cr2_raw(cr2);
+        self.load_guest_run_msrs();
+        self.state.lock().fpu.load();
+    }
+
+    fn save_context(&self) -> Result<()> {
+        self.state.lock().fpu.save();
+        self.save_guest_run_msrs()?;
+        self.state.lock().sregs.cr2 = read_cr2_raw();
+        Ok(())
+    }
+
     /// Queues a virtual external interrupt for this vCPU.
     pub fn inject_interrupt(&self, vector: u32) -> Result<()> {
         let mut state = self.state.lock();
@@ -983,14 +1014,14 @@ impl Vcpu {
         Ok(())
     }
 
-    fn load_guest_cr2(&self) {
-        let cr2 = self.state.lock().sregs.cr2;
-        write_cr2_raw(cr2);
-    }
+    // fn load_guest_cr2(&self) {
+    //     let cr2 = self.state.lock().sregs.cr2;
+    //     write_cr2_raw(cr2);
+    // }
 
-    fn save_guest_cr2(&self) {
-        self.state.lock().sregs.cr2 = read_cr2_raw();
-    }
+    // fn save_guest_cr2(&self) {
+    //     self.state.lock().sregs.cr2 = read_cr2_raw();
+    // }
 
     fn load_guest_run_msrs(&self) {
         let state = self.state.lock();
@@ -1210,7 +1241,7 @@ impl Vcpu {
             let VcpuState {
                 lapic, interrupt, ..
             } = &mut *state;
-            try_inject_pending_interrupt(lapic, interrupt)?;
+            inject_pending_interrupt(lapic, interrupt)?;
         }
         if state.interrupt.pending {
             return Ok(());

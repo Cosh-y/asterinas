@@ -224,7 +224,7 @@ fn vmx_interrupt_injectable() -> Result<bool> {
 
 /// If a deferred interrupt is pending and the guest is now interruptible,
 /// write it into the VM-entry interruption-information field.
-pub fn try_inject_pending_interrupt(lapic: &mut Lapic, intr: &mut InterruptState) -> Result<()> {
+pub fn inject_pending_interrupt(lapic: &mut Lapic, intr: &mut InterruptState) -> Result<()> {
     if !intr.pending {
         return Ok(());
     }
