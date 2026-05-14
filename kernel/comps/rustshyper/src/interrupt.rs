@@ -133,6 +133,7 @@ pub fn clear_event_injection() -> Result<()> {
 }
 
 /// Clears interrupt shadow after an emulated HLT wakeup.
+/// remove BLOCKING_BY_STI bit in the guest interruptibility state(VMCS)
 pub fn clear_interrupt_shadow_after_hlt() -> Result<()> {
     let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE
         .read()
@@ -180,6 +181,7 @@ pub fn inject_lapic_interrupt(
     }
 
     disable_interrupt_window_exiting()?;
+    /// 通过 VMCS 向 guest 注入 event，类型是 external interrupt
     VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
         .write(intr_info)
         .map_err(Error::from)?;
@@ -208,8 +210,6 @@ pub fn inject_gp_fault(exc: &mut ExceptionState) {
 
 /// Check whether the guest is currently in a state where an external interrupt
 /// can be injected (RFLAGS.IF == 1 and no blocking-by-STI/MOV-SS).
-///
-/// Mirrors `vmx_interrupt_injectable` from the C VMX backend.
 fn vmx_interrupt_injectable() -> Result<bool> {
     let rflags = VmcsGuestNW::RFLAGS.read().map_err(Error::from)?;
     let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE

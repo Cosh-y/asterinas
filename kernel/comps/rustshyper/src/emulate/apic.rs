@@ -50,11 +50,14 @@ pub struct Lapic {
     pub id: u32,
     pub ldr: u32, // Logical Destination Register
 
-    pub tpr: u8, // Task Priority
+    /// Task Priority Register: 7:4 = priority threshold
+    pub tpr: u8,
     pub ppr: u8, // Processor Priority (derived)
 
-    pub irr: [u32; 8], // Interrupt Request Register
-    pub isr: [u32; 8], // In-Service Register
+    /// Interrupt Request Register: containes pending interrupts that have not yet been dispatched to the processor
+    pub irr: [u32; 8],
+    /// In-Service Register: contains interrupts that have been dispatched to the processor but not yet EOIed
+    pub isr: [u32; 8],
     pub icr: [u32; 8], // Interrupt Command Register
     pub tmr: [u32; 8], // Trigger Mode Register
 }
@@ -62,7 +65,7 @@ pub struct Lapic {
 /// APIC timer state.
 #[derive(Debug, Default)]
 pub struct ApicTimer {
-    pub lvt_timer_bits: u32,
+    pub lvt_timer_bits: u32, // LVT(Local Vector Table) Timer Register
     pub divide_shift: u8,
     pub initial_count: u32,
 }
@@ -203,11 +206,14 @@ pub fn lapic_kick_to_service(lapic: &mut Lapic, vec: u8) {
 }
 
 /// Return the highest-priority pending vector that is deliverable, or `None`.
+/// pending vector is the highest set bit in IRR.
+/// pending vector is deliverable if its priority is higher than the current TPR and all ISR vectors.
 pub fn lapic_check_pending_vector(lapic: &Lapic) -> Option<u8> {
     let pending_vector = lapic_find_highest_irr(lapic)?;
 
     let isr_vector = lapic_find_highest_isr(lapic);
 
+    // interrupt vector 的高四位表示优先级，低四位表示具体的中断号。同一优先级的中断由低四位决定先后顺序。
     let pending_prio = pending_vector >> 4;
     let tpr_prio = lapic.tpr >> 4;
     let isr_prio = isr_vector.map(|v| v >> 4).unwrap_or(0);
@@ -458,6 +464,7 @@ pub fn emulate_lapic_write(
     (LapicWriteEffect::None, true)
 }
 
+/// 
 fn deliver_icr_fixed_interrupt(lapic: &mut Lapic, low: u32, high: u32) {
     let vector = (low & 0xFF) as u8;
     let delivery_mode = (low >> 8) & 0x7;

@@ -4,13 +4,13 @@ use ostd::arch::virt::*;
 
 use super::{
     emulate::apic::{
-        emulate_ioapic_read, emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
-        LapicWriteEffect, IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
+        IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE, LapicWriteEffect, emulate_ioapic_read,
+        emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
     },
     error::*,
     vm::{
-        guest_cr4_read_shadow, guest_ia32e_mode_active, sanitize_guest_cr0, sanitize_guest_cr4,
-        sanitize_guest_efer, GuestMsrState, Vcpu,
+        GuestMsrState, Vcpu, guest_cr4_read_shadow, sanitize_guest_cr0, sanitize_guest_cr4,
+        sanitize_guest_efer,
     },
 };
 use crate::interrupt::{
@@ -185,11 +185,13 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
         }
         Ok(VmxExitReason::TRIPLE_FAULT) => Ok(Some(build_run_state(exit_info))),
         Ok(VmxExitReason::HLT) => {
-            if vcpu.poll_expired_lapic_timer()? {
+            if vcpu.wait_for_hlt_wakeup()? {
+                // log::error!("Guest HLT. But wake up from host kernel due to event injection or interrupt window");
                 clear_interrupt_shadow_after_hlt()?;
                 advance_guest_rip()?;
                 Ok(None)
             } else {
+                // log::error!("Guest HLT. Can't wake up from host kernel. Returning to userspace to wait for wakeup event.");
                 Ok(Some(build_run_state(exit_info)))
             }
         }
@@ -326,16 +328,22 @@ fn emulate_cr_access(vcpu: &Vcpu) -> Result<()> {
         0 => {
             let value = read_gpr(&regs, gpr_index, 8);
             match cr_index {
+                // A value different from the shadow was written to the masked bit.
                 0 => emulate_cr0_write(vcpu, value)?,
                 2 => vcpu.set_guest_cr2(value),
-                3 => VmcsGuestNW::CR3.write(value as usize).map_err(Error::from)?,
+                3 => VmcsGuestNW::CR3
+                    .write(value as usize)
+                    .map_err(Error::from)?,
                 4 => emulate_cr4_write(value)?,
                 other => log::warn!("rustshyper: ignoring guest write to CR{}", other),
             }
         }
         1 => {
             let value = match cr_index {
-                0 => VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64,
+                0 => {
+                    log::error!("rustshyper: guest read CR0 causes VM-exit, which should not happen");
+                    VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64
+                },
                 2 => vcpu.guest_cr2(),
                 3 => VmcsGuestNW::CR3.read().map_err(Error::from)? as u64,
                 4 => VmcsControlNW::CR4_READ_SHADOW.read().map_err(Error::from)? as u64,
@@ -361,8 +369,9 @@ fn emulate_cr0_write(vcpu: &Vcpu, value: u64) -> Result<()> {
         return Ok(());
     }
 
-    let shadow_value = value;
-    let actual_value = sanitize_guest_cr0(value);
+    let sanitized_value = sanitize_guest_cr0(value);
+    let shadow_value = sanitized_value;
+    let actual_value = sanitized_value;
     let guest_efer = vcpu.state.lock().msrs.efer;
 
     VmcsControlNW::CR0_READ_SHADOW
@@ -371,7 +380,7 @@ fn emulate_cr0_write(vcpu: &Vcpu, value: u64) -> Result<()> {
     VmcsGuestNW::CR0
         .write(actual_value as usize)
         .map_err(Error::from)?;
-    sync_guest_efer_state(guest_efer, value)?;
+    update_guest_efer_vmcs(guest_efer, shadow_value)?;
     Ok(())
 }
 
@@ -395,11 +404,11 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
 
     if is_write {
         let msr_value = (state.regs.rax as u32 as u64) | ((state.regs.rdx as u32 as u64) << 32);
-        if is_x2apic_msr(msr_index) {
-            drop(state);
-            emulate_x2apic_msr_write(vcpu, msr_index, msr_value)?;
-            return Ok(());
-        }
+        // if is_x2apic_msr(msr_index) {
+        //     drop(state);
+        //     emulate_x2apic_msr_write(vcpu, msr_index, msr_value)?;
+        //     return Ok(());
+        // }
 
         match msr_index {
             MSR_IA32_TSC => {
@@ -450,22 +459,22 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
         return Ok(());
     }
 
-    if is_x2apic_msr(msr_index) {
-        drop(state);
-        let Some(msr_value) = emulate_x2apic_msr_read(vcpu, msr_index) else {
-            log::warn!(
-                "rustshyper: unsupported x2APIC RDMSR rip={:#x} msr={:#x}",
-                guest_rip,
-                msr_index,
-            );
-            queue_gp_fault(vcpu)?;
-            return Ok(());
-        };
-        let mut state = vcpu.state.lock();
-        state.regs.rax = msr_value as u32 as u64;
-        state.regs.rdx = msr_value >> 32;
-        return Ok(());
-    }
+    // if is_x2apic_msr(msr_index) {
+    //     drop(state);
+    //     let Some(msr_value) = emulate_x2apic_msr_read(vcpu, msr_index) else {
+    //         log::warn!(
+    //             "rustshyper: unsupported x2APIC RDMSR rip={:#x} msr={:#x}",
+    //             guest_rip,
+    //             msr_index,
+    //         );
+    //         queue_gp_fault(vcpu)?;
+    //         return Ok(());
+    //     };
+    //     let mut state = vcpu.state.lock();
+    //     state.regs.rax = msr_value as u32 as u64;
+    //     state.regs.rdx = msr_value >> 32;
+    //     return Ok(());
+    // }
 
     let msr_value = match msr_index {
         MSR_IA32_TSC => state.tsc.tsc_physical,
@@ -516,9 +525,7 @@ fn update_guest_msr_vmcs(msrs: &GuestMsrState) -> Result<()> {
     let guest_cr0 = VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64;
 
     VmcsGuest64::IA32_PAT.write(msrs.pat).map_err(Error::from)?;
-    VmcsGuest64::IA32_EFER
-        .write(sanitize_guest_efer(msrs.efer, guest_cr0))
-        .map_err(Error::from)?;
+    update_guest_efer_vmcs(msrs.efer, guest_cr0)?;
     VmcsGuestNW::FS_BASE
         .write(msrs.fs_base as usize)
         .map_err(Error::from)?;
@@ -534,27 +541,28 @@ fn update_guest_msr_vmcs(msrs: &GuestMsrState) -> Result<()> {
     VmcsGuestNW::IA32_SYSENTER_EIP
         .write(msrs.sysenter_eip as usize)
         .map_err(Error::from)?;
-    sync_guest_ia32e_mode_control(msrs.efer, guest_cr0)?;
     Ok(())
 }
 
-fn sync_guest_efer_state(guest_efer: u64, guest_cr0: u64) -> Result<()> {
-    VmcsGuest64::IA32_EFER
-        .write(sanitize_guest_efer(guest_efer, guest_cr0))
-        .map_err(Error::from)?;
-    sync_guest_ia32e_mode_control(guest_efer, guest_cr0)
-}
+use x86::vmx::vmcs::control::EntryControls;
 
-fn sync_guest_ia32e_mode_control(guest_efer: u64, guest_cr0: u64) -> Result<()> {
+fn update_guest_efer_vmcs(guest_efer: u64, guest_cr0: u64) -> Result<()> {
+    const EFER_LMA: u64 = 1 << 10;
+
+    let sanitized_efer = sanitize_guest_efer(guest_efer, guest_cr0);
+
+    VmcsGuest64::IA32_EFER
+        .write(sanitized_efer)
+        .map_err(Error::from)?;
+
     let mut entry = VmcsControl32::VMENTRY_CONTROLS
         .read()
         .map_err(Error::from)?;
-    let ia32e_mode_guest = 1 << 9;
 
-    if guest_ia32e_mode_active(guest_efer, guest_cr0) {
-        entry |= ia32e_mode_guest;
+    if sanitized_efer & EFER_LMA != 0 {
+        entry |= EntryControls::IA32E_MODE_GUEST.bits();
     } else {
-        entry &= !ia32e_mode_guest;
+        entry &= !EntryControls::IA32E_MODE_GUEST.bits();
     }
 
     VmcsControl32::VMENTRY_CONTROLS
@@ -571,60 +579,64 @@ fn sanitize_apic_base(value: u64) -> u64 {
     LAPIC_BASE | APIC_BASE_ENABLE | (value & (APIC_BASE_BSP | APIC_BASE_X2APIC))
 }
 
-fn is_x2apic_msr(msr_index: u32) -> bool {
-    (MSR_X2APIC_BASE..=MSR_X2APIC_END).contains(&msr_index)
-}
+// fn is_x2apic_msr(msr_index: u32) -> bool {
+//     (MSR_X2APIC_BASE..=MSR_X2APIC_END).contains(&msr_index)
+// }
 
-fn x2apic_msr_offset(msr_index: u32) -> u64 {
-    u64::from(msr_index - MSR_X2APIC_BASE) << 4
-}
+// fn x2apic_msr_offset(msr_index: u32) -> u64 {
+//     u64::from(msr_index - MSR_X2APIC_BASE) << 4
+// }
 
-fn emulate_x2apic_msr_read(vcpu: &Vcpu, msr_index: u32) -> Option<u64> {
-    let offset = x2apic_msr_offset(msr_index);
-    let state = vcpu.state.lock();
+// It seems that this function has not been used.
+// fn emulate_x2apic_msr_read(vcpu: &Vcpu, msr_index: u32) -> Option<u64> {
+//     log::error!("Guest read from x2APIC MSR {:#x}", msr_index);
+//     let offset = x2apic_msr_offset(msr_index);
+//     let state = vcpu.state.lock();
 
-    if offset == 0x20 {
-        return Some(state.lapic.id as u64);
-    }
+//     if offset == 0x20 {
+//         return Some(state.lapic.id as u64);
+//     }
 
-    let (value, ok) = emulate_lapic_read(&state.lapic, &state.apic_timer, &state.tsc, offset);
-    ok.then_some(value)
-}
+//     let (value, ok) = emulate_lapic_read(&state.lapic, &state.apic_timer, &state.tsc, offset);
+//     ok.then_some(value)
+// }
 
-fn emulate_x2apic_msr_write(vcpu: &Vcpu, msr_index: u32, value: u64) -> Result<()> {
-    let offset = x2apic_msr_offset(msr_index);
-    let vm = vcpu
-        .vm
-        .upgrade()
-        .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
-    let mut ioapic = vm.ioapic.lock();
+// It seems that this function has not been used.
+// fn emulate_x2apic_msr_write(vcpu: &Vcpu, msr_index: u32, value: u64) -> Result<()> {
+//     log::error!("Guest write to x2APIC MSR {:#x} with value {:#x}", msr_index, value);
+//     let offset = x2apic_msr_offset(msr_index);
+//     let vm = vcpu
+//         .vm
+//         .upgrade()
+//         .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
+//     let mut ioapic = vm.ioapic.lock();
 
-    let effect = {
-        let mut state = vcpu.state.lock();
-        let (effect, ok) = {
-            let super::vm::VcpuState {
-                lapic, apic_timer, ..
-            } = &mut *state;
-            emulate_lapic_write(lapic, apic_timer, &mut ioapic, offset, value)
-        };
-        if !ok {
-            inject_gp_fault(&mut state.exception);
-            let mut perf = [0u32; 32];
-            inject_pending_exception(&mut state.exception, &mut perf)?;
-            return Ok(());
-        }
-        effect
-    };
+//     let effect = {
+//         let mut state = vcpu.state.lock();
+//         let (effect, ok) = {
+//             let super::vm::VcpuState {
+//                 lapic, apic_timer, ..
+//             } = &mut *state;
+//             emulate_lapic_write(lapic, apic_timer, &mut ioapic, offset, value)
+//         };
+//         if !ok {
+//             inject_gp_fault(&mut state.exception);
+//             let mut perf = [0u32; 32];
+//             inject_pending_exception(&mut state.exception, &mut perf)?;
+//             return Ok(());
+//         }
+//         effect
+//     };
 
-    drop(ioapic);
-    match effect {
-        LapicWriteEffect::StartTimer | LapicWriteEffect::StartTimerDeadline => {
-            vcpu.handle_lapic_timer_write_effect(effect)?;
-        }
-        LapicWriteEffect::None => {}
-    }
-    Ok(())
-}
+//     drop(ioapic);
+//     match effect {
+//         LapicWriteEffect::StartTimer | LapicWriteEffect::StartTimerDeadline => {
+//             vcpu.handle_lapic_timer_write_effect(effect)?;
+//         }
+//         LapicWriteEffect::None => {}
+//     }
+//     Ok(())
+// }
 
 fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
     let mut state = vcpu.state.lock();
@@ -693,6 +705,7 @@ fn write_gpr(regs: &mut VcpuRegs, index: u8, size: u8, value: u64) {
 }
 
 fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
+    // log::error!("Guest access to APIC MMIO at GPA {:#x}", fault_gpa);
     let is_lapic = (LAPIC_BASE..(LAPIC_BASE + LAPIC_SIZE)).contains(&fault_gpa);
     let is_ioapic = (IOAPIC_BASE..(IOAPIC_BASE + IOAPIC_SIZE)).contains(&fault_gpa);
     if !is_lapic && !is_ioapic {
@@ -721,6 +734,7 @@ fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
 }
 
 fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Result<bool> {
+    // log::error!("Guest access to LAPIC MMIO at GPA {:#x}", fault_gpa);
     let offset = fault_gpa - LAPIC_BASE;
     if insn.is_read {
         let mut state = vcpu.state.lock();
@@ -758,7 +772,9 @@ fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Res
 }
 
 fn emulate_ioapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Result<bool> {
+    // log::error!("Guest access to IOAPIC MMIO at GPA {:#x}", fault_gpa);
     let offset = fault_gpa - IOAPIC_BASE;
+    // log::error!("IOAPIC MMIO access with offset {:#x}, IOAPIC_BASE {:#x}", offset, IOAPIC_BASE);
     let vm = vcpu
         .vm
         .upgrade()

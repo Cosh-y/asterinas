@@ -11,6 +11,7 @@ extern crate alloc;
 mod emulate;
 mod error;
 mod handler;
+mod utils;
 pub mod interrupt;
 pub mod vm;
 

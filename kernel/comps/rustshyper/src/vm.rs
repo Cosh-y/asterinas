@@ -39,6 +39,7 @@ use super::{
         inject_lapic_interrupt, inject_pending_exception, queue_external_interrupt,
         try_inject_pending_interrupt, ExceptionState, InterruptState,
     },
+    utils::*,
 };
 
 const X86_CR0_PE: u64 = 1 << 0;
@@ -503,8 +504,10 @@ impl Vcpu {
             let (exit_info, run_state) = {
                 let _irq_guard = ostd::irq::disable_local();
                 self.prepare_guest_timing_before_entry()?;
+
                 let host_cr2 = read_cr2_raw();
                 self.load_guest_cr2();
+                
                 let host_run_msrs = HostRunMsrs::read_current();
                 self.load_guest_run_msrs();
                 let run_result = {
@@ -518,9 +521,10 @@ impl Vcpu {
                 };
                 let msr_sync_result = self.save_guest_run_msrs();
                 host_run_msrs.restore();
-                let guest_cr2 = read_cr2_raw();
+                
+                self.save_guest_cr2();
                 write_cr2_raw(host_cr2);
-                self.save_guest_cr2(guest_cr2);
+                
                 run_result?;
                 msr_sync_result?;
                 let exit_info = exit_info().map_err(Error::from)?;
@@ -529,17 +533,6 @@ impl Vcpu {
                 (exit_info, run_state)
             };
 
-            if matches!(
-                VmxExitReason::try_from(exit_info.exit_reason),
-                Ok(VmxExitReason::HLT)
-            ) && run_state.is_some()
-                && self.wait_for_hlt_wakeup()?
-            {
-                clear_interrupt_shadow_after_hlt()?;
-                super::handler::advance_guest_rip()?;
-                continue;
-            }
-
             if let Some(run_state) = run_state {
                 return Ok(run_state);
             }
@@ -547,6 +540,7 @@ impl Vcpu {
     }
 
     fn init(&self, eptp: u64) -> Result<()> {
+        log::error!("Vcpu init.(initialize VMCS)");
         vmclear(self.vmcs_phys)?;
         vmptrld(self.vmcs_phys)?;
 
@@ -691,7 +685,7 @@ impl Vcpu {
         VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
         VmcsGuest64::IA32_PAT.write(msrs.pat)?;
-        VmcsGuest64::IA32_EFER.write(sanitize_guest_efer(msrs.efer, sregs.cr0))?;
+        VmcsGuest64::IA32_EFER.write(msrs.efer)?;
         VmcsControl64::TSC_OFFSET.write(0)?;
         Ok(())
     }
@@ -749,7 +743,7 @@ impl Vcpu {
         let mut entry_controls =
             (EntryControls::LOAD_IA32_PAT | EntryControls::LOAD_IA32_EFER).bits();
         let state = self.state.lock();
-        if guest_ia32e_mode_active(state.msrs.efer, state.sregs.cr0) {
+        if state.msrs.efer & X86_EFER_LMA != 0 {
             entry_controls |= EntryControls::IA32E_MODE_GUEST.bits();
         }
         drop(state);
@@ -974,6 +968,7 @@ impl Vcpu {
         Ok(())
     }
 
+    /// TODO: 现在 note 和 refresh 的实现是一样的？
     /// Record Guest TSC value at VM exit.
     pub(crate) fn note_vmexit_tsc(&self) -> Result<()> {
         let mut state = self.state.lock();
@@ -993,8 +988,8 @@ impl Vcpu {
         write_cr2_raw(cr2);
     }
 
-    fn save_guest_cr2(&self, cr2: u64) {
-        self.state.lock().sregs.cr2 = cr2;
+    fn save_guest_cr2(&self) {
+        self.state.lock().sregs.cr2 = read_cr2_raw();
     }
 
     fn load_guest_run_msrs(&self) {
@@ -1029,6 +1024,8 @@ impl Vcpu {
         Ok(())
     }
 
+
+    /// 在 VMEntry 前更新 tsc offset 并设置 VMCS 中的 preemption timer 和 tsc offset
     pub(crate) fn prepare_guest_timing_before_entry(&self) -> Result<()> {
         self.refresh_guest_tsc()?;
 
@@ -1065,20 +1062,19 @@ impl Vcpu {
             return Ok(());
         }
 
+        // log::error!(
+        //     "Triggered by preemption timer: VCPU {} LAPIC timer expired. 
+        //     tsc_physical={:#x} tsc_ddl_physical={:#x} multiplier={:#x}",
+        //     self.id,
+        //     state.tsc.tsc_physical,
+        //     state.tsc.ddl_physical,
+        //     state.tsc.multiplier
+        // );
         expire_lapic_timer_locked(&mut state);
         Ok(())
     }
 
-    pub(crate) fn poll_expired_lapic_timer(&self) -> Result<bool> {
-        let mut state = self.state.lock();
-        if !state.tsc.activated || state.tsc.ddl_physical > state.tsc.tsc_physical {
-            return Ok(false);
-        }
-
-        expire_lapic_timer_locked(&mut state);
-        Ok(true)
-    }
-
+    /// 判断能否在内核中等到打破 hlt 的中断
     pub(crate) fn wait_for_hlt_wakeup(&self) -> Result<bool> {
         {
             let mut state = self.state.lock();
@@ -1222,6 +1218,7 @@ impl Vcpu {
 
         if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
             let mut perf = [0_u32; 224];
+            // TODO: 怀疑 perf 变量无用。
             inject_lapic_interrupt(&mut state.lapic, &mut perf, u32::from(vector))?;
         }
 
@@ -1229,27 +1226,8 @@ impl Vcpu {
     }
 }
 
-fn timer_deactivate_locked(state: &mut VcpuState) {
-    state.tsc.activated = false;
-    state.tsc.ddl_physical = 0;
-}
-
 fn refresh_tsc_locked(state: &mut VcpuState) {
     state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
-}
-
-fn expire_lapic_timer_locked(state: &mut VcpuState) {
-    let tsc = state.tsc;
-    let action = {
-        let VcpuState {
-            lapic, apic_timer, ..
-        } = state;
-        lapic_on_timer_expire(lapic, apic_timer, &tsc)
-    };
-    match action {
-        TimerExpireAction::Rearm(deadline) => timer_activate_locked(state, deadline),
-        TimerExpireAction::Deactivate => timer_deactivate_locked(state),
-    }
 }
 
 fn virtual_tsc_mhz() -> Option<u32> {
@@ -1264,25 +1242,40 @@ fn hlt_wait_max_ticks() -> u64 {
     }
 }
 
+/// 关闭时钟中断计时器
+fn timer_deactivate_locked(state: &mut VcpuState) {
+    state.tsc.activated = false;
+    state.tsc.ddl_physical = 0;
+}
+
+/// 在 tsc_physical 超过 ddl_physical 时调用
+/// 通过 lapic_on_timer_expire 设置中断，并根据其返回值再次设置 timer
+fn expire_lapic_timer_locked(state: &mut VcpuState) {
+    let tsc = state.tsc;
+    let action = {
+        let VcpuState {
+            lapic, apic_timer, ..
+        } = state;
+        lapic_on_timer_expire(lapic, apic_timer, &tsc)
+    };
+    match action {
+        TimerExpireAction::Rearm(deadline) => timer_activate_locked(state, deadline),
+        TimerExpireAction::Deactivate => timer_deactivate_locked(state),
+    }
+}
+
+/// 查看当前 tsc_physical 是否小于 deadline，若是，则设置 deadline 到 ddl_physical 中
+/// 否则调用 expire_lapic_timer_locked
 fn timer_activate_locked(state: &mut VcpuState, deadline_ticks: u64) {
     state.tsc.activated = true;
     if deadline_ticks > state.tsc.tsc_physical {
         state.tsc.ddl_physical = deadline_ticks;
     } else {
-        let tsc = state.tsc;
-        let action = {
-            let VcpuState {
-                lapic, apic_timer, ..
-            } = &mut *state;
-            lapic_on_timer_expire(lapic, apic_timer, &tsc)
-        };
-        match action {
-            TimerExpireAction::Rearm(next_deadline) => timer_activate_locked(state, next_deadline),
-            TimerExpireAction::Deactivate => timer_deactivate_locked(state),
-        }
+        expire_lapic_timer_locked(state);
     }
 }
 
+/// 以 One-shot/Periodic 模式设置 lapic timer
 fn start_apic_timer_locked(state: &mut VcpuState) {
     if let Some(deadline) = lapic_timer_deadline(&state.apic_timer, &state.tsc) {
         timer_activate_locked(state, deadline);
@@ -1291,6 +1284,8 @@ fn start_apic_timer_locked(state: &mut VcpuState) {
     }
 }
 
+/// 以 tsc-deadline 模式设置 lapic timer
+/// tsc-deadline 模式即以 IA32_TSC_DEADLINE MSR 作为触发时钟中断的绝对时间
 fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
     if let Some(deadline) = lapic_timer_deadline_tsc(&state.apic_timer, state.msrs.tsc_deadline) {
         timer_activate_locked(state, deadline);
@@ -1299,6 +1294,8 @@ fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
     }
 }
 
+/// 根据 tsc_physical 到 ddl_physical 的差距计算应写入 preemption timer 中的值
+/// 即到下次发生 preemption timer exit 的时间间隔
 fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
     if !state.tsc.activated {
         return VMX_PREEMPTION_TIMER_POLL_VALUE;
@@ -1320,14 +1317,36 @@ fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
     shifted.min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE)) as u32
 }
 
-pub(super) fn sanitize_guest_cr0(value: u64) -> u64 {
-    let mut fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+// /// 
+// pub(super) fn sanitize_guest_cr0(value: u64) -> u64 {
+//     let mut fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+//     let fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+
+//     // unrestricted guest relaxes PE/PG only
+//     fixed0 &= !(X86_CR0_PE | X86_CR0_PG);
+
+//     (value | fixed0 | X86_CR0_ET | X86_CR0_NE) & fixed1
+// }
+
+pub(super) fn sanitize_guest_cr0(cr0: u64) -> u64 {
+    let fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
     let fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
 
-    // unrestricted guest relaxes PE/PG only
-    fixed0 &= !(X86_CR0_PE | X86_CR0_PG);
+    // The PE/PG bit cannot be forcibly set to 1 based on fixed0. I can not explain.
+    let valid_cr0 = (cr0 | (fixed0 & !X86_CR0_PE & !X86_CR0_PG)) & fixed1;
 
-    (value | fixed0 | X86_CR0_ET | X86_CR0_NE) & fixed1
+    log::error!("Fixed to 1:    {:#066b}", fixed0);
+    log::error!("Fixed to 1:    {}", format_binary64_grouped(fixed0));
+    log::error!("Fixed to 1':   {}", format_binary64_grouped(fixed0 & !X86_CR0_PE & !X86_CR0_PG));
+    log::error!("Fixed to 0:    {}", format_binary64_grouped(!fixed1));
+    log::error!("Flexible:      {}", format_binary64_grouped(fixed1 & !fixed0));
+    log::error!("Input CR0:     {}", format_binary64_grouped(cr0));
+    log::error!("Sanitized CR0: {}", format_binary64_grouped(valid_cr0));
+    if cr0 != valid_cr0 {
+        log::error!("Attention!!! Guest CR0 value has been sanitized.");
+    }
+
+    valid_cr0
 }
 
 pub(super) fn sanitize_guest_cr4(value: u64) -> u64 {
@@ -1352,10 +1371,6 @@ pub(super) fn sanitize_guest_efer(value: u64, guest_cr0: u64) -> u64 {
     }
 
     actual
-}
-
-pub(super) fn guest_ia32e_mode_active(value: u64, guest_cr0: u64) -> bool {
-    (sanitize_guest_efer(value, guest_cr0) & X86_EFER_LMA) != 0
 }
 
 fn segment_access_rights(segment: &VcpuSegment) -> u32 {
