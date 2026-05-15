@@ -832,6 +832,38 @@ impl Vcpu {
         Ok(())
     }
 
+    fn load_guest_run_msrs(&self) {
+        let state = self.state.lock();
+
+        Msr::IA32_STAR.write(state.msrs.star);
+        Msr::IA32_LSTAR.write(state.msrs.lstar);
+        Msr::IA32_CSTAR.write(state.msrs.cstar);
+        Msr::IA32_FMASK.write(state.msrs.syscall_mask);
+        Msr::IA32_KERNEL_GSBASE.write(state.msrs.kernel_gs_base);
+    }
+
+    fn save_guest_run_msrs(&self) -> Result<()> {
+        let star = Msr::IA32_STAR.read();
+        let lstar = Msr::IA32_LSTAR.read();
+        let cstar = Msr::IA32_CSTAR.read();
+        let syscall_mask = Msr::IA32_FMASK.read();
+        let kernel_gs_base = Msr::IA32_KERNEL_GSBASE.read();
+        let fs_base = VmcsGuestNW::FS_BASE.read().map_err(Error::from)? as u64;
+        let gs_base = VmcsGuestNW::GS_BASE.read().map_err(Error::from)? as u64;
+
+        let mut state = self.state.lock();
+        state.msrs.star = star;
+        state.msrs.lstar = lstar;
+        state.msrs.cstar = cstar;
+        state.msrs.syscall_mask = syscall_mask;
+        state.msrs.kernel_gs_base = kernel_gs_base;
+        state.msrs.fs_base = fs_base;
+        state.msrs.gs_base = gs_base;
+        state.sregs.fs.base = fs_base;
+        state.sregs.gs.base = gs_base;
+        Ok(())
+    }
+
     /// Queues a virtual external interrupt for this vCPU.
     pub fn inject_interrupt(&self, vector: u32) -> Result<()> {
         let mut state = self.state.lock();
@@ -1008,57 +1040,14 @@ impl Vcpu {
     }
 
     /// Refreshes the guest-visible TSC before VM-entry.
-    pub(crate) fn refresh_guest_tsc(&self) -> Result<()> {
+    pub(crate) fn refresh_guest_tsc(&self) {
         let mut state = self.state.lock();
         state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
-        Ok(())
     }
-
-    // fn load_guest_cr2(&self) {
-    //     let cr2 = self.state.lock().sregs.cr2;
-    //     write_cr2_raw(cr2);
-    // }
-
-    // fn save_guest_cr2(&self) {
-    //     self.state.lock().sregs.cr2 = read_cr2_raw();
-    // }
-
-    fn load_guest_run_msrs(&self) {
-        let state = self.state.lock();
-
-        Msr::IA32_STAR.write(state.msrs.star);
-        Msr::IA32_LSTAR.write(state.msrs.lstar);
-        Msr::IA32_CSTAR.write(state.msrs.cstar);
-        Msr::IA32_FMASK.write(state.msrs.syscall_mask);
-        Msr::IA32_KERNEL_GSBASE.write(state.msrs.kernel_gs_base);
-    }
-
-    fn save_guest_run_msrs(&self) -> Result<()> {
-        let star = Msr::IA32_STAR.read();
-        let lstar = Msr::IA32_LSTAR.read();
-        let cstar = Msr::IA32_CSTAR.read();
-        let syscall_mask = Msr::IA32_FMASK.read();
-        let kernel_gs_base = Msr::IA32_KERNEL_GSBASE.read();
-        let fs_base = VmcsGuestNW::FS_BASE.read().map_err(Error::from)? as u64;
-        let gs_base = VmcsGuestNW::GS_BASE.read().map_err(Error::from)? as u64;
-
-        let mut state = self.state.lock();
-        state.msrs.star = star;
-        state.msrs.lstar = lstar;
-        state.msrs.cstar = cstar;
-        state.msrs.syscall_mask = syscall_mask;
-        state.msrs.kernel_gs_base = kernel_gs_base;
-        state.msrs.fs_base = fs_base;
-        state.msrs.gs_base = gs_base;
-        state.sregs.fs.base = fs_base;
-        state.sregs.gs.base = gs_base;
-        Ok(())
-    }
-
 
     /// 在 VMEntry 前更新 tsc offset 并设置 VMCS 中的 preemption timer 和 tsc offset
     pub(crate) fn prepare_guest_timing_before_entry(&self) -> Result<()> {
-        self.refresh_guest_tsc()?;
+        self.refresh_guest_tsc();
 
         let state = self.state.lock();
         let preemption_timer = compute_preemption_timer_value(&state);
@@ -1108,8 +1097,8 @@ impl Vcpu {
     /// 判断能否在内核中等到打破 hlt 的中断
     pub(crate) fn wait_for_hlt_wakeup(&self) -> Result<bool> {
         {
+            self.refresh_guest_tsc();
             let mut state = self.state.lock();
-            refresh_tsc_locked(&mut state);
             if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
                 return Ok(true);
             }
@@ -1125,8 +1114,8 @@ impl Vcpu {
         let wait_started_tsc = read_tsc();
         let max_wait_ticks = hlt_wait_max_ticks();
         loop {
+            self.refresh_guest_tsc();
             let mut state = self.state.lock();
-            refresh_tsc_locked(&mut state);
             if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
                 return Ok(true);
             }
@@ -1255,10 +1244,6 @@ impl Vcpu {
 
         Ok(())
     }
-}
-
-fn refresh_tsc_locked(state: &mut VcpuState) {
-    state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
 }
 
 fn virtual_tsc_mhz() -> Option<u32> {
