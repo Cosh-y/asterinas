@@ -9,6 +9,8 @@ pub enum Errno {
     OstdError,
     /// resource not found
     NotFound,
+    /// Resource is already in use.
+    Busy,
     /// Guest's vcpu run failed
     GuestRunFailed,
 }

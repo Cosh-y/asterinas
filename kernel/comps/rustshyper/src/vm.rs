@@ -16,9 +16,9 @@ use ostd::{
         virt::*,
     },
     mm::{
+        Frame, FrameAllocOptions, HasPaddr, PAGE_SIZE, VmIo, VmSpace,
         kspace::{read_bytes_from_paddr, read_u64_from_paddr},
         vm_space::VmQueriedItem,
-        Frame, FrameAllocOptions, HasPaddr, VmIo, VmSpace, PAGE_SIZE,
     },
     sync::{Mutex, SpinLock},
 };
@@ -29,15 +29,15 @@ use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
 use super::{
     emulate::apic::{
-        ioapic_kick_irq, lapic_check_pending_vector, lapic_on_timer_expire,
-        lapic_timer_deadline, lapic_timer_deadline_tsc, ApicTimer, Ioapic, Lapic,
-        TimerExpireAction, TscState, IOAPIC_NUM_PINS,
+        ApicTimer, IOAPIC_NUM_PINS, Ioapic, Lapic, TimerExpireAction, TscState, ioapic_kick_irq,
+        lapic_check_pending_vector, lapic_on_timer_expire, lapic_timer_deadline,
+        lapic_timer_deadline_tsc,
     },
     error::*,
     interrupt::{
-        clear_event_injection, clear_interrupt_shadow_after_hlt, has_pending_exception,
-        inject_lapic_interrupt, inject_pending_exception, queue_external_interrupt,
-        inject_pending_interrupt, ExceptionState, InterruptState,
+        ExceptionState, InterruptState, clear_event_injection, has_pending_exception,
+        inject_lapic_interrupt, inject_pending_exception, inject_pending_interrupt,
+        queue_external_interrupt,
     },
     utils::*,
 };
@@ -52,7 +52,8 @@ const X86_EFER_LME: u64 = 1 << 8;
 const X86_EFER_LMA: u64 = 1 << 10;
 const PRIMARY_CTL_PAUSE_EXITING: u32 = 1 << 30;
 const VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK: u8 = 0;
-const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 1_000;
+const VMX_PREEMPTION_TIMER_INACTIVE_VALUE: u32 = u32::MAX;
+const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 1_000_000;
 const HLT_WAIT_MAX_TSC_FREQ_DIVISOR: u64 = 100;
 const HLT_WAIT_MAX_FALLBACK_TICKS: u64 = 25_000_000;
 const CPUID_TSC_CRYSTAL_HZ: u32 = 1_000_000;
@@ -158,6 +159,27 @@ impl HostContext {
         write_cr2_raw(self.cr2);
         self.fpu.load();
         self.msrs.restore();
+    }
+}
+
+struct VcpuRunGuard<'a> {
+    vcpu: &'a Vcpu,
+}
+
+impl Drop for VcpuRunGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = vmclear(self.vcpu.vmcs_phys) {
+            log::warn!(
+                "rustshyper: failed to vmclear vcpu id={} vmcs={:#x}: {:?}",
+                self.vcpu.id,
+                self.vcpu.vmcs_phys,
+                err
+            );
+        }
+
+        let mut state = self.vcpu.state.lock();
+        state.launched = false;
+        state.running = false;
     }
 }
 
@@ -501,6 +523,11 @@ impl Vcpu {
 
     /// Runs the VCPU
     pub fn run(&self) -> Result<super::handler::RunStateMessage> {
+        // VMCS state is per-pCPU while loaded. Keep this run on one pCPU, then
+        // clear the VMCS before returning so the next RSH_RUN may migrate safely.
+        let _preempt_guard = ostd::task::disable_preempt();
+        let _run_guard = self.enter_run()?;
+
         if !self.state.lock().initialized {
             let eptp = self
                 .vm
@@ -524,21 +551,21 @@ impl Vcpu {
         use super::handler::vmexit_handler;
         loop {
             let irq_guard = ostd::irq::disable_local();
-            
+
             vmptrld(self.vmcs_phys)?;
             self.prepare_pending_events()?;
             self.prepare_guest_timing_before_entry()?;
 
-            let mut host_context = HostContext::save();
-            
-            let (exit_info, run_state) = {                
+            let host_context = HostContext::save();
+
+            let (_exit_info, run_state) = {
                 self.restore_context();
-                
+
                 let run_result = self.vmlaunch_or_vmresume();
-                
+
                 let save_context_result = self.save_context();
                 host_context.restore();
-                
+
                 run_result?;
                 save_context_result?;
 
@@ -554,6 +581,15 @@ impl Vcpu {
                 return Ok(run_state);
             }
         }
+    }
+
+    fn enter_run(&self) -> Result<VcpuRunGuard<'_>> {
+        let mut state = self.state.lock();
+        if state.running {
+            return Err(Error::with_message(Errno::Busy, "vCPU is already running"));
+        }
+        state.running = true;
+        Ok(VcpuRunGuard { vcpu: self })
     }
 
     fn init(&self, eptp: u64) -> Result<()> {
@@ -800,7 +836,11 @@ impl Vcpu {
             let guest_rflags = VmcsGuestNW::RFLAGS.read().ok();
             log::error!(
                 "rustshyper: {} failed for vcpu id={} vmcs={:#x} vm_instruction_error={:#x?} exit_reason={:#x?} guest_rip={:#x?} guest_rsp={:#x?} guest_rflags={:#x?}",
-                if launched == 0 { "vmlaunch" } else { "vmresume" },
+                if launched == 0 {
+                    "vmlaunch"
+                } else {
+                    "vmresume"
+                },
                 self.id,
                 self.vmcs_phys,
                 vm_instruction_error,
@@ -889,9 +929,11 @@ impl Vcpu {
         if state.initialized {
             drop(state);
             vmptrld(self.vmcs_phys)?;
-            VmcsGuestNW::RSP.write(regs.rsp as usize)
+            VmcsGuestNW::RSP
+                .write(regs.rsp as usize)
                 .map_err(Error::from)?;
-            VmcsGuestNW::RIP.write(regs.rip as usize)
+            VmcsGuestNW::RIP
+                .write(regs.rip as usize)
                 .map_err(Error::from)?;
             VmcsGuestNW::RFLAGS
                 .write((regs.rflags | 0x2) as usize)
@@ -956,16 +998,12 @@ impl Vcpu {
         let mut state = self.state.lock();
         let eax = state.regs.rax as u32;
         let ecx = state.regs.rcx as u32;
-        let (
-            mut eax_out,
-            mut ebx_out,
-            mut ecx_out,
-            mut edx_out,
-        ) = if let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(eax, ecx) {
-            (eax, ebx, ecx, edx)
-        } else {
-            (0, 0, 0, 0)
-        };
+        let (mut eax_out, mut ebx_out, mut ecx_out, mut edx_out) =
+            if let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(eax, ecx) {
+                (eax, ebx, ecx, edx)
+            } else {
+                (0, 0, 0, 0)
+            };
 
         if eax == 0 {
             eax_out = eax_out.max(0x16);
@@ -1083,7 +1121,7 @@ impl Vcpu {
         }
 
         // log::error!(
-        //     "Triggered by preemption timer: VCPU {} LAPIC timer expired. 
+        //     "Triggered by preemption timer: VCPU {} LAPIC timer expired.
         //     tsc_physical={:#x} tsc_ddl_physical={:#x} multiplier={:#x}",
         //     self.id,
         //     state.tsc.tsc_physical,
@@ -1314,7 +1352,7 @@ fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
 /// 即到下次发生 preemption timer exit 的时间间隔
 fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
     if !state.tsc.activated {
-        return VMX_PREEMPTION_TIMER_POLL_VALUE;
+        return VMX_PREEMPTION_TIMER_INACTIVE_VALUE;
     }
 
     let ticks = state
@@ -1323,9 +1361,7 @@ fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
         .saturating_sub(state.tsc.tsc_physical);
 
     if state.tsc.multiplier == VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK {
-        return ticks
-            .min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE))
-            .max(1) as u32;
+        return ticks.min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE)).max(1) as u32;
     }
 
     let shifted = ticks >> state.tsc.multiplier;
@@ -1333,7 +1369,7 @@ fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
     shifted.min(u64::from(VMX_PREEMPTION_TIMER_POLL_VALUE)) as u32
 }
 
-// /// 
+// ///
 // pub(super) fn sanitize_guest_cr0(value: u64) -> u64 {
 //     let mut fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
 //     let fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
@@ -1407,18 +1443,14 @@ fn sync_sregs_from_vmcs(sregs: &mut VcpuSregs) -> Result<()> {
     let cr0_mask = VmcsControlNW::CR0_GUEST_HOST_MASK
         .read()
         .map_err(Error::from)? as u64;
-    let cr0_shadow = VmcsControlNW::CR0_READ_SHADOW
-        .read()
-        .map_err(Error::from)? as u64;
+    let cr0_shadow = VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64;
     sregs.cr0 = merge_guest_control_register(cr0, cr0_mask, cr0_shadow);
 
     let cr4 = VmcsGuestNW::CR4.read().map_err(Error::from)? as u64;
     let cr4_mask = VmcsControlNW::CR4_GUEST_HOST_MASK
         .read()
         .map_err(Error::from)? as u64;
-    let cr4_shadow = VmcsControlNW::CR4_READ_SHADOW
-        .read()
-        .map_err(Error::from)? as u64;
+    let cr4_shadow = VmcsControlNW::CR4_READ_SHADOW.read().map_err(Error::from)? as u64;
     sregs.cr4 = merge_guest_control_register(cr4, cr4_mask, cr4_shadow);
 
     sregs.cr3 = VmcsGuestNW::CR3.read().map_err(Error::from)? as u64;

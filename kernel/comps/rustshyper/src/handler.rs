@@ -331,9 +331,11 @@ fn emulate_cr_access(vcpu: &Vcpu) -> Result<()> {
                 // A value different from the shadow was written to the masked bit.
                 0 => emulate_cr0_write(vcpu, value)?,
                 2 => vcpu.set_guest_cr2(value),
-                3 => VmcsGuestNW::CR3
-                    .write(value as usize)
-                    .map_err(Error::from)?,
+                3 => {
+                    VmcsGuestNW::CR3
+                        .write(value as usize)
+                        .map_err(Error::from)?;
+                }
                 4 => emulate_cr4_write(value)?,
                 other => log::warn!("rustshyper: ignoring guest write to CR{}", other),
             }

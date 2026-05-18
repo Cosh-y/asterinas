@@ -231,6 +231,7 @@ impl From<aster_rustshyper::Error> for Error {
             RustShyperErrno::Fault => Errno::EFAULT,
             RustShyperErrno::OstdError => Errno::EIO,
             RustShyperErrno::NotFound => Errno::ENOENT,
+            RustShyperErrno::Busy => Errno::EBUSY,
             RustShyperErrno::GuestRunFailed => Errno::EIO,
         };
 
