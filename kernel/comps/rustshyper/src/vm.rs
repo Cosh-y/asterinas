@@ -16,9 +16,9 @@ use ostd::{
         virt::*,
     },
     mm::{
-        Frame, FrameAllocOptions, HasPaddr, PAGE_SIZE, VmIo, VmSpace,
         kspace::{read_bytes_from_paddr, read_u64_from_paddr},
         vm_space::VmQueriedItem,
+        Frame, FrameAllocOptions, HasPaddr, VmIo, VmSpace, PAGE_SIZE,
     },
     sync::{Mutex, SpinLock},
 };
@@ -29,15 +29,15 @@ use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
 use super::{
     emulate::apic::{
-        ApicTimer, IOAPIC_NUM_PINS, Ioapic, Lapic, TimerExpireAction, TscState, ioapic_kick_irq,
-        lapic_check_pending_vector, lapic_on_timer_expire, lapic_timer_deadline,
-        lapic_timer_deadline_tsc,
+        ioapic_kick_irq, lapic_check_pending_vector, lapic_on_timer_expire, lapic_set_irr,
+        lapic_timer_deadline, lapic_timer_deadline_tsc, ApicTimer, Ioapic, Lapic,
+        TimerExpireAction, TscState, IOAPIC_NUM_PINS,
     },
     error::*,
     interrupt::{
-        ExceptionState, InterruptState, clear_event_injection, has_pending_exception,
-        inject_lapic_interrupt, inject_pending_exception, inject_pending_interrupt,
-        queue_external_interrupt,
+        clear_event_injection, has_pending_exception, inject_lapic_interrupt,
+        inject_pending_exception, inject_pending_interrupt, queue_external_interrupt,
+        vmx_interrupt_snapshot, ExceptionState, InterruptState,
     },
     utils::*,
 };
@@ -50,13 +50,32 @@ const X86_CR4_FSGSBASE: u64 = 1 << 16;
 const X86_CR0_PG: u64 = 1 << 31;
 const X86_EFER_LME: u64 = 1 << 8;
 const X86_EFER_LMA: u64 = 1 << 10;
-const PRIMARY_CTL_PAUSE_EXITING: u32 = 1 << 30;
 const VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK: u8 = 0;
-const VMX_PREEMPTION_TIMER_INACTIVE_VALUE: u32 = u32::MAX;
-const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 1_000_000;
+const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 10_000;
+const VMX_PAUSE_LOOP_EXIT_GAP: u32 = 1_000_000;
+const VMX_PAUSE_LOOP_EXIT_WINDOW: u32 = 4096;
+const PAUSE_DIAG_LOG_INTERVAL: u64 = 1 << 20;
+const LAPIC_FIXED_IPI_DIAG_LOG_INTERVAL: u64 = 1 << 12;
+const LAPIC_INJECT_DIAG_LOG_INTERVAL: u64 = 1 << 12;
+const LAPIC_TIMER_EXPIRE_DIAG_LOG_INTERVAL: u64 = 1 << 12;
+const LAPIC_TIMER_INJECT_DIAG_LOG_INTERVAL: u64 = 1 << 12;
+const LINUX_LOCAL_TIMER_VECTOR: u8 = 0xec;
 const HLT_WAIT_MAX_TSC_FREQ_DIVISOR: u64 = 100;
 const HLT_WAIT_MAX_FALLBACK_TICKS: u64 = 25_000_000;
 const CPUID_TSC_CRYSTAL_HZ: u32 = 1_000_000;
+const VMX_EXIT_REASON_HLT: u32 = 12;
+const APIC_ICR_DELIVERY_MODE_FIXED: u32 = 0;
+const APIC_ICR_DELIVERY_MODE_INIT: u32 = 5;
+const APIC_ICR_DELIVERY_MODE_STARTUP: u32 = 6;
+const APIC_ICR_DESTINATION_MODE_LOGICAL: u32 = 1;
+const APIC_ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const APIC_ICR_DESTINATION_SHORTHAND_SHIFT: u32 = 18;
+const APIC_ICR_DESTINATION_SHORTHAND_MASK: u32 = 0x3;
+const APIC_ICR_DESTINATION_FIELD_SHIFT: u32 = 24;
+const APIC_ICR_SHORTHAND_NONE: u32 = 0;
+const APIC_ICR_SHORTHAND_SELF: u32 = 1;
+const APIC_ICR_SHORTHAND_ALL_INCLUDING_SELF: u32 = 2;
+const APIC_ICR_SHORTHAND_ALL_EXCLUDING_SELF: u32 = 3;
 
 /// Represents a virtual machine instance
 pub struct Vm {
@@ -134,6 +153,20 @@ pub struct VcpuState {
     pub apic_timer: ApicTimer,
     /// TSC-tracking state for virtual timer emulation.
     pub tsc: TscState,
+    /// Multiprocessor startup state used for INIT/SIPI handling.
+    pub mp_state: VcpuMpState,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VcpuMpState {
+    Runnable,
+    WaitForSipi,
+}
+
+impl Default for VcpuMpState {
+    fn default() -> Self {
+        Self::Runnable
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +202,7 @@ struct VcpuRunGuard<'a> {
 impl Drop for VcpuRunGuard<'_> {
     fn drop(&mut self) {
         if let Err(err) = vmclear(self.vcpu.vmcs_phys) {
-            log::warn!(
+            log::error!(
                 "rustshyper: failed to vmclear vcpu id={} vmcs={:#x}: {:?}",
                 self.vcpu.id,
                 self.vcpu.vmcs_phys,
@@ -225,6 +258,7 @@ pub struct GuestMsrState {
     pub cstar: u64,
     pub syscall_mask: u64,
     pub tsc_deadline: u64,
+    pub tsc_adjust: u64,
     pub tsc_aux: u64,
     pub sysenter_cs: u64,
     pub sysenter_esp: u64,
@@ -248,6 +282,7 @@ impl Default for GuestMsrState {
             cstar: 0,
             syscall_mask: 0,
             tsc_deadline: 0,
+            tsc_adjust: 0,
             tsc_aux: 0,
             sysenter_cs: 0,
             sysenter_esp: 0,
@@ -414,6 +449,93 @@ impl Vm {
         ioapic_kick_irq(&mut ioapic, &mut lapics, irq);
         Ok(())
     }
+
+    pub fn vcpu_count(&self) -> u32 {
+        self.vcpus.lock().len() as u32
+    }
+
+    /// Delivers a Local APIC ICR write from one vCPU to its target vCPUs.
+    pub fn deliver_lapic_icr(&self, source_vcpu_id: u32, low: u32, high: u32) -> Result<()> {
+        let vcpus: alloc::vec::Vec<_> = self
+            .vcpus
+            .lock()
+            .iter()
+            .map(|(&vcpu_id, vcpu)| (vcpu_id, vcpu.clone()))
+            .collect();
+
+        let delivery_mode = (low >> 8) & 0x7;
+        let destination_mode = (low >> 11) & 0x1;
+        let shorthand =
+            (low >> APIC_ICR_DESTINATION_SHORTHAND_SHIFT) & APIC_ICR_DESTINATION_SHORTHAND_MASK;
+        let destination = (high >> APIC_ICR_DESTINATION_FIELD_SHIFT) as u8;
+        let vector = low & 0xff;
+
+        for (vcpu_id, vcpu) in vcpus {
+            let mut state = vcpu.state.lock();
+            if !icr_matches_destination(
+                source_vcpu_id,
+                vcpu_id,
+                &state.lapic,
+                destination_mode,
+                shorthand,
+                destination,
+            ) {
+                continue;
+            }
+
+            match delivery_mode {
+                APIC_ICR_DELIVERY_MODE_FIXED => {
+                    let vector = (low & 0xff) as u8;
+                    if vector >= 16 {
+                        lapic_set_irr(&mut state.lapic, vector);
+                    }
+                }
+                APIC_ICR_DELIVERY_MODE_INIT => {
+                    if (low & APIC_ICR_LEVEL_ASSERT) != 0 {
+                        reset_vcpu_for_init_locked(&mut state, vcpu_id);
+                    }
+                }
+                APIC_ICR_DELIVERY_MODE_STARTUP => {
+                    if state.mp_state == VcpuMpState::WaitForSipi {
+                        start_vcpu_from_sipi_locked(&mut state, (low & 0xff) as u8, vcpu_id);
+                    }
+                }
+                _ => {
+                    log::error!(
+                        "rustshyper: unsupported LAPIC ICR delivery mode {} low={:#x} high={:#x}",
+                        delivery_mode,
+                        low,
+                        high
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn icr_matches_destination(
+    source_vcpu_id: u32,
+    target_vcpu_id: u32,
+    target_lapic: &Lapic,
+    destination_mode: u32,
+    shorthand: u32,
+    destination: u8,
+) -> bool {
+    match shorthand {
+        APIC_ICR_SHORTHAND_NONE => {
+            if destination_mode == APIC_ICR_DESTINATION_MODE_LOGICAL {
+                ((target_lapic.ldr >> 24) as u8) & destination != 0
+            } else {
+                target_lapic.id as u8 == destination
+            }
+        }
+        APIC_ICR_SHORTHAND_SELF => target_vcpu_id == source_vcpu_id,
+        APIC_ICR_SHORTHAND_ALL_INCLUDING_SELF => true,
+        APIC_ICR_SHORTHAND_ALL_EXCLUDING_SELF => target_vcpu_id != source_vcpu_id,
+        _ => false,
+    }
 }
 
 fn query_userspace_page_hpa(vm_space: &Arc<VmSpace>, userspace_addr: VirtAddr) -> Result<PhysAddr> {
@@ -501,9 +623,10 @@ impl Vcpu {
         state.msrs = GuestMsrState::default();
         if id != 0 {
             state.msrs.apic_base &= !(1 << 8);
+            state.mp_state = VcpuMpState::WaitForSipi;
         }
         state.lapic.id = id;
-        state.lapic.ldr = (1_u32.checked_shl(id).unwrap_or(0)) << 24;
+        state.lapic.ldr = default_lapic_ldr(id);
         state.apic_timer.lvt_timer_bits = 1 << 16;
         // Some virtualized environments expose enough VMX state to run the guest
         // but still #GP on RDMSR IA32_VMX_MISC (0x485). Use a marker value and
@@ -523,6 +646,10 @@ impl Vcpu {
 
     /// Runs the VCPU
     pub fn run(&self) -> Result<super::handler::RunStateMessage> {
+        if self.state.lock().mp_state == VcpuMpState::WaitForSipi {
+            return Ok(self.wait_for_sipi_run_state());
+        }
+
         // VMCS state is per-pCPU while loaded. Keep this run on one pCPU, then
         // clear the VMCS before returning so the next RSH_RUN may migrate safely.
         let _preempt_guard = ostd::task::disable_preempt();
@@ -580,6 +707,19 @@ impl Vcpu {
             if let Some(run_state) = run_state {
                 return Ok(run_state);
             }
+        }
+    }
+
+    fn wait_for_sipi_run_state(&self) -> super::handler::RunStateMessage {
+        let state = self.state.lock();
+        super::handler::RunStateMessage {
+            exit_reason: VMX_EXIT_REASON_HLT,
+            instruction_len: 0,
+            guest_rip: state.regs.rip,
+            guest_phys_addr: 0,
+            exit_qualification: 0,
+            io: super::handler::IoExitInfo::default(),
+            mmio: super::handler::MmioInfo::default(),
         }
     }
 
@@ -755,30 +895,51 @@ impl Vcpu {
             0,
         )?;
 
+        let secondary_cap = Msr::IA32_VMX_PROCBASED_CTLS2.read();
+        let secondary_allowed1 = (secondary_cap >> 32) as u32;
+        let supports_pause_loop_exiting =
+            (secondary_allowed1 & SecondaryControls::PAUSE_LOOP_EXITING.bits()) != 0;
+        let pause_exiting_fallback = if supports_pause_loop_exiting {
+            0
+        } else {
+            PrimaryControls::PAUSE_EXITING.bits()
+        };
+
         set_control(
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
             (PrimaryControls::USE_TSC_OFFSETTING
                 | PrimaryControls::HLT_EXITING
+                // | PrimaryControls::RDTSC_EXITING
                 | PrimaryControls::USE_IO_BITMAPS
                 | PrimaryControls::USE_MSR_BITMAPS
                 | PrimaryControls::SECONDARY_CONTROLS)
                 .bits()
-                | PRIMARY_CTL_PAUSE_EXITING,
+                | pause_exiting_fallback,
             (PrimaryControls::CR3_LOAD_EXITING | PrimaryControls::CR3_STORE_EXITING).bits(),
         )?;
 
+        let pause_loop_exiting = if supports_pause_loop_exiting {
+            SecondaryControls::PAUSE_LOOP_EXITING
+        } else {
+            SecondaryControls::empty()
+        };
         set_control(
             VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_PROCBASED_CTLS2,
             0,
             (SecondaryControls::ENABLE_EPT
                 | SecondaryControls::ENABLE_RDTSCP
-                | SecondaryControls::UNRESTRICTED_GUEST)
+                | SecondaryControls::UNRESTRICTED_GUEST
+                | pause_loop_exiting)
                 .bits(),
             0,
         )?;
+        if supports_pause_loop_exiting {
+            VmcsControl32::PLE_GAP.write(VMX_PAUSE_LOOP_EXIT_GAP)?;
+            VmcsControl32::PLE_WINDOW.write(VMX_PAUSE_LOOP_EXIT_WINDOW)?;
+        }
 
         set_control(
             VmcsControl32::VMEXIT_CONTROLS,
@@ -974,10 +1135,13 @@ impl Vcpu {
     pub(crate) fn emulate_cpuid(&self) -> Result<()> {
         const CPUID_1_ECX_VMX: u32 = 1 << 5;
         const CPUID_1_ECX_FMA: u32 = 1 << 12;
+        const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
         const CPUID_1_ECX_PCID: u32 = 1 << 17;
         const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
         const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;
         const CPUID_1_ECX_AVX: u32 = 1 << 28;
+        const CPUID_1_EDX_APIC: u32 = 1 << 9;
+        const CPUID_1_EDX_HTT: u32 = 1 << 28;
         const CPUID_7_EBX_FSGSBASE: u32 = 1 << 0;
         const CPUID_7_EBX_HLE: u32 = 1 << 4;
         const CPUID_7_EBX_AVX2: u32 = 1 << 5;
@@ -995,9 +1159,15 @@ impl Vcpu {
         const CPUID_7_ECX_AVX512BITALG: u32 = 1 << 12;
         const CPUID_7_ECX_AVX512VPOPCNTDQ: u32 = 1 << 14;
 
+        let vcpu_count = self
+            .vm
+            .upgrade()
+            .map(|vm| vm.vcpu_count().max(1))
+            .unwrap_or(1);
         let mut state = self.state.lock();
         let eax = state.regs.rax as u32;
         let ecx = state.regs.rcx as u32;
+        let apic_id = state.lapic.id;
         let (mut eax_out, mut ebx_out, mut ecx_out, mut edx_out) =
             if let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(eax, ecx) {
                 (eax, ebx, ecx, edx)
@@ -1012,10 +1182,26 @@ impl Vcpu {
         if eax == 1 {
             ecx_out &= !(CPUID_1_ECX_VMX
                 | CPUID_1_ECX_FMA
+                | CPUID_1_ECX_X2APIC
                 | CPUID_1_ECX_PCID
                 | CPUID_1_ECX_XSAVE
                 | CPUID_1_ECX_OSXSAVE
                 | CPUID_1_ECX_AVX);
+            ebx_out =
+                (ebx_out & 0x0000_ffff) | ((vcpu_count & 0xff) << 16) | ((apic_id & 0xff) << 24);
+            edx_out |= CPUID_1_EDX_APIC;
+            if vcpu_count > 1 {
+                edx_out |= CPUID_1_EDX_HTT;
+            } else {
+                edx_out &= !CPUID_1_EDX_HTT;
+            }
+        }
+
+        if eax == 4 {
+            if (eax_out & 0x1f) != 0 {
+                let cores_per_package_minus_one = vcpu_count.saturating_sub(1).min(0x3f);
+                eax_out = (eax_out & !(0x3f << 26)) | (cores_per_package_minus_one << 26);
+            }
         }
 
         if eax == 7 && ecx == 0 {
@@ -1042,6 +1228,14 @@ impl Vcpu {
             ebx_out = 0;
             ecx_out = 0;
             edx_out = 0;
+        }
+
+        if eax == 0x0b || eax == 0x1f {
+            let topology = topology_cpuid(ecx, apic_id, vcpu_count);
+            eax_out = topology.eax;
+            ebx_out = topology.ebx;
+            ecx_out = topology.ecx;
+            edx_out = topology.edx;
         }
 
         if eax == 0x15 {
@@ -1107,6 +1301,8 @@ impl Vcpu {
             super::emulate::apic::LapicWriteEffect::StartTimerDeadline => {
                 start_apic_timer_deadline_locked(&mut state);
             }
+            super::emulate::apic::LapicWriteEffect::Eoi { .. } => {}
+            super::emulate::apic::LapicWriteEffect::Icr { .. } => {}
         }
         Ok(())
     }
@@ -1120,14 +1316,6 @@ impl Vcpu {
             return Ok(());
         }
 
-        // log::error!(
-        //     "Triggered by preemption timer: VCPU {} LAPIC timer expired.
-        //     tsc_physical={:#x} tsc_ddl_physical={:#x} multiplier={:#x}",
-        //     self.id,
-        //     state.tsc.tsc_physical,
-        //     state.tsc.ddl_physical,
-        //     state.tsc.multiplier
-        // );
         expire_lapic_timer_locked(&mut state);
         Ok(())
     }
@@ -1248,6 +1436,12 @@ impl Vcpu {
         Ok(())
     }
 
+    fn read_guest_u32(&self, gva: u64) -> Result<u32> {
+        let mut bytes = [0_u8; core::mem::size_of::<u32>()];
+        self.read_guest_memory(gva, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
     fn read_guest_phys_u64(&self, gpa: u64) -> Result<u64> {
         let hpa = self.translate_guest_gpa(gpa)?;
         Ok(read_u64_from_paddr(hpa as usize))
@@ -1275,9 +1469,7 @@ impl Vcpu {
         }
 
         if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
-            let mut perf = [0_u32; 224];
-            // TODO: 怀疑 perf 变量无用。
-            inject_lapic_interrupt(&mut state.lapic, &mut perf, u32::from(vector))?;
+            inject_lapic_interrupt(&mut state.lapic, u32::from(vector))?;
         }
 
         Ok(())
@@ -1289,11 +1481,164 @@ fn virtual_tsc_mhz() -> Option<u32> {
     u32::try_from(mhz).ok().filter(|&mhz| mhz != 0)
 }
 
+fn is_canonical_guest_kernel_pointer(value: u64) -> bool {
+    value >= (!0_u64 << 47)
+}
+
+fn lapic_bitmap_has_vector(bitmap: &[u32; 8], vector: u8) -> bool {
+    (bitmap[(vector / 32) as usize] & (1_u32 << (vector % 32))) != 0
+}
+
+fn topology_cpuid(subleaf: u32, apic_id: u32, vcpu_count: u32) -> CpuidResult {
+    if vcpu_count <= 1 {
+        return CpuidResult {
+            eax: 0,
+            ebx: 0,
+            ecx: subleaf,
+            edx: apic_id,
+        };
+    }
+
+    match subleaf {
+        0 => CpuidResult {
+            // One hardware thread per guest core. Keep the SMT level present
+            // but sized to 1 so Linux models --vcpus as separate cores.
+            eax: 0,
+            ebx: 1,
+            ecx: 1 << 8,
+            edx: apic_id,
+        },
+        1 => CpuidResult {
+            eax: topology_apic_id_shift(vcpu_count),
+            ebx: vcpu_count,
+            ecx: (2 << 8) | 1,
+            edx: apic_id,
+        },
+        _ => CpuidResult {
+            eax: 0,
+            ebx: 0,
+            ecx: subleaf,
+            edx: apic_id,
+        },
+    }
+}
+
+fn topology_apic_id_shift(vcpu_count: u32) -> u32 {
+    u32::BITS - vcpu_count.saturating_sub(1).leading_zeros()
+}
+
 fn hlt_wait_max_ticks() -> u64 {
     match tsc_freq() {
         0 => HLT_WAIT_MAX_FALLBACK_TICKS,
         freq => (freq / HLT_WAIT_MAX_TSC_FREQ_DIVISOR).max(1),
     }
+}
+
+fn reset_vcpu_for_init_locked(state: &mut VcpuState, vcpu_id: u32) {
+    let mut reset_state = VcpuState {
+        msrs: GuestMsrState::default(),
+        regs: VcpuRegs {
+            rflags: 0x2,
+            ..VcpuRegs::default()
+        },
+        sregs: real_mode_sregs(0),
+        mp_state: VcpuMpState::WaitForSipi,
+        ..VcpuState::default()
+    };
+
+    if vcpu_id != 0 {
+        reset_state.msrs.apic_base &= !(1 << 8);
+    }
+    reset_state.msrs.efer = 0;
+    reset_state.lapic.id = vcpu_id;
+    reset_state.lapic.ldr = default_lapic_ldr(vcpu_id);
+    reset_state.apic_timer.lvt_timer_bits = 1 << 16;
+    reset_state.tsc.multiplier = VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK;
+
+    *state = reset_state;
+}
+
+fn start_vcpu_from_sipi_locked(state: &mut VcpuState, vector: u8, vcpu_id: u32) {
+    state.regs = VcpuRegs {
+        rip: 0,
+        rflags: 0x2,
+        ..VcpuRegs::default()
+    };
+    state.sregs = real_mode_sregs(vector);
+    state.msrs.efer = 0;
+    state.msrs.fs_base = 0;
+    state.msrs.gs_base = 0;
+    state.msrs.kernel_gs_base = 0;
+    state.msrs.tsc_aux = u64::from(vcpu_id);
+    state.initialized = false;
+    state.launched = false;
+    state.exception = ExceptionState::default();
+    state.interrupt = InterruptState::default();
+    timer_deactivate_locked(state);
+    state.mp_state = VcpuMpState::Runnable;
+
+    log::info!(
+        "rustshyper: SIPI starts vcpu id={} vector={:#x} gpa={:#x}",
+        vcpu_id,
+        vector,
+        u64::from(vector) << 12
+    );
+}
+
+fn real_mode_sregs(startup_vector: u8) -> VcpuSregs {
+    let code_base = u64::from(startup_vector) << 12;
+    let code_selector = u16::from(startup_vector) << 8;
+    let data = real_mode_data_segment(0, 0);
+
+    VcpuSregs {
+        cs: real_mode_code_segment(code_selector, code_base),
+        ds: data,
+        es: data,
+        fs: data,
+        gs: data,
+        ss: data,
+        tr: real_mode_system_segment(0x20, 0, 0x0b),
+        ldt: VcpuSegment {
+            unusable: 1,
+            ..VcpuSegment::default()
+        },
+        cr0: X86_CR0_ET | X86_CR0_NE,
+        ..VcpuSregs::default()
+    }
+}
+
+fn real_mode_code_segment(selector: u16, base: u64) -> VcpuSegment {
+    real_mode_segment(selector, base, 0x0b, 1)
+}
+
+fn real_mode_data_segment(selector: u16, base: u64) -> VcpuSegment {
+    real_mode_segment(selector, base, 0x03, 1)
+}
+
+fn real_mode_system_segment(selector: u16, base: u64, type_: u8) -> VcpuSegment {
+    real_mode_segment(selector, base, type_, 0)
+}
+
+fn real_mode_segment(selector: u16, base: u64, type_: u8, s: u8) -> VcpuSegment {
+    VcpuSegment {
+        base,
+        limit: 0xffff,
+        selector,
+        type_,
+        present: 1,
+        dpl: 0,
+        db: 0,
+        s,
+        l: 0,
+        g: 0,
+        avl: 0,
+        unusable: 0,
+        padding: 0,
+    }
+}
+
+fn default_lapic_ldr(vcpu_id: u32) -> u32 {
+    (1_u32.checked_shl(vcpu_id).unwrap_or(0)) << 24
 }
 
 /// 关闭时钟中断计时器
@@ -1352,7 +1697,7 @@ fn start_apic_timer_deadline_locked(state: &mut VcpuState) {
 /// 即到下次发生 preemption timer exit 的时间间隔
 fn compute_preemption_timer_value(state: &VcpuState) -> u32 {
     if !state.tsc.activated {
-        return VMX_PREEMPTION_TIMER_INACTIVE_VALUE;
+        return VMX_PREEMPTION_TIMER_POLL_VALUE;
     }
 
     let ticks = state
@@ -1387,15 +1732,12 @@ pub(super) fn sanitize_guest_cr0(cr0: u64) -> u64 {
     // The PE/PG bit cannot be forcibly set to 1 based on fixed0. I can not explain.
     let valid_cr0 = (cr0 | (fixed0 & !X86_CR0_PE & !X86_CR0_PG)) & fixed1;
 
-    log::error!("Fixed to 1:    {:#066b}", fixed0);
-    log::error!("Fixed to 1:    {}", format_binary64_grouped(fixed0));
-    log::error!("Fixed to 1':   {}", format_binary64_grouped(fixed0 & !X86_CR0_PE & !X86_CR0_PG));
-    log::error!("Fixed to 0:    {}", format_binary64_grouped(!fixed1));
-    log::error!("Flexible:      {}", format_binary64_grouped(fixed1 & !fixed0));
-    log::error!("Input CR0:     {}", format_binary64_grouped(cr0));
-    log::error!("Sanitized CR0: {}", format_binary64_grouped(valid_cr0));
     if cr0 != valid_cr0 {
-        log::error!("Attention!!! Guest CR0 value has been sanitized.");
+        log::error!(
+            "rustshyper: guest CR0 sanitized from {} to {}",
+            format_binary64_grouped(cr0),
+            format_binary64_grouped(valid_cr0)
+        );
     }
 
     valid_cr0
@@ -1551,13 +1893,6 @@ fn validate_guest_state(state: &VcpuState) -> Result<()> {
         return Err(Error::with_message(
             Errno::InvalidArgs,
             "guest special registers must be configured before first run",
-        ));
-    }
-
-    if state.regs.rip == 0 {
-        return Err(Error::with_message(
-            Errno::InvalidArgs,
-            "guest RIP must be configured before first run",
         ));
     }
 

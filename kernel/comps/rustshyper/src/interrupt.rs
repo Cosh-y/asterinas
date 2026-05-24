@@ -44,6 +44,17 @@ pub struct InterruptState {
     pub intr_info: u32,
 }
 
+/// Snapshot of VMCS interruptibility fields used for injection decisions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VmcsInterruptSnapshot {
+    pub rip: usize,
+    pub rflags: usize,
+    pub interruptibility: u32,
+    pub entry_intr_info: u32,
+    pub primary_controls: u32,
+    pub injectable: bool,
+}
+
 /// Handle a VM-exit caused by an external interrupt.
 ///
 /// Reads the VM-exit interruption-information field from the VMCS and treats
@@ -163,9 +174,8 @@ pub fn queue_external_interrupt(intr: &mut InterruptState, vector: u32) -> Resul
 /// request an interrupt-window exit. This avoids mirroring LAPIC vectors into a
 /// second pending queue and only moves IRR to ISR at the VM-entry injection
 /// point.
-pub fn inject_lapic_interrupt(
+pub(crate) fn inject_lapic_interrupt(
     lapic: &mut Lapic,
-    perf_interrupt_count: &mut [u32; 224],
     vector: u32,
 ) -> Result<()> {
     if vector < 32 {
@@ -181,13 +191,11 @@ pub fn inject_lapic_interrupt(
     }
 
     disable_interrupt_window_exiting()?;
-    /// 通过 VMCS 向 guest 注入 event，类型是 external interrupt
+    // 通过 VMCS 向 guest 注入 event，类型是 external interrupt
     VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
         .write(intr_info)
         .map_err(Error::from)?;
     lapic_kick_to_service(lapic, vector as u8);
-    perf_interrupt_count[(vector - 32) as usize] =
-        perf_interrupt_count[(vector - 32) as usize].saturating_add(1);
 
     Ok(())
 }
@@ -211,15 +219,36 @@ pub fn inject_gp_fault(exc: &mut ExceptionState) {
 /// Check whether the guest is currently in a state where an external interrupt
 /// can be injected (RFLAGS.IF == 1 and no blocking-by-STI/MOV-SS).
 fn vmx_interrupt_injectable() -> Result<bool> {
+    Ok(vmx_interrupt_snapshot()?.injectable)
+}
+
+pub(crate) fn vmx_interrupt_snapshot() -> Result<VmcsInterruptSnapshot> {
+    let rip = VmcsGuestNW::RIP.read().map_err(Error::from)?;
     let rflags = VmcsGuestNW::RFLAGS.read().map_err(Error::from)?;
     let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE
         .read()
         .map_err(Error::from)?;
+    let entry_intr_info = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+        .read()
+        .map_err(Error::from)?;
+    let primary_controls = VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS
+        .read()
+        .map_err(Error::from)?;
 
+    Ok(VmcsInterruptSnapshot {
+        rip,
+        rflags,
+        interruptibility,
+        entry_intr_info,
+        primary_controls,
+        injectable: vmx_interrupt_injectable_from(rflags, interruptibility),
+    })
+}
+
+fn vmx_interrupt_injectable_from(rflags: usize, interruptibility: u32) -> bool {
     let if_set = (rflags & RFLAGS_IF) != 0;
     let not_blocking = (interruptibility & (BLOCKING_BY_STI | BLOCKING_BY_MOV_SS)) == 0;
-
-    Ok(if_set && not_blocking)
+    if_set && not_blocking
 }
 
 /// If a deferred interrupt is pending and the guest is now interruptible,

@@ -4,13 +4,13 @@ use ostd::arch::virt::*;
 
 use super::{
     emulate::apic::{
-        IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE, LapicWriteEffect, emulate_ioapic_read,
-        emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
+        emulate_ioapic_read, emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
+        LapicWriteEffect, IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
     },
     error::*,
     vm::{
-        GuestMsrState, Vcpu, guest_cr4_read_shadow, sanitize_guest_cr0, sanitize_guest_cr4,
-        sanitize_guest_efer,
+        guest_cr4_read_shadow, sanitize_guest_cr0, sanitize_guest_cr4, sanitize_guest_efer,
+        GuestMsrState, Vcpu,
     },
 };
 use crate::interrupt::{
@@ -28,6 +28,7 @@ const X86_CR0_PE: u64 = 1 << 0;
 const X86_CR0_PG: u64 = 1 << 31;
 const MSR_IA32_TSC: u32 = 0x0000_0010;
 const MSR_IA32_APIC_BASE: u32 = 0x0000_001B;
+const MSR_IA32_TSC_ADJUST: u32 = 0x0000_003B;
 const MSR_IA32_BIOS_SIGN_ID: u32 = 0x0000_008B;
 const MSR_IA32_XAPIC_DISABLE_STATUS: u32 = 0x0000_00BD;
 const MSR_IA32_MTRRCAP: u32 = 0x0000_00FE;
@@ -49,8 +50,6 @@ const MSR_GS_BASE: u32 = 0xC000_0101;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 const MSR_IA32_TSC_AUX: u32 = 0xC000_0103;
 const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
-const MSR_X2APIC_BASE: u32 = 0x0000_0800;
-const MSR_X2APIC_END: u32 = 0x0000_08FF;
 const MSR_AMD64_DE_CFG: u32 = 0xC001_1029;
 
 #[repr(C)]
@@ -343,9 +342,11 @@ fn emulate_cr_access(vcpu: &Vcpu) -> Result<()> {
         1 => {
             let value = match cr_index {
                 0 => {
-                    log::error!("rustshyper: guest read CR0 causes VM-exit, which should not happen");
+                    log::error!(
+                        "rustshyper: guest read CR0 causes VM-exit, which should not happen"
+                    );
                     VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64
-                },
+                }
                 2 => vcpu.guest_cr2(),
                 3 => VmcsGuestNW::CR3.read().map_err(Error::from)? as u64,
                 4 => VmcsControlNW::CR4_READ_SHADOW.read().map_err(Error::from)? as u64,
@@ -414,8 +415,32 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
 
         match msr_index {
             MSR_IA32_TSC => {
+                let raw_tsc = ostd::arch::read_tsc();
                 state.tsc.tsc_physical = msr_value;
-                state.tsc.tsc_offset = msr_value.wrapping_sub(ostd::arch::read_tsc());
+                state.tsc.tsc_offset = msr_value.wrapping_sub(raw_tsc);
+                log::debug!(
+                    "rustshyper: WRMSR TSC vcpu={} rip={:#x} value={:#x} raw_tsc={:#x} offset={:#x}",
+                    vcpu.id(),
+                    guest_rip,
+                    msr_value,
+                    raw_tsc,
+                    state.tsc.tsc_offset,
+                );
+            }
+            MSR_IA32_TSC_ADJUST => {
+                let delta = msr_value.wrapping_sub(state.msrs.tsc_adjust);
+                state.msrs.tsc_adjust = msr_value;
+                state.tsc.tsc_physical = state.tsc.tsc_physical.wrapping_add(delta);
+                state.tsc.tsc_offset = state.tsc.tsc_offset.wrapping_add(delta);
+                log::debug!(
+                    "rustshyper: WRMSR TSC_ADJUST vcpu={} rip={:#x} value={:#x} delta={:#x} guest_tsc={:#x} offset={:#x}",
+                    vcpu.id(),
+                    guest_rip,
+                    msr_value,
+                    delta,
+                    state.tsc.tsc_physical,
+                    state.tsc.tsc_offset,
+                );
             }
             MSR_IA32_APIC_BASE => {
                 state.msrs.apic_base = sanitize_apic_base(msr_value);
@@ -480,6 +505,7 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
 
     let msr_value = match msr_index {
         MSR_IA32_TSC => state.tsc.tsc_physical,
+        MSR_IA32_TSC_ADJUST => state.msrs.tsc_adjust,
         MSR_IA32_APIC_BASE => state.msrs.apic_base,
         MSR_IA32_BIOS_SIGN_ID => 0,
         MSR_IA32_XAPIC_DISABLE_STATUS => 0,
@@ -517,6 +543,21 @@ fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
             return Ok(());
         }
     };
+
+    match msr_index {
+        MSR_IA32_TSC | MSR_IA32_TSC_ADJUST | MSR_IA32_TSC_DEADLINE => {
+            log::debug!(
+                "rustshyper: RDMSR TSC-related vcpu={} rip={:#x} msr={:#x} value={:#x} guest_tsc={:#x} offset={:#x}",
+                vcpu.id(),
+                guest_rip,
+                msr_index,
+                msr_value,
+                state.tsc.tsc_physical,
+                state.tsc.tsc_offset,
+            );
+        }
+        _ => {}
+    }
 
     state.regs.rax = msr_value as u32 as u64;
     state.regs.rdx = msr_value >> 32;
@@ -575,70 +616,10 @@ fn update_guest_efer_vmcs(guest_efer: u64, guest_cr0: u64) -> Result<()> {
 
 fn sanitize_apic_base(value: u64) -> u64 {
     const APIC_BASE_BSP: u64 = 1 << 8;
-    const APIC_BASE_X2APIC: u64 = 1 << 10;
     const APIC_BASE_ENABLE: u64 = 1 << 11;
 
-    LAPIC_BASE | APIC_BASE_ENABLE | (value & (APIC_BASE_BSP | APIC_BASE_X2APIC))
+    LAPIC_BASE | APIC_BASE_ENABLE | (value & APIC_BASE_BSP)
 }
-
-// fn is_x2apic_msr(msr_index: u32) -> bool {
-//     (MSR_X2APIC_BASE..=MSR_X2APIC_END).contains(&msr_index)
-// }
-
-// fn x2apic_msr_offset(msr_index: u32) -> u64 {
-//     u64::from(msr_index - MSR_X2APIC_BASE) << 4
-// }
-
-// It seems that this function has not been used.
-// fn emulate_x2apic_msr_read(vcpu: &Vcpu, msr_index: u32) -> Option<u64> {
-//     log::error!("Guest read from x2APIC MSR {:#x}", msr_index);
-//     let offset = x2apic_msr_offset(msr_index);
-//     let state = vcpu.state.lock();
-
-//     if offset == 0x20 {
-//         return Some(state.lapic.id as u64);
-//     }
-
-//     let (value, ok) = emulate_lapic_read(&state.lapic, &state.apic_timer, &state.tsc, offset);
-//     ok.then_some(value)
-// }
-
-// It seems that this function has not been used.
-// fn emulate_x2apic_msr_write(vcpu: &Vcpu, msr_index: u32, value: u64) -> Result<()> {
-//     log::error!("Guest write to x2APIC MSR {:#x} with value {:#x}", msr_index, value);
-//     let offset = x2apic_msr_offset(msr_index);
-//     let vm = vcpu
-//         .vm
-//         .upgrade()
-//         .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
-//     let mut ioapic = vm.ioapic.lock();
-
-//     let effect = {
-//         let mut state = vcpu.state.lock();
-//         let (effect, ok) = {
-//             let super::vm::VcpuState {
-//                 lapic, apic_timer, ..
-//             } = &mut *state;
-//             emulate_lapic_write(lapic, apic_timer, &mut ioapic, offset, value)
-//         };
-//         if !ok {
-//             inject_gp_fault(&mut state.exception);
-//             let mut perf = [0u32; 32];
-//             inject_pending_exception(&mut state.exception, &mut perf)?;
-//             return Ok(());
-//         }
-//         effect
-//     };
-
-//     drop(ioapic);
-//     match effect {
-//         LapicWriteEffect::StartTimer | LapicWriteEffect::StartTimerDeadline => {
-//             vcpu.handle_lapic_timer_write_effect(effect)?;
-//         }
-//         LapicWriteEffect::None => {}
-//     }
-//     Ok(())
-// }
 
 fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
     let mut state = vcpu.state.lock();
@@ -769,7 +750,18 @@ fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Res
         effect
     };
     drop(ioapic);
-    vcpu.handle_lapic_timer_write_effect(effect)?;
+    match effect {
+        LapicWriteEffect::Icr { low, high } => {
+            vm.deliver_lapic_icr(vcpu.id(), low, high)?;
+        }
+        LapicWriteEffect::Eoi {
+            lapic_id,
+            vector,
+            irr,
+            isr,
+        } => {},
+        effect => vcpu.handle_lapic_timer_write_effect(effect)?,
+    }
     Ok(true)
 }
 

@@ -356,6 +356,16 @@ pub enum LapicWriteEffect {
     None,
     StartTimer,
     StartTimerDeadline,
+    Eoi {
+        lapic_id: u32,
+        vector: u8,
+        irr: [u32; 8],
+        isr: [u32; 8],
+    },
+    Icr {
+        low: u32,
+        high: u32,
+    },
 }
 
 /// Emulate a LAPIC MMIO write.
@@ -387,6 +397,17 @@ pub fn emulate_lapic_write(
                 lapic_clear_isr(lapic, isr_vec);
                 lapic_update_ppr(lapic);
                 ioapic_eoi(ioapic, isr_vec);
+                if isr_vec >= 0xf0 {
+                    return (
+                        LapicWriteEffect::Eoi {
+                            lapic_id: lapic.id,
+                            vector: isr_vec,
+                            irr: lapic.irr,
+                            isr: lapic.isr,
+                        },
+                        true,
+                    );
+                }
             }
         }
         XLAPIC_RW_LDR => {
@@ -449,7 +470,13 @@ pub fn emulate_lapic_write(
                 if value >> 32 != 0 {
                     lapic.icr[1] = (value >> 32) as u32;
                 }
-                deliver_icr_fixed_interrupt(lapic, value as u32, lapic.icr[1]);
+                return (
+                    LapicWriteEffect::Icr {
+                        low: value as u32,
+                        high: lapic.icr[1],
+                    },
+                    true,
+                );
             }
         }
         _ => {
@@ -462,36 +489,6 @@ pub fn emulate_lapic_write(
         }
     }
     (LapicWriteEffect::None, true)
-}
-
-/// 
-fn deliver_icr_fixed_interrupt(lapic: &mut Lapic, low: u32, high: u32) {
-    let vector = (low & 0xFF) as u8;
-    let delivery_mode = (low >> 8) & 0x7;
-    let destination_mode = (low >> 11) & 0x1;
-    let shorthand = (low >> 18) & 0x3;
-
-    if delivery_mode != 0 || vector < 16 {
-        return;
-    }
-
-    let matches_destination = match shorthand {
-        0 => {
-            let destination = (high >> 24) as u8;
-            if destination_mode == 0 {
-                destination == lapic.id as u8
-            } else {
-                ((lapic.ldr >> 24) as u8) & destination != 0
-            }
-        }
-        1 | 2 => true,
-        3 => false,
-        _ => false,
-    };
-
-    if matches_destination {
-        lapic_set_irr(lapic, vector);
-    }
 }
 
 // ===== I/O APIC emulation =====
