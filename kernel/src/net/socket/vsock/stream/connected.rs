@@ -33,6 +33,7 @@ impl Connected {
     }
 
     pub fn from_connecting(connecting: Arc<Connecting>) -> Self {
+        connecting.move_port_to_connected();
         Self {
             connection: SpinLock::new(Connection::new_from_info(connecting.info())),
             id: connecting.id(),
@@ -53,34 +54,66 @@ impl Connected {
     }
 
     pub fn try_recv(&self, writer: &mut dyn MultiWrite) -> Result<usize> {
-        let mut connection = self.connection.disable_irq().lock();
-        let bytes_read = connection.buffer.read_fallible(writer)?;
-        connection.info.done_forwarding(bytes_read);
-        self.pollee.invalidate();
+        let writer_len = writer.sum_lens();
+        if writer_len == 0 {
+            return Ok(0);
+        }
 
-        match bytes_read {
-            0 => {
+        let mut staged = {
+            let connection = self.connection.disable_irq().lock();
+            let available = connection.buffer.len();
+            if available == 0 {
                 if !connection.is_peer_requested_shutdown() {
                     return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty");
                 } else {
                     return_errno_with_message!(Errno::ECONNRESET, "the connection is reset");
                 }
             }
-            bytes_read => Ok(bytes_read),
+
+            let copy_len = available.min(writer_len);
+            let mut staged = vec![0u8; copy_len];
+            connection.buffer.peek_slice(&mut staged).unwrap();
+            drop(connection);
+            staged
+        };
+
+        writer.prefault_write(staged.len())?;
+        let mut reader = VmReader::from(staged.as_slice());
+        let bytes_read = writer.write(&mut reader)?;
+        if bytes_read == 0 {
+            return Ok(0);
         }
+
+        let mut connection = self.connection.disable_irq().lock();
+        connection
+            .buffer
+            .pop_slice(&mut staged[..bytes_read])
+            .unwrap();
+        connection.info.done_forwarding(bytes_read);
+        drop(connection);
+
+        self.pollee.invalidate();
+
+        Ok(bytes_read)
     }
 
     pub fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
-        let mut connection = self.connection.disable_irq().lock();
         // TODO: Deal with flags
         if !flags.is_all_supported() {
             warn!("unsupported flags: {:?}", flags);
         }
         let buf_len = reader.sum_lens();
-        VSOCK_GLOBAL
-            .get()
-            .unwrap()
-            .send(reader, &mut connection.info)?;
+        let mut info = {
+            let connection = self.connection.disable_irq().lock();
+            let info = connection.info.clone();
+            drop(connection);
+            info
+        };
+        reader.prefault_read(buf_len)?;
+        VSOCK_GLOBAL.get().unwrap().send(reader, &mut info)?;
+        let mut connection = self.connection.disable_irq().lock();
+        connection.info.tx_cnt = info.tx_cnt;
+        connection.info.has_pending_credit_request = info.has_pending_credit_request;
 
         Ok(buf_len)
     }
@@ -100,12 +133,16 @@ impl Connected {
     pub fn shutdown(&self, _cmd: SockShutdownCmd) -> Result<()> {
         // TODO: deal with cmd
         if self.should_close() {
-            let mut connection = self.connection.disable_irq().lock();
-            if connection.is_local_shutdown() {
-                return Ok(());
-            }
+            let info = {
+                let connection = self.connection.disable_irq().lock();
+                if connection.is_local_shutdown() {
+                    return Ok(());
+                }
+                connection.info.clone()
+            };
             let vsockspace = VSOCK_GLOBAL.get().unwrap();
-            vsockspace.reset(&connection.info).unwrap();
+            vsockspace.reset(&info).unwrap();
+            let mut connection = self.connection.disable_irq().lock();
             connection.set_local_shutdown();
         }
         Ok(())
@@ -121,10 +158,13 @@ impl Connected {
     }
 
     pub fn add_connection_buffer(&self, bytes: &[u8]) -> bool {
-        let mut connection = self.connection.disable_irq().lock();
-
-        let result = connection.add(bytes);
-        self.pollee.notify(IoEvents::IN);
+        let result = {
+            let mut connection = self.connection.disable_irq().lock();
+            connection.add(bytes)
+        };
+        if result {
+            self.pollee.notify(IoEvents::IN);
+        }
 
         result
     }
@@ -143,13 +183,17 @@ impl Connected {
 
     fn check_io_events(&self) -> IoEvents {
         let connection = self.connection.disable_irq().lock();
+        let mut events = IoEvents::empty();
 
-        // receive
         if !connection.buffer.is_empty() {
-            IoEvents::IN
-        } else {
-            IoEvents::empty()
+            events |= IoEvents::IN;
         }
+
+        if !connection.is_local_shutdown() {
+            events |= IoEvents::OUT;
+        }
+
+        events
     }
 }
 

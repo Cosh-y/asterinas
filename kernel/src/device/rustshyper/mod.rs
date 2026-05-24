@@ -23,7 +23,14 @@ const RUSTSHYPER_MINOR: u16 = 232;
 
 /// Initializes the RustShyper device
 pub(super) fn init_in_first_process(_path_resolver: &PathResolver) -> Result<()> {
-    aster_rustshyper::init()?;
+    if let Err(err) = aster_rustshyper::init() {
+        error!(
+            "rustshyper: failed to initialize hypervisor backend, skipping /dev/rustshyper: {:?}",
+            err
+        );
+        return Ok(());
+    }
+
     let device = Arc::new(RustShyperDevice::new());
     char::register(device)?;
     Ok(())

@@ -209,6 +209,32 @@ impl<T: Pod> RingBuffer<T> {
         consumer.pop_slice(items)
     }
 
+    /// Copies a slice of items from the front of the `RingBuffer` without
+    /// advancing the head.
+    pub fn peek_slice(&self, items: &mut [T]) -> Option<()> {
+        let nitems = items.len();
+        if self.len() < nitems {
+            return None;
+        }
+
+        let head = self.head();
+        let offset = head.0 & (self.capacity - 1);
+        let byte_offset = offset * Self::T_SIZE;
+
+        if offset + nitems > self.capacity {
+            self.segment
+                .read_slice(byte_offset, &mut items[..self.capacity - offset])
+                .unwrap();
+            self.segment
+                .read_slice(0, &mut items[self.capacity - offset..])
+                .unwrap();
+        } else {
+            self.segment.read_slice(byte_offset, items).unwrap();
+        }
+
+        Some(())
+    }
+
     pub(self) fn advance_tail(&self, mut tail: Wrapping<usize>, len: usize) {
         tail += len;
         self.tail.store(tail.0, Ordering::Release);

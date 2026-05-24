@@ -82,13 +82,17 @@ impl VsockStreamSocket {
     }
 
     fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
-        let inner = self.status.read();
-        match &*inner {
-            Status::Connected(connected) => connected.send(reader, flags),
-            Status::Init(_) | Status::Listen(_) => {
-                return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+        let connected = {
+            let inner = self.status.read();
+            match &*inner {
+                Status::Connected(connected) => connected.clone(),
+                Status::Init(_) | Status::Listen(_) => {
+                    return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+                }
             }
-        }
+        };
+
+        connected.send(reader, flags)
     }
 
     fn try_recv(
@@ -96,16 +100,19 @@ impl VsockStreamSocket {
         writer: &mut dyn MultiWrite,
         _flags: SendRecvFlags,
     ) -> Result<(usize, SocketAddr)> {
-        let connected = match &*self.status.read() {
-            Status::Connected(connected) => connected.clone(),
-            Status::Init(_) | Status::Listen(_) => {
-                return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+        let connected = {
+            let inner = self.status.read();
+            match &*inner {
+                Status::Connected(connected) => connected.clone(),
+                Status::Init(_) | Status::Listen(_) => {
+                    return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+                }
             }
         };
+        let peer_addr = connected.peer_addr();
 
         let read_size = connected.try_recv(writer)?;
 
-        let peer_addr = self.peer_addr()?;
         // If buffer is now empty and the peer requested shutdown, finish shutting down the
         // connection.
         if connected.should_close()
@@ -114,7 +121,7 @@ impl VsockStreamSocket {
             debug!("The error is {:?}", e);
         }
 
-        Ok((read_size, peer_addr))
+        Ok((read_size, peer_addr.into()))
     }
 }
 
@@ -180,28 +187,39 @@ impl Socket for VsockStreamSocket {
         vsockspace.insert_connecting_socket(connecting.local_addr(), connecting.clone());
 
         // Send request
-        vsockspace.request(&connecting.info()).unwrap();
+        vsockspace.request(&connecting.info())?;
         // wait for response from driver
         // TODO: Add timeout
-        let mut poller = Poller::new(None);
-        if !connecting
-            .poll(IoEvents::IN, Some(poller.as_handle_mut()))
-            .contains(IoEvents::IN)
-            && let Err(e) = poller.wait()
-        {
-            vsockspace
-                .remove_connecting_socket(&connecting.local_addr())
-                .unwrap();
-            return Err(e);
+        loop {
+            let mut poller = Poller::new(None);
+            if connecting
+                .poll(IoEvents::IN, Some(poller.as_handle_mut()))
+                .contains(IoEvents::IN)
+            {
+                break;
+            }
+            if let Err(e) = poller.wait() {
+                error!(
+                    "vhost-vsock connect wait failed local={:?} peer={:?} errno={:?}",
+                    connecting.local_addr(),
+                    connecting.peer_addr(),
+                    e.error()
+                );
+                vsockspace.remove_connecting_socket(&connecting.local_addr());
+                return Err(e);
+            }
         }
 
-        vsockspace
-            .remove_connecting_socket(&connecting.local_addr())
-            .unwrap();
+        vsockspace.remove_connecting_socket(&connecting.local_addr());
+        connecting.result()?;
         let connected = Arc::new(Connected::from_connecting(connecting));
         *self.status.write() = Status::Connected(connected.clone());
         // move connecting socket map to connected sockmap
         vsockspace.insert_connected_socket(connected.id(), connected);
+        error!(
+            "vhost-vsock stream connect completed peer={:?}",
+            remote_addr
+        );
 
         Ok(())
     }
@@ -237,12 +255,17 @@ impl Socket for VsockStreamSocket {
     }
 
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
-        match &*self.status.read() {
-            Status::Connected(connected) => connected.shutdown(cmd),
-            Status::Init(_) | Status::Listen(_) => {
-                return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+        let connected = {
+            let inner = self.status.read();
+            match &*inner {
+                Status::Connected(connected) => connected.clone(),
+                Status::Init(_) | Status::Listen(_) => {
+                    return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+                }
             }
-        }
+        };
+
+        connected.shutdown(cmd)
     }
 
     fn sendmsg(

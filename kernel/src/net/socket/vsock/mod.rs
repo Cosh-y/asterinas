@@ -6,6 +6,8 @@ use aster_virtio::device::socket::{DEVICE_NAME, get_device, register_recv_callba
 use common::VsockSpace;
 use spin::Once;
 
+use crate::prelude::*;
+
 pub mod addr;
 pub mod common;
 pub mod stream;
@@ -22,5 +24,17 @@ pub(in crate::net) fn init() {
             let vsockspace = VSOCK_GLOBAL.get().unwrap();
             vsockspace.poll().unwrap();
         })
+    } else {
+        VSOCK_GLOBAL.call_once(|| Arc::new(VsockSpace::new_host_vhost()));
     }
+}
+
+pub(crate) fn handle_vhost_event(
+    event: aster_virtio::device::socket::connect::VsockEvent,
+    body: &[u8],
+) -> Result<()> {
+    let vsockspace = VSOCK_GLOBAL
+        .get()
+        .ok_or_else(|| Error::with_message(Errno::ENODEV, "vsock space is not initialized"))?;
+    vsockspace.handle_event(event, body)
 }
