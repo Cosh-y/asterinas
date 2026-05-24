@@ -45,8 +45,10 @@ fn do_accept(
     flags: Flags,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let mut file_table = ctx.thread_local.borrow_file_table_mut();
-    let file = get_file_fast!(&mut file_table, sockfd.try_into()?);
+    let file = {
+        let mut file_table = ctx.thread_local.borrow_file_table_mut();
+        get_file_fast!(&mut file_table, sockfd.try_into()?).into_owned()
+    };
     let socket = file.as_socket_or_err()?;
 
     let (connected_socket, socket_addr) = {
@@ -72,6 +74,7 @@ fn do_accept(
     }
 
     let fd = {
+        let file_table = ctx.thread_local.borrow_file_table();
         let mut file_table_locked = file_table.unwrap().write();
         file_table_locked.insert(connected_socket, fd_flags)
     };
