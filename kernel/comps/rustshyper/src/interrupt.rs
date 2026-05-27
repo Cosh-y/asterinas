@@ -155,18 +155,18 @@ pub fn clear_interrupt_shadow_after_hlt() -> Result<()> {
 }
 
 /// Queues an external interrupt for direct VM-entry delivery.
-pub fn queue_external_interrupt(intr: &mut InterruptState, vector: u32) -> Result<()> {
-    if !(32..256).contains(&vector) {
-        return Err(Error::with_message(
-            Errno::InvalidArgs,
-            "interrupt vector must be in the external-interrupt range [32, 255]",
-        ));
-    }
+// pub fn queue_external_interrupt(intr: &mut InterruptState, vector: u32) -> Result<()> {
+//     if !(32..256).contains(&vector) {
+//         return Err(Error::with_message(
+//             Errno::InvalidArgs,
+//             "interrupt vector must be in the external-interrupt range [32, 255]",
+//         ));
+//     }
 
-    intr.intr_info = vector | INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
-    intr.pending = true;
-    Ok(())
-}
+//     intr.intr_info = vector | INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+//     intr.pending = true;
+//     Ok(())
+// }
 
 /// Try to inject the highest-priority virtual LAPIC interrupt.
 ///

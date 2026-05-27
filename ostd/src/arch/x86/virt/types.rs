@@ -46,8 +46,8 @@ pub struct VcpuRegs {
     pub rdx: u64,
     pub rsi: u64,
     pub rdi: u64,
-    pub rsp: u64,
     pub rbp: u64,
+    pub rsp: u64,
     pub r8: u64,
     pub r9: u64,
     pub r10: u64,
@@ -78,6 +78,7 @@ pub struct VcpuSregs {
     pub cr2: u64,
     pub cr3: u64,
     pub cr4: u64,
+    // TODO: remove the following fields
     pub efer: u64,
     pub apic_base: u64,
     pub interrupt_bitmap: [u64; 4],

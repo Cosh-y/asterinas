@@ -1,17 +1,18 @@
 use core::fmt;
 
 use ostd::arch::virt::*;
+use x86_64::registers::control::Cr0Flags;
 
 use super::{
     emulate::apic::{
         emulate_ioapic_read, emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
-        LapicWriteEffect, IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
+        LapicWriteEffect, Icr, ioapic_eoi, IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
     },
+    emulate::cr::emulate_cr_access,
+    emulate::msr::emulate_msrrw,
+    emulate::timer::{start_apic_timer_deadline_locked, start_apic_timer_locked},
     error::*,
-    vm::{
-        guest_cr4_read_shadow, sanitize_guest_cr0, sanitize_guest_cr4, sanitize_guest_efer,
-        GuestMsrState, Vcpu,
-    },
+    vcpu::{Vcpu, VcpuState, VcpuMsrs},
 };
 use crate::interrupt::{
     clear_interrupt_shadow_after_hlt, handle_external_interrupt, handle_interrupt_window,
@@ -23,34 +24,6 @@ const PAUSE_INSN_LENGTH: usize = 2;
 
 const VMX_EXIT_REASON_IO_INSTRUCTION: u32 = 30;
 const VMX_EXIT_REASON_EPT_VIOLATION: u32 = 48;
-
-const X86_CR0_PE: u64 = 1 << 0;
-const X86_CR0_PG: u64 = 1 << 31;
-const MSR_IA32_TSC: u32 = 0x0000_0010;
-const MSR_IA32_APIC_BASE: u32 = 0x0000_001B;
-const MSR_IA32_TSC_ADJUST: u32 = 0x0000_003B;
-const MSR_IA32_BIOS_SIGN_ID: u32 = 0x0000_008B;
-const MSR_IA32_XAPIC_DISABLE_STATUS: u32 = 0x0000_00BD;
-const MSR_IA32_MTRRCAP: u32 = 0x0000_00FE;
-const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x0000_010A;
-const MSR_IA32_MCG_CAP: u32 = 0x0000_0179;
-const MSR_IA32_SYSENTER_CS: u32 = 0x0000_0174;
-const MSR_IA32_SYSENTER_ESP: u32 = 0x0000_0175;
-const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
-const MSR_IA32_MISC_ENABLE: u32 = 0x0000_01A0;
-const MSR_IA32_PAT: u32 = 0x0000_0277;
-const MSR_IA32_MTRR_DEF_TYPE: u32 = 0x0000_02FF;
-const MSR_EFER: u32 = 0xC000_0080;
-const MSR_STAR: u32 = 0xC000_0081;
-const MSR_LSTAR: u32 = 0xC000_0082;
-const MSR_CSTAR: u32 = 0xC000_0083;
-const MSR_SYSCALL_MASK: u32 = 0xC000_0084;
-const MSR_FS_BASE: u32 = 0xC000_0100;
-const MSR_GS_BASE: u32 = 0xC000_0101;
-const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-const MSR_IA32_TSC_AUX: u32 = 0xC000_0103;
-const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06E0;
-const MSR_AMD64_DE_CFG: u32 = 0xC001_1029;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -187,7 +160,7 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             if vcpu.wait_for_hlt_wakeup()? {
                 // log::error!("Guest HLT. But wake up from host kernel due to event injection or interrupt window");
                 clear_interrupt_shadow_after_hlt()?;
-                advance_guest_rip()?;
+                advance_guest_rip(vcpu)?;
                 Ok(None)
             } else {
                 // log::error!("Guest HLT. Can't wake up from host kernel. Returning to userspace to wait for wakeup event.");
@@ -200,23 +173,23 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
         }
         Ok(VmxExitReason::CPUID) => {
             vcpu.emulate_cpuid()?;
-            advance_guest_rip()?;
+            advance_guest_rip(vcpu)?;
             Ok(None)
         }
         Ok(VmxExitReason::VMCALL) => Ok(Some(build_run_state(exit_info))),
         Ok(VmxExitReason::CR_ACCESS) => {
             emulate_cr_access(vcpu)?;
-            advance_guest_rip()?;
+            advance_guest_rip(vcpu)?;
             Ok(None)
         }
         Ok(VmxExitReason::MSR_READ) => {
             emulate_msrrw(vcpu, false)?;
-            advance_guest_rip()?;
+            advance_guest_rip(vcpu)?;
             Ok(None)
         }
         Ok(VmxExitReason::MSR_WRITE) => {
             emulate_msrrw(vcpu, true)?;
-            advance_guest_rip()?;
+            advance_guest_rip(vcpu)?;
             Ok(None)
         }
         Ok(VmxExitReason::IO_INSTRUCTION) => Ok(Some(build_io_run_state(vcpu, exit_info))),
@@ -232,7 +205,8 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             Ok(Some(build_run_state(exit_info)))
         }
         Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
-            advance_rip(PAUSE_INSN_LENGTH).map_err(Error::from)?;
+            // advance_guest_rip(vcpu)?;
+            vcpu.state.lock().arch_mut().advance_rip(PAUSE_INSN_LENGTH as u64);
             Ok(Some(build_run_state(exit_info)))
         }
         Ok(_) => Ok(Some(build_run_state(exit_info))),
@@ -305,320 +279,8 @@ fn build_mmio_run_state(exit_info: &VmxExitInfo) -> RunStateMessage {
     }
 }
 
-pub(crate) fn advance_guest_rip() -> Result<()> {
-    let len = instruction_len().map_err(Error::from)? as usize;
-    advance_rip(len).map_err(Error::from)
-}
-
 fn instruction_len() -> core::result::Result<u32, ostd::Error> {
     VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read()
-}
-
-fn emulate_cr_access(vcpu: &Vcpu) -> Result<()> {
-    let qualification = VmcsReadOnlyNW::EXIT_QUALIFICATION
-        .read()
-        .map_err(Error::from)?;
-    let cr_index = (qualification & 0xF) as u8;
-    let access = ((qualification >> 4) & 0b11) as u8;
-    let gpr_index = ((qualification >> 8) & 0xF) as u8;
-
-    let mut regs = vcpu.get_regs()?;
-    match access {
-        0 => {
-            let value = read_gpr(&regs, gpr_index, 8);
-            match cr_index {
-                // A value different from the shadow was written to the masked bit.
-                0 => emulate_cr0_write(vcpu, value)?,
-                2 => vcpu.set_guest_cr2(value),
-                3 => {
-                    VmcsGuestNW::CR3
-                        .write(value as usize)
-                        .map_err(Error::from)?;
-                }
-                4 => emulate_cr4_write(value)?,
-                other => log::warn!("rustshyper: ignoring guest write to CR{}", other),
-            }
-        }
-        1 => {
-            let value = match cr_index {
-                0 => {
-                    log::error!(
-                        "rustshyper: guest read CR0 causes VM-exit, which should not happen"
-                    );
-                    VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64
-                }
-                2 => vcpu.guest_cr2(),
-                3 => VmcsGuestNW::CR3.read().map_err(Error::from)? as u64,
-                4 => VmcsControlNW::CR4_READ_SHADOW.read().map_err(Error::from)? as u64,
-                other => {
-                    log::warn!("rustshyper: ignoring guest read from CR{}", other);
-                    0
-                }
-            };
-            write_gpr(&mut regs, gpr_index, 8, value);
-            vcpu.set_regs(regs)?;
-        }
-        other => {
-            log::warn!("rustshyper: unsupported CR access type {}", other);
-        }
-    }
-
-    Ok(())
-}
-
-fn emulate_cr0_write(vcpu: &Vcpu, value: u64) -> Result<()> {
-    if (value & X86_CR0_PG) != 0 && (value & X86_CR0_PE) == 0 {
-        queue_gp_fault(vcpu)?;
-        return Ok(());
-    }
-
-    let sanitized_value = sanitize_guest_cr0(value);
-    let shadow_value = sanitized_value;
-    let actual_value = sanitized_value;
-    let guest_efer = vcpu.state.lock().msrs.efer;
-
-    VmcsControlNW::CR0_READ_SHADOW
-        .write(shadow_value as usize)
-        .map_err(Error::from)?;
-    VmcsGuestNW::CR0
-        .write(actual_value as usize)
-        .map_err(Error::from)?;
-    update_guest_efer_vmcs(guest_efer, shadow_value)?;
-    Ok(())
-}
-
-fn emulate_cr4_write(value: u64) -> Result<()> {
-    let actual_value = sanitize_guest_cr4(value);
-    let shadow_value = guest_cr4_read_shadow(value);
-
-    VmcsGuestNW::CR4
-        .write(actual_value as usize)
-        .map_err(Error::from)?;
-    VmcsControlNW::CR4_READ_SHADOW
-        .write(shadow_value as usize)
-        .map_err(Error::from)?;
-    Ok(())
-}
-
-fn emulate_msrrw(vcpu: &Vcpu, is_write: bool) -> Result<()> {
-    let mut state = vcpu.state.lock();
-    let msr_index = state.regs.rcx as u32;
-    let guest_rip = VmcsGuestNW::RIP.read().map_err(Error::from)? as u64;
-
-    if is_write {
-        let msr_value = (state.regs.rax as u32 as u64) | ((state.regs.rdx as u32 as u64) << 32);
-        // if is_x2apic_msr(msr_index) {
-        //     drop(state);
-        //     emulate_x2apic_msr_write(vcpu, msr_index, msr_value)?;
-        //     return Ok(());
-        // }
-
-        match msr_index {
-            MSR_IA32_TSC => {
-                let raw_tsc = ostd::arch::read_tsc();
-                state.tsc.tsc_physical = msr_value;
-                state.tsc.tsc_offset = msr_value.wrapping_sub(raw_tsc);
-                log::debug!(
-                    "rustshyper: WRMSR TSC vcpu={} rip={:#x} value={:#x} raw_tsc={:#x} offset={:#x}",
-                    vcpu.id(),
-                    guest_rip,
-                    msr_value,
-                    raw_tsc,
-                    state.tsc.tsc_offset,
-                );
-            }
-            MSR_IA32_TSC_ADJUST => {
-                let delta = msr_value.wrapping_sub(state.msrs.tsc_adjust);
-                state.msrs.tsc_adjust = msr_value;
-                state.tsc.tsc_physical = state.tsc.tsc_physical.wrapping_add(delta);
-                state.tsc.tsc_offset = state.tsc.tsc_offset.wrapping_add(delta);
-                log::debug!(
-                    "rustshyper: WRMSR TSC_ADJUST vcpu={} rip={:#x} value={:#x} delta={:#x} guest_tsc={:#x} offset={:#x}",
-                    vcpu.id(),
-                    guest_rip,
-                    msr_value,
-                    delta,
-                    state.tsc.tsc_physical,
-                    state.tsc.tsc_offset,
-                );
-            }
-            MSR_IA32_APIC_BASE => {
-                state.msrs.apic_base = sanitize_apic_base(msr_value);
-            }
-            MSR_IA32_BIOS_SIGN_ID => {}
-            MSR_IA32_MISC_ENABLE => {}
-            MSR_IA32_SYSENTER_CS => state.msrs.sysenter_cs = msr_value,
-            MSR_IA32_SYSENTER_ESP => state.msrs.sysenter_esp = msr_value,
-            MSR_IA32_SYSENTER_EIP => state.msrs.sysenter_eip = msr_value,
-            MSR_EFER => state.msrs.efer = msr_value,
-            MSR_IA32_PAT => state.msrs.pat = msr_value,
-            MSR_FS_BASE => state.msrs.fs_base = msr_value,
-            MSR_GS_BASE => state.msrs.gs_base = msr_value,
-            MSR_KERNEL_GS_BASE => state.msrs.kernel_gs_base = msr_value,
-            MSR_IA32_TSC_AUX => state.msrs.tsc_aux = msr_value,
-            MSR_STAR => state.msrs.star = msr_value,
-            MSR_LSTAR => state.msrs.lstar = msr_value,
-            MSR_CSTAR => state.msrs.cstar = msr_value,
-            MSR_SYSCALL_MASK => state.msrs.syscall_mask = msr_value,
-            MSR_IA32_TSC_DEADLINE => {
-                state.msrs.tsc_deadline = msr_value;
-                drop(state);
-                vcpu.handle_lapic_timer_write_effect(
-                    crate::emulate::apic::LapicWriteEffect::StartTimerDeadline,
-                )?;
-                return Ok(());
-            }
-            _ => {
-                log::warn!(
-                    "rustshyper: unrecognized WRMSR rip={:#x} msr={:#x} value={:#x}",
-                    guest_rip,
-                    msr_index,
-                    msr_value
-                );
-                inject_gp_fault(&mut state.exception);
-                let mut perf = [0u32; 32];
-                inject_pending_exception(&mut state.exception, &mut perf)?;
-                return Ok(());
-            }
-        }
-
-        update_guest_msr_vmcs(&state.msrs)?;
-        return Ok(());
-    }
-
-    // if is_x2apic_msr(msr_index) {
-    //     drop(state);
-    //     let Some(msr_value) = emulate_x2apic_msr_read(vcpu, msr_index) else {
-    //         log::warn!(
-    //             "rustshyper: unsupported x2APIC RDMSR rip={:#x} msr={:#x}",
-    //             guest_rip,
-    //             msr_index,
-    //         );
-    //         queue_gp_fault(vcpu)?;
-    //         return Ok(());
-    //     };
-    //     let mut state = vcpu.state.lock();
-    //     state.regs.rax = msr_value as u32 as u64;
-    //     state.regs.rdx = msr_value >> 32;
-    //     return Ok(());
-    // }
-
-    let msr_value = match msr_index {
-        MSR_IA32_TSC => state.tsc.tsc_physical,
-        MSR_IA32_TSC_ADJUST => state.msrs.tsc_adjust,
-        MSR_IA32_APIC_BASE => state.msrs.apic_base,
-        MSR_IA32_BIOS_SIGN_ID => 0,
-        MSR_IA32_XAPIC_DISABLE_STATUS => 0,
-        MSR_IA32_MTRRCAP => 0,
-        MSR_IA32_ARCH_CAPABILITIES => 0,
-        MSR_IA32_MCG_CAP => 0,
-        MSR_IA32_MISC_ENABLE => 0,
-        MSR_IA32_SYSENTER_CS => state.msrs.sysenter_cs,
-        MSR_IA32_SYSENTER_ESP => state.msrs.sysenter_esp,
-        MSR_IA32_SYSENTER_EIP => state.msrs.sysenter_eip,
-        MSR_EFER => state.msrs.efer,
-        MSR_IA32_PAT => state.msrs.pat,
-        MSR_IA32_MTRR_DEF_TYPE => 0,
-        MSR_FS_BASE => state.msrs.fs_base,
-        MSR_GS_BASE => state.msrs.gs_base,
-        MSR_KERNEL_GS_BASE => state.msrs.kernel_gs_base,
-        MSR_IA32_TSC_AUX => state.msrs.tsc_aux,
-        MSR_STAR => state.msrs.star,
-        MSR_LSTAR => state.msrs.lstar,
-        MSR_CSTAR => state.msrs.cstar,
-        MSR_SYSCALL_MASK => state.msrs.syscall_mask,
-        MSR_AMD64_DE_CFG => 0,
-        MSR_IA32_TSC_DEADLINE => state.msrs.tsc_deadline,
-        _ => {
-            log::warn!(
-                "rustshyper: unrecognized RDMSR rip={:#x} msr={:#x} rax={:#x} rdx={:#x}",
-                guest_rip,
-                msr_index,
-                state.regs.rax,
-                state.regs.rdx
-            );
-            inject_gp_fault(&mut state.exception);
-            let mut perf = [0u32; 32];
-            inject_pending_exception(&mut state.exception, &mut perf)?;
-            return Ok(());
-        }
-    };
-
-    match msr_index {
-        MSR_IA32_TSC | MSR_IA32_TSC_ADJUST | MSR_IA32_TSC_DEADLINE => {
-            log::debug!(
-                "rustshyper: RDMSR TSC-related vcpu={} rip={:#x} msr={:#x} value={:#x} guest_tsc={:#x} offset={:#x}",
-                vcpu.id(),
-                guest_rip,
-                msr_index,
-                msr_value,
-                state.tsc.tsc_physical,
-                state.tsc.tsc_offset,
-            );
-        }
-        _ => {}
-    }
-
-    state.regs.rax = msr_value as u32 as u64;
-    state.regs.rdx = msr_value >> 32;
-    Ok(())
-}
-
-fn update_guest_msr_vmcs(msrs: &GuestMsrState) -> Result<()> {
-    let guest_cr0 = VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64;
-
-    VmcsGuest64::IA32_PAT.write(msrs.pat).map_err(Error::from)?;
-    update_guest_efer_vmcs(msrs.efer, guest_cr0)?;
-    VmcsGuestNW::FS_BASE
-        .write(msrs.fs_base as usize)
-        .map_err(Error::from)?;
-    VmcsGuestNW::GS_BASE
-        .write(msrs.gs_base as usize)
-        .map_err(Error::from)?;
-    VmcsGuest32::IA32_SYSENTER_CS
-        .write(msrs.sysenter_cs as u32)
-        .map_err(Error::from)?;
-    VmcsGuestNW::IA32_SYSENTER_ESP
-        .write(msrs.sysenter_esp as usize)
-        .map_err(Error::from)?;
-    VmcsGuestNW::IA32_SYSENTER_EIP
-        .write(msrs.sysenter_eip as usize)
-        .map_err(Error::from)?;
-    Ok(())
-}
-
-use x86::vmx::vmcs::control::EntryControls;
-
-fn update_guest_efer_vmcs(guest_efer: u64, guest_cr0: u64) -> Result<()> {
-    const EFER_LMA: u64 = 1 << 10;
-
-    let sanitized_efer = sanitize_guest_efer(guest_efer, guest_cr0);
-
-    VmcsGuest64::IA32_EFER
-        .write(sanitized_efer)
-        .map_err(Error::from)?;
-
-    let mut entry = VmcsControl32::VMENTRY_CONTROLS
-        .read()
-        .map_err(Error::from)?;
-
-    if sanitized_efer & EFER_LMA != 0 {
-        entry |= EntryControls::IA32E_MODE_GUEST.bits();
-    } else {
-        entry &= !EntryControls::IA32E_MODE_GUEST.bits();
-    }
-
-    VmcsControl32::VMENTRY_CONTROLS
-        .write(entry)
-        .map_err(Error::from)?;
-    Ok(())
-}
-
-fn sanitize_apic_base(value: u64) -> u64 {
-    const APIC_BASE_BSP: u64 = 1 << 8;
-    const APIC_BASE_ENABLE: u64 = 1 << 11;
-
-    LAPIC_BASE | APIC_BASE_ENABLE | (value & APIC_BASE_BSP)
 }
 
 fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
@@ -629,64 +291,7 @@ fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
     Ok(())
 }
 
-fn read_gpr(regs: &VcpuRegs, index: u8, size: u8) -> u64 {
-    let raw = match index {
-        0 => regs.rax,
-        1 => regs.rcx,
-        2 => regs.rdx,
-        3 => regs.rbx,
-        4 => regs.rsp,
-        5 => regs.rbp,
-        6 => regs.rsi,
-        7 => regs.rdi,
-        8 => regs.r8,
-        9 => regs.r9,
-        10 => regs.r10,
-        11 => regs.r11,
-        12 => regs.r12,
-        13 => regs.r13,
-        14 => regs.r14,
-        15 => regs.r15,
-        _ => 0,
-    };
-
-    match size {
-        1 => raw & 0xff,
-        2 => raw & 0xffff,
-        4 => raw & 0xffff_ffff,
-        _ => raw,
-    }
-}
-
-fn write_gpr(regs: &mut VcpuRegs, index: u8, size: u8, value: u64) {
-    let slot = match index {
-        0 => &mut regs.rax,
-        1 => &mut regs.rcx,
-        2 => &mut regs.rdx,
-        3 => &mut regs.rbx,
-        4 => &mut regs.rsp,
-        5 => &mut regs.rbp,
-        6 => &mut regs.rsi,
-        7 => &mut regs.rdi,
-        8 => &mut regs.r8,
-        9 => &mut regs.r9,
-        10 => &mut regs.r10,
-        11 => &mut regs.r11,
-        12 => &mut regs.r12,
-        13 => &mut regs.r13,
-        14 => &mut regs.r14,
-        15 => &mut regs.r15,
-        _ => return,
-    };
-
-    *slot = match size {
-        1 => (*slot & !0xff) | (value & 0xff),
-        2 => (*slot & !0xffff) | (value & 0xffff),
-        4 => value & 0xffff_ffff,
-        _ => value,
-    };
-}
-
+// TODO: why return bool here?
 fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
     // log::error!("Guest access to APIC MMIO at GPA {:#x}", fault_gpa);
     let is_lapic = (LAPIC_BASE..(LAPIC_BASE + LAPIC_SIZE)).contains(&fault_gpa);
@@ -712,7 +317,7 @@ fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
         }
     }
 
-    advance_rip(insn.len).map_err(Error::from)?;
+    vcpu.state.lock().arch_mut().advance_rip(insn.len as u64);
     Ok(true)
 }
 
@@ -725,42 +330,46 @@ fn emulate_lapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Res
         if !ok {
             return Ok(false);
         }
-        write_gpr(&mut state.regs, insn.reg, insn.size, value);
+        
+        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
+        state.arch_mut().set_gpr(gpr_index, insn.size, value);
+
         return Ok(true);
     }
 
     let value = {
-        let state = vcpu.state.lock();
-        read_gpr(&state.regs, insn.reg, insn.size)
+        let mut state = vcpu.state.lock();
+        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
+        state.arch_mut().gpr(gpr_index)
     };
+    
     let vm = vcpu
         .vm
         .upgrade()
         .ok_or_else(|| Error::with_message(Errno::NotFound, "vm not found"))?;
-    let mut ioapic = vm.ioapic.lock();
+    
     let effect = {
         let mut state = vcpu.state.lock();
-        let super::vm::VcpuState {
-            lapic, apic_timer, ..
-        } = &mut *state;
-        let (effect, ok) = emulate_lapic_write(lapic, apic_timer, &mut ioapic, offset, value);
-        if !ok {
-            return Ok(false);
-        }
-        effect
+        let VcpuState { lapic, apic_timer, .. } = &mut *state;
+        emulate_lapic_write(lapic, apic_timer, offset, value)
     };
-    drop(ioapic);
+    
     match effect {
-        LapicWriteEffect::Icr { low, high } => {
-            vm.deliver_lapic_icr(vcpu.id(), low, high)?;
+        Some(LapicWriteEffect::Eoi { isr_vec }) => {
+            ioapic_eoi(&mut vm.ioapic.lock(), isr_vec);
         }
-        LapicWriteEffect::Eoi {
-            lapic_id,
-            vector,
-            irr,
-            isr,
-        } => {},
-        effect => vcpu.handle_lapic_timer_write_effect(effect)?,
+        Some(LapicWriteEffect::Icr(icr)) => {
+            vm.deliver_lapic_icr(vcpu.id(), icr)?;
+        },
+        Some(LapicWriteEffect::StartTimer) => {
+            let mut state = vcpu.state.lock();
+            start_apic_timer_locked(&mut state);
+        }
+        Some(LapicWriteEffect::StartTimerDeadline) => {
+            let mut state = vcpu.state.lock();
+            start_apic_timer_deadline_locked(&mut state);
+        }
+        None => {}
     }
     Ok(true)
 }
@@ -781,13 +390,16 @@ fn emulate_ioapic_mmio(vcpu: &Vcpu, fault_gpa: u64, insn: MmioInstruction) -> Re
             return Ok(false);
         }
         let mut state = vcpu.state.lock();
-        write_gpr(&mut state.regs, insn.reg, insn.size, value);
+        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
+        state.arch_mut().set_gpr(gpr_index, insn.size, value);
+        
         return Ok(true);
     }
 
     let value = {
         let state = vcpu.state.lock();
-        read_gpr(&state.regs, insn.reg, insn.size)
+        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
+        state.arch().gpr(gpr_index)
     };
     if !emulate_ioapic_write(&mut ioapic, offset, value) {
         return Ok(false);
@@ -818,6 +430,8 @@ fn decode_mmio_instruction(bytes: &[u8; MAX_INSN_LENGTH]) -> Option<MmioInstruct
     let opcode = *bytes.get(ptr)?;
     ptr += 1;
 
+    // MOV Opcode
+    // Volume 2, 4.3 Instructions(M-U)
     let (is_read, size) = match opcode {
         0x88 => (false, 1),
         0x8a => (true, 1),
@@ -844,6 +458,13 @@ fn decode_mmio_instruction(bytes: &[u8; MAX_INSN_LENGTH]) -> Option<MmioInstruct
         _ => return None,
     };
 
+    // modrm
+    // bit: 7 6 | 5 4 3 | 2 1 0
+    //      mod |  reg  |  r/m
+    // mod: r/m is reg or memory
+    //      11    for reg
+    //      other for memory
+    // Volume 2, 2.1 Instruction Format...
     let modrm = *bytes.get(ptr)?;
     ptr += 1;
 
@@ -883,4 +504,26 @@ fn decode_mmio_instruction(bytes: &[u8; MAX_INSN_LENGTH]) -> Option<MmioInstruct
         reg,
         len: ptr,
     })
+}
+
+fn map_instruction_gpr_index_to_common_gpr_index(index: u8) -> u8 {
+    // The encode method of gpr index in ModRM:
+    // ???
+    match index {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        3 => 1,
+        4 => 7,
+        5 => 6,
+        6 => 4,
+        7 => 5,
+        other => other,
+    }
+}
+
+pub(crate) fn advance_guest_rip(vcpu: &Vcpu) -> Result<()> {
+    let len = instruction_len().map_err(Error::from)? as usize;
+    vcpu.state.lock().arch_mut().advance_rip(len as u64);
+    Ok(())
 }

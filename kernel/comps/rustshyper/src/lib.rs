@@ -8,15 +8,17 @@
 
 extern crate alloc;
 
+mod context;
 mod emulate;
 mod error;
 mod handler;
 mod utils;
+mod vmcs;
+pub mod vcpu;
 pub mod interrupt;
 pub mod vm;
 
 pub use error::{Errno, Error};
-pub use vm::{Vcpu, Vm};
 
 use crate::error::*;
 

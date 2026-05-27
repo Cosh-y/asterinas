@@ -2,7 +2,7 @@
 
 //! VCPU file descriptor implementation
 
-use aster_rustshyper::vm::Vcpu;
+use aster_rustshyper::vcpu::Vcpu;
 
 use super::ioctl_defs;
 use crate::{
@@ -108,8 +108,8 @@ impl FileLike for VcpuFile {
                 Ok(0)
             }
             cmd @ InjectInterrupt => {
-                let vector = cmd.read()?;
-                self.vcpu.inject_interrupt(vector)?;
+                // let vector = cmd.read()?;
+                // self.vcpu.inject_interrupt(vector)?;
                 Ok(0)
             }
             _ => {

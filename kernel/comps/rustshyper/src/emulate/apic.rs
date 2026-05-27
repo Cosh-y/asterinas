@@ -2,7 +2,6 @@
 //!
 //! Use pure software emulate for now.
 
-// ===== LAPIC MMIO Register Offsets =====
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
 pub const LAPIC_SIZE: u64 = 0x400;
 
@@ -27,8 +26,8 @@ const XLAPIC_RO_IRR_BASE: u64 = 0x200;
 const XLAPIC_RO_IRR_SIZE: u64 = 0x080; // 0x280 - 0x200
 const XLAPIC_RW_ESR: u64 = 0x280;
 const XLAPIC_RW_LVT_CMCI: u64 = 0x2F0;
-const XLAPIC_RW_ICR_BASE: u64 = 0x300;
-const XLAPIC_RW_ICR_SIZE: u64 = 0x020; // 0x320 - 0x300
+const XLAPIC_RW_ICR_LOW: u64 = 0x300;
+const XLAPIC_RW_ICR_HIGH: u64 = 0x310;
 const XLAPIC_RW_LVT_TIMER: u64 = 0x320;
 const XLAPIC_RW_LVT_THERM: u64 = 0x330;
 const XLAPIC_RW_LVT_PERF: u64 = 0x340;
@@ -58,7 +57,7 @@ pub struct Lapic {
     pub irr: [u32; 8],
     /// In-Service Register: contains interrupts that have been dispatched to the processor but not yet EOIed
     pub isr: [u32; 8],
-    pub icr: [u32; 8], // Interrupt Command Register
+    pub icr: [u32; 2], // Interrupt Command Register, 64 bits
     pub tmr: [u32; 8], // Trigger Mode Register
 }
 
@@ -167,8 +166,6 @@ fn lapic_find_highest(val: &[u32; 8]) -> Option<u8> {
     None
 }
 
-// ===== LAPIC operations =====
-
 pub fn lapic_find_highest_isr(lapic: &Lapic) -> Option<u8> {
     lapic_find_highest(&lapic.isr)
 }
@@ -225,75 +222,6 @@ pub fn lapic_check_pending_vector(lapic: &Lapic) -> Option<u8> {
     }
 }
 
-// ===== APIC timer helpers =====
-
-fn is_periodic_mode(timer: &ApicTimer) -> bool {
-    ((timer.lvt_timer_bits >> 17) & 0b11) == 1
-}
-
-fn is_deadline_mode(timer: &ApicTimer) -> bool {
-    ((timer.lvt_timer_bits >> 17) & 0b11) == 2
-}
-
-/// Compute the next deadline for one-shot / periodic APIC timer modes.
-pub fn lapic_timer_deadline(timer: &ApicTimer, tsc: &TscState) -> Option<u64> {
-    if timer.initial_count == 0 || is_deadline_mode(timer) {
-        return None;
-    }
-
-    Some(
-        tsc.tsc_physical
-            .wrapping_add((timer.initial_count as u64) << timer.divide_shift),
-    )
-}
-
-/// Compute the deadline for TSC-deadline mode.
-pub fn lapic_timer_deadline_tsc(timer: &ApicTimer, tsc_deadline: u64) -> Option<u64> {
-    if tsc_deadline == 0 || !is_deadline_mode(timer) {
-        return None;
-    }
-
-    Some(tsc_deadline)
-}
-
-/// Called by the timer subsystem when the APIC timer deadline is reached.
-///
-/// Sets the IRR bit for the configured timer vector and, for periodic mode,
-/// re-arms the timer.  The caller is responsible for actually re-arming /
-/// deactivating the hardware timer (`timer_activate` / `timer_deactivate`).
-pub fn lapic_on_timer_expire(
-    lapic: &mut Lapic,
-    timer: &mut ApicTimer,
-    tsc: &TscState,
-) -> TimerExpireAction {
-    if (timer.lvt_timer_bits & (1 << 16)) == 0 {
-        let vector = (timer.lvt_timer_bits & 0xFF) as u8;
-        if vector < 32 {
-            log::warn!("xLAPIC: Find a timer vector triggered below 32: {}", vector);
-        }
-        lapic_set_irr(lapic, vector);
-    }
-
-    if is_periodic_mode(timer) {
-        let next_deadline = tsc
-            .tsc_physical
-            .wrapping_add((timer.initial_count as u64) << timer.divide_shift);
-        TimerExpireAction::Rearm(next_deadline)
-    } else {
-        TimerExpireAction::Deactivate
-    }
-}
-
-/// What the caller should do with the hardware timer after `lapic_on_timer_expire`.
-pub enum TimerExpireAction {
-    /// Re-arm the timer at the given TSC deadline.
-    Rearm(u64),
-    /// Deactivate the timer.
-    Deactivate,
-}
-
-// ===== LAPIC MMIO emulation =====
-
 /// Emulate a LAPIC MMIO read.
 ///
 /// Returns `(value, ok)` where `ok` is false if the offset is unsupported.
@@ -337,9 +265,8 @@ pub fn emulate_lapic_read(
         o if o >= XLAPIC_RO_IRR_BASE && o < XLAPIC_RO_IRR_BASE + XLAPIC_RO_IRR_SIZE => {
             lapic.irr[((o - XLAPIC_RO_IRR_BASE) / 16) as usize] as u64
         }
-        o if o >= XLAPIC_RW_ICR_BASE && o < XLAPIC_RW_ICR_BASE + XLAPIC_RW_ICR_SIZE => {
-            lapic.icr[((o - XLAPIC_RW_ICR_BASE) / 16) as usize] as u64
-        }
+        XLAPIC_RW_ICR_HIGH => lapic.icr[1] as u64,
+        XLAPIC_RW_ICR_LOW => lapic.icr[0] as u64,
         o if o >= XLAPIC_RO_TMR_BASE && o < XLAPIC_RO_TMR_BASE + XLAPIC_RO_TMR_SIZE => {
             lapic.tmr[((o - XLAPIC_RO_TMR_BASE) / 16) as usize] as u64
         }
@@ -351,21 +278,23 @@ pub fn emulate_lapic_read(
     (value, true)
 }
 
+pub struct Icr {
+    pub delivery_mode: u8,
+    pub dest_mode: u8,
+    pub dest_shorthand: u8,
+    pub dest_id: u8,
+    pub level: u8,
+    pub vector: u8,
+}
+
 /// Result of a LAPIC write that may require a timer action.
 pub enum LapicWriteEffect {
-    None,
     StartTimer,
     StartTimerDeadline,
     Eoi {
-        lapic_id: u32,
-        vector: u8,
-        irr: [u32; 8],
-        isr: [u32; 8],
+        isr_vec: u8,
     },
-    Icr {
-        low: u32,
-        high: u32,
-    },
+    Icr(Icr),
 }
 
 /// Emulate a LAPIC MMIO write.
@@ -374,10 +303,9 @@ pub enum LapicWriteEffect {
 pub fn emulate_lapic_write(
     lapic: &mut Lapic,
     timer: &mut ApicTimer,
-    ioapic: &mut Ioapic,
     offset: u64,
     value: u64,
-) -> (LapicWriteEffect, bool) {
+) -> Option<LapicWriteEffect> {
     match offset {
         XLAPIC_RW_ID => {
             let new_apic_id = ((value >> 24) & 0xFF) as u32;
@@ -396,18 +324,10 @@ pub fn emulate_lapic_write(
             if let Some(isr_vec) = lapic_find_highest_isr(lapic) {
                 lapic_clear_isr(lapic, isr_vec);
                 lapic_update_ppr(lapic);
-                ioapic_eoi(ioapic, isr_vec);
-                if isr_vec >= 0xf0 {
-                    return (
-                        LapicWriteEffect::Eoi {
-                            lapic_id: lapic.id,
-                            vector: isr_vec,
-                            irr: lapic.irr,
-                            isr: lapic.isr,
-                        },
-                        true,
-                    );
-                }
+                // ioapic_eoi(ioapic, isr_vec);
+                return Some(LapicWriteEffect::Eoi {
+                    isr_vec,
+                });
             }
         }
         XLAPIC_RW_LDR => {
@@ -433,24 +353,23 @@ pub fn emulate_lapic_write(
         XLAPIC_RW_LVT_TIMER => {
             let timer_mode = (value >> 17) & 0b11;
             timer.lvt_timer_bits = value as u32;
-            let effect = match timer_mode {
-                0 | 1 => LapicWriteEffect::StartTimer, // One-shot or Periodic
-                2 => LapicWriteEffect::StartTimerDeadline, // TSC-Deadline
+            match timer_mode {
+                0 | 1 => return Some(LapicWriteEffect::StartTimer), // One-shot or Periodic
+                2 => return Some(LapicWriteEffect::StartTimerDeadline), // TSC-Deadline
                 _ => {
                     log::warn!("MMIO.xLAPIC: Write a reserved timer mode");
-                    LapicWriteEffect::None
+                    return None;
                 }
-            };
-            return (effect, true);
+            }
         }
         XLAPIC_RW_TIMER_INIT => {
             timer.initial_count = value as u32;
-            return (LapicWriteEffect::StartTimer, true);
+            return Some(LapicWriteEffect::StartTimer);
         }
         XLAPIC_RW_TIMER_DIVI => {
             let shift = (value & 0b11) | ((value & 0b1000) >> 1);
             timer.divide_shift = ((shift + 1) & 0b111) as u8;
-            return (LapicWriteEffect::StartTimer, true);
+            return Some(LapicWriteEffect::StartTimer);
         }
         XLAPIC_WO_SELF_IPI => {
             lapic_set_irr(lapic, (value & 0xFF) as u8);
@@ -463,21 +382,24 @@ pub fn emulate_lapic_write(
                 );
             }
         }
-        o if o >= XLAPIC_RW_ICR_BASE && o < XLAPIC_RW_ICR_BASE + XLAPIC_RW_ICR_SIZE => {
-            let index = ((o - XLAPIC_RW_ICR_BASE) / 16) as usize;
-            lapic.icr[index] = value as u32;
-            if o == XLAPIC_RW_ICR_BASE {
-                if value >> 32 != 0 {
-                    lapic.icr[1] = (value >> 32) as u32;
-                }
-                return (
-                    LapicWriteEffect::Icr {
-                        low: value as u32,
-                        high: lapic.icr[1],
-                    },
-                    true,
-                );
+        XLAPIC_RW_ICR_LOW => {
+            lapic.icr[0] = value as u32;
+            // TODO: make sure
+            if value >> 32 != 0 {
+                lapic.icr[1] = (value >> 32) as u32;
             }
+            let icr = Icr {
+                vector: (value & 0xFF) as u8,
+                delivery_mode: ((value >> 8) & 0x7) as u8,
+                dest_mode: ((value >> 11) & 0x1) as u8,
+                dest_shorthand: ((value >> 18) & 0b11) as u8,
+                level: ((value >> 14) & 0x1) as u8,
+                dest_id: ((lapic.icr[1] >> 24) & 0xFF) as u8,
+            };
+            return Some(LapicWriteEffect::Icr(icr));
+        }
+        XLAPIC_RW_ICR_HIGH => {
+            lapic.icr[1] = value as u32;
         }
         _ => {
             log::warn!(
@@ -485,13 +407,11 @@ pub fn emulate_lapic_write(
                 offset,
                 value
             );
-            return (LapicWriteEffect::None, false);
+            return None;
         }
     }
-    (LapicWriteEffect::None, true)
+    None
 }
-
-// ===== I/O APIC emulation =====
 
 /// Emulate an IOAPIC MMIO read.
 pub fn emulate_ioapic_read(ioapic: &Ioapic, offset: u64) -> (u64, bool) {
@@ -606,5 +526,36 @@ pub fn ioapic_eoi(ioapic: &mut Ioapic, vec: u8) {
         if ioapic.redtbl[irq].fields().vector == vec {
             ioapic.redtbl[irq].set_remote_irr(false);
         }
+    }
+}
+
+pub fn default_lapic_ldr(vcpu_id: u32) -> u32 {
+    (1_u32.checked_shl(vcpu_id).unwrap_or(0)) << 24
+}
+
+const APIC_ICR_DESTINATION_MODE_LOGICAL: u8 = 1;
+const APIC_ICR_SHORTHAND_NONE: u8 = 0;
+const APIC_ICR_SHORTHAND_SELF: u8 = 1;
+const APIC_ICR_SHORTHAND_ALL_INCLUDING_SELF: u8 = 2;
+const APIC_ICR_SHORTHAND_ALL_EXCLUDING_SELF: u8 = 3;
+
+pub fn icr_matches_destination(
+    source_vcpu_id: u32,
+    target_vcpu_id: u32,
+    target_lapic: &Lapic,
+    source_icr: &Icr,
+) -> bool {
+    match source_icr.dest_shorthand {
+        APIC_ICR_SHORTHAND_NONE => {
+            if source_icr.dest_mode == APIC_ICR_DESTINATION_MODE_LOGICAL {
+                ((target_lapic.ldr >> 24) as u8) & source_icr.dest_id != 0
+            } else {
+                target_lapic.id as u8 == source_icr.dest_id
+            }
+        }
+        APIC_ICR_SHORTHAND_SELF => target_vcpu_id == source_vcpu_id,
+        APIC_ICR_SHORTHAND_ALL_INCLUDING_SELF => true,
+        APIC_ICR_SHORTHAND_ALL_EXCLUDING_SELF => target_vcpu_id != source_vcpu_id,
+        _ => false,
     }
 }

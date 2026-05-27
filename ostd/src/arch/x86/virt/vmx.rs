@@ -987,11 +987,6 @@ pub fn alloc_vmxon_region() -> Result<PhysAddr> {
     Ok(phys_addr as u64)
 }
 
-pub fn advance_rip(len: usize) -> Result<()> {
-    let base = VmcsGuestNW::RIP.read()?;
-    VmcsGuestNW::RIP.write(base + len)
-}
-
 pub fn vcpu_run(guest_regs_ptr: *mut VcpuRegs, launched: u64) -> u64 {
     unsafe { __rkvm_vcpu_run(guest_regs_ptr, launched) }
 }
@@ -1039,8 +1034,9 @@ core::arch::global_asm!(
         mov rcx, [rdi + 0x10]
         mov rdx, [rdi + 0x18]
         mov rsi, [rdi + 0x20]
-        ## skip rdi, rsp
-        mov rbp, [rdi + 0x38]
+        ## skip rdi
+        mov rbp, [rdi + 0x30]
+        ## skip rsp
         mov r8,  [rdi + 0x40]
         mov r9,  [rdi + 0x48]
         mov r10, [rdi + 0x50]
@@ -1075,8 +1071,9 @@ core::arch::global_asm!(
         mov [rdi + 0x10], rcx
         mov [rdi + 0x18], rdx
         mov [rdi + 0x20], rsi
-        ## skip rdi, rsp
-        mov [rdi + 0x38], rbp
+        ## skip rdi
+        mov [rdi + 0x30], rbp
+        ## skip rsp
         mov [rdi + 0x40], r8
         mov [rdi + 0x48], r9
         mov [rdi + 0x50], r10
