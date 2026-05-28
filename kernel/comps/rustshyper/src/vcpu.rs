@@ -4,7 +4,6 @@ use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 use core::arch::x86_64::CpuidResult;
 
 use ostd::arch::cpu::context::FpuContext;
-use ostd::arch::cpu::cpuid::cpuid;
 use ostd::arch::{read_tsc, tsc_freq};
 use ostd::arch::virt::*;
 use ostd::mm::kspace::{read_bytes_from_paddr, read_u64_from_paddr};
@@ -482,138 +481,6 @@ impl Vcpu {
         );
     }
 
-    pub(crate) fn emulate_cpuid(&self) -> Result<()> {
-        const CPUID_1_ECX_VMX: u32 = 1 << 5;
-        const CPUID_1_ECX_FMA: u32 = 1 << 12;
-        const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
-        const CPUID_1_ECX_PCID: u32 = 1 << 17;
-        const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
-        const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;
-        const CPUID_1_ECX_AVX: u32 = 1 << 28;
-        const CPUID_1_EDX_APIC: u32 = 1 << 9;
-        const CPUID_1_EDX_HTT: u32 = 1 << 28;
-        const CPUID_7_EBX_FSGSBASE: u32 = 1 << 0;
-        const CPUID_7_EBX_HLE: u32 = 1 << 4;
-        const CPUID_7_EBX_AVX2: u32 = 1 << 5;
-        const CPUID_7_EBX_RTM: u32 = 1 << 11;
-        const CPUID_7_EBX_INVPCID: u32 = 1 << 10;
-        const CPUID_7_EBX_AVX512F: u32 = 1 << 16;
-        const CPUID_7_EBX_AVX512DQ: u32 = 1 << 17;
-        const CPUID_7_EBX_AVX512CD: u32 = 1 << 28;
-        const CPUID_7_EBX_AVX512BW: u32 = 1 << 30;
-        const CPUID_7_EBX_AVX512VL: u32 = 1 << 31;
-        const CPUID_7_ECX_AVX512VBMI: u32 = 1 << 1;
-        const CPUID_7_ECX_VAES: u32 = 1 << 9;
-        const CPUID_7_ECX_VPCLMULQDQ: u32 = 1 << 10;
-        const CPUID_7_ECX_AVX512VNNI: u32 = 1 << 11;
-        const CPUID_7_ECX_AVX512BITALG: u32 = 1 << 12;
-        const CPUID_7_ECX_AVX512VPOPCNTDQ: u32 = 1 << 14;
-
-        let vcpu_count = self
-            .vm
-            .upgrade()
-            .map(|vm| vm.vcpu_count().max(1))
-            .unwrap_or(1);
-        let mut state = self.state.lock();
-        let eax = state.arch.regs.rax as u32;
-        let ecx = state.arch.regs.rcx as u32;
-        let apic_id = state.lapic.id;
-        let (mut eax_out, mut ebx_out, mut ecx_out, mut edx_out) =
-            if let Some(CpuidResult { eax, ebx, ecx, edx }) = cpuid(eax, ecx) {
-                (eax, ebx, ecx, edx)
-            } else {
-                (0, 0, 0, 0)
-            };
-
-        if eax == 0 {
-            eax_out = eax_out.max(0x16);
-        }
-
-        if eax == 1 {
-            ecx_out &= !(CPUID_1_ECX_VMX
-                | CPUID_1_ECX_FMA
-                | CPUID_1_ECX_X2APIC
-                | CPUID_1_ECX_PCID
-                | CPUID_1_ECX_XSAVE
-                | CPUID_1_ECX_OSXSAVE
-                | CPUID_1_ECX_AVX);
-            ebx_out =
-                (ebx_out & 0x0000_ffff) | ((vcpu_count & 0xff) << 16) | ((apic_id & 0xff) << 24);
-            edx_out |= CPUID_1_EDX_APIC;
-            if vcpu_count > 1 {
-                edx_out |= CPUID_1_EDX_HTT;
-            } else {
-                edx_out &= !CPUID_1_EDX_HTT;
-            }
-        }
-
-        if eax == 4 {
-            if (eax_out & 0x1f) != 0 {
-                let cores_per_package_minus_one = vcpu_count.saturating_sub(1).min(0x3f);
-                eax_out = (eax_out & !(0x3f << 26)) | (cores_per_package_minus_one << 26);
-            }
-        }
-
-        if eax == 7 && ecx == 0 {
-            ebx_out &= !(CPUID_7_EBX_FSGSBASE
-                | CPUID_7_EBX_HLE
-                | CPUID_7_EBX_AVX2
-                | CPUID_7_EBX_RTM
-                | CPUID_7_EBX_INVPCID
-                | CPUID_7_EBX_AVX512F
-                | CPUID_7_EBX_AVX512DQ
-                | CPUID_7_EBX_AVX512CD
-                | CPUID_7_EBX_AVX512BW
-                | CPUID_7_EBX_AVX512VL);
-            ecx_out &= !(CPUID_7_ECX_AVX512VBMI
-                | CPUID_7_ECX_VAES
-                | CPUID_7_ECX_VPCLMULQDQ
-                | CPUID_7_ECX_AVX512VNNI
-                | CPUID_7_ECX_AVX512BITALG
-                | CPUID_7_ECX_AVX512VPOPCNTDQ);
-        }
-
-        if eax == 0xd {
-            eax_out = 0;
-            ebx_out = 0;
-            ecx_out = 0;
-            edx_out = 0;
-        }
-
-        if eax == 0x0b || eax == 0x1f {
-            let topology = topology_cpuid(ecx, apic_id, vcpu_count);
-            eax_out = topology.eax;
-            ebx_out = topology.ebx;
-            ecx_out = topology.ecx;
-            edx_out = topology.edx;
-        }
-
-        const CPUID_TSC_CRYSTAL_HZ: u32 = 1_000_000;
-        if eax == 0x15 {
-            if let Some(tsc_mhz) = virtual_tsc_mhz() {
-                eax_out = 1;
-                ebx_out = tsc_mhz;
-                ecx_out = CPUID_TSC_CRYSTAL_HZ;
-                edx_out = 0;
-            }
-        }
-
-        if eax == 0x16 {
-            if let Some(tsc_mhz) = virtual_tsc_mhz() {
-                eax_out = tsc_mhz;
-                ebx_out = tsc_mhz;
-                ecx_out = 0;
-                edx_out = 0;
-            }
-        }
-
-        state.arch.regs.rax = eax_out as u64;
-        state.arch.regs.rbx = ebx_out as u64;
-        state.arch.regs.rcx = ecx_out as u64;
-        state.arch.regs.rdx = edx_out as u64;
-        Ok(())
-    }
-
     /// TODO: 现在 note 和 refresh 的实现是一样的？
     /// Record Guest TSC value at VM exit.
     pub(crate) fn note_vmexit_tsc(&self) -> Result<()> {
@@ -984,11 +851,6 @@ impl VcpuArchState {
     }
 }
 
-fn virtual_tsc_mhz() -> Option<u32> {
-    let mhz = (tsc_freq().saturating_add(500_000)) / 1_000_000;
-    u32::try_from(mhz).ok().filter(|&mhz| mhz != 0)
-}
-
 struct VcpuRunGuard<'a> {
     vcpu: &'a Vcpu,
 }
@@ -1043,82 +905,6 @@ impl Default for VcpuMpState {
 }
 
 // TODO: consider removing the following part from vcpu.rs
-// fn sync_sregs_from_vmcs(sregs: &mut VcpuSregs) -> Result<()> {
-//     let cr0 = VmcsGuestNW::CR0.read().map_err(Error::from)? as u64;
-//     let cr0_mask = VmcsControlNW::CR0_GUEST_HOST_MASK
-//         .read()
-//         .map_err(Error::from)? as u64;
-//     let cr0_shadow = VmcsControlNW::CR0_READ_SHADOW.read().map_err(Error::from)? as u64;
-//     sregs.cr0 = merge_guest_control_register(cr0, cr0_mask, cr0_shadow);
-
-//     let cr4 = VmcsGuestNW::CR4.read().map_err(Error::from)? as u64;
-//     let cr4_mask = VmcsControlNW::CR4_GUEST_HOST_MASK
-//         .read()
-//         .map_err(Error::from)? as u64;
-//     let cr4_shadow = VmcsControlNW::CR4_READ_SHADOW.read().map_err(Error::from)? as u64;
-//     sregs.cr4 = merge_guest_control_register(cr4, cr4_mask, cr4_shadow);
-
-//     sregs.cr3 = VmcsGuestNW::CR3.read().map_err(Error::from)? as u64;
-//     sregs.efer = VmcsGuest64::IA32_EFER.read().map_err(Error::from)?;
-//     sregs.gdt = read_dtable_from_vmcs(VmcsGuestNW::GDTR_BASE, VmcsGuest32::GDTR_LIMIT)?;
-//     sregs.idt = read_dtable_from_vmcs(VmcsGuestNW::IDTR_BASE, VmcsGuest32::IDTR_LIMIT)?;
-
-//     sregs.cs = read_segment_from_vmcs(
-//         VmcsGuest16::CS_SELECTOR,
-//         VmcsGuestNW::CS_BASE,
-//         VmcsGuest32::CS_LIMIT,
-//         VmcsGuest32::CS_ACCESS_RIGHTS,
-//     )?;
-//     sregs.ds = read_segment_from_vmcs(
-//         VmcsGuest16::DS_SELECTOR,
-//         VmcsGuestNW::DS_BASE,
-//         VmcsGuest32::DS_LIMIT,
-//         VmcsGuest32::DS_ACCESS_RIGHTS,
-//     )?;
-//     sregs.es = read_segment_from_vmcs(
-//         VmcsGuest16::ES_SELECTOR,
-//         VmcsGuestNW::ES_BASE,
-//         VmcsGuest32::ES_LIMIT,
-//         VmcsGuest32::ES_ACCESS_RIGHTS,
-//     )?;
-//     sregs.fs = read_segment_from_vmcs(
-//         VmcsGuest16::FS_SELECTOR,
-//         VmcsGuestNW::FS_BASE,
-//         VmcsGuest32::FS_LIMIT,
-//         VmcsGuest32::FS_ACCESS_RIGHTS,
-//     )?;
-//     sregs.gs = read_segment_from_vmcs(
-//         VmcsGuest16::GS_SELECTOR,
-//         VmcsGuestNW::GS_BASE,
-//         VmcsGuest32::GS_LIMIT,
-//         VmcsGuest32::GS_ACCESS_RIGHTS,
-//     )?;
-//     sregs.ss = read_segment_from_vmcs(
-//         VmcsGuest16::SS_SELECTOR,
-//         VmcsGuestNW::SS_BASE,
-//         VmcsGuest32::SS_LIMIT,
-//         VmcsGuest32::SS_ACCESS_RIGHTS,
-//     )?;
-//     sregs.tr = read_segment_from_vmcs(
-//         VmcsGuest16::TR_SELECTOR,
-//         VmcsGuestNW::TR_BASE,
-//         VmcsGuest32::TR_LIMIT,
-//         VmcsGuest32::TR_ACCESS_RIGHTS,
-//     )?;
-//     sregs.ldt = read_segment_from_vmcs(
-//         VmcsGuest16::LDTR_SELECTOR,
-//         VmcsGuestNW::LDTR_BASE,
-//         VmcsGuest32::LDTR_LIMIT,
-//         VmcsGuest32::LDTR_ACCESS_RIGHTS,
-//     )?;
-
-//     Ok(())
-// }
-
-// fn merge_guest_control_register(value: u64, mask: u64, shadow: u64) -> u64 {
-//     (value & !mask) | (shadow & mask)
-// }
-
 fn read_dtable_from_vmcs(base_field: VmcsGuestNW, limit_field: VmcsGuest32) -> Result<VcpuDtable> {
     Ok(VcpuDtable {
         base: base_field.read().map_err(Error::from)? as u64,
@@ -1151,44 +937,6 @@ fn read_segment_from_vmcs(
     })
 }
 
-fn topology_cpuid(subleaf: u32, apic_id: u32, vcpu_count: u32) -> CpuidResult {
-    if vcpu_count <= 1 {
-        return CpuidResult {
-            eax: 0,
-            ebx: 0,
-            ecx: subleaf,
-            edx: apic_id,
-        };
-    }
-
-    match subleaf {
-        0 => CpuidResult {
-            // One hardware thread per guest core. Keep the SMT level present
-            // but sized to 1 so Linux models --vcpus as separate cores.
-            eax: 0,
-            ebx: 1,
-            ecx: 1 << 8,
-            edx: apic_id,
-        },
-        1 => CpuidResult {
-            eax: topology_apic_id_shift(vcpu_count),
-            ebx: vcpu_count,
-            ecx: (2 << 8) | 1,
-            edx: apic_id,
-        },
-        _ => CpuidResult {
-            eax: 0,
-            ebx: 0,
-            ecx: subleaf,
-            edx: apic_id,
-        },
-    }
-}
-
-fn topology_apic_id_shift(vcpu_count: u32) -> u32 {
-    u32::BITS - vcpu_count.saturating_sub(1).leading_zeros()
-}
-
 const HLT_WAIT_MAX_TSC_FREQ_DIVISOR: u64 = 100;
 const HLT_WAIT_MAX_FALLBACK_TICKS: u64 = 25_000_000;
 
@@ -1198,30 +946,6 @@ fn hlt_wait_max_ticks() -> u64 {
         freq => (freq / HLT_WAIT_MAX_TSC_FREQ_DIVISOR).max(1),
     }
 }
-
-// pub(crate) fn reset_vcpu_for_init_locked(state: &mut VcpuState, vcpu_id: u32) {
-//     let mut reset_state = VcpuState {
-//         msrs: VcpuMsrs::default(),
-//         regs: VcpuRegs {
-//             rflags: 0x2,
-//             ..VcpuRegs::default()
-//         },
-//         sregs: real_mode_sregs(0),
-//         mp_state: VcpuMpState::WaitForSipi,
-//         ..VcpuState::default()
-//     };
-
-//     if vcpu_id != 0 {
-//         reset_state.msrs.apic_base &= !(1 << 8);
-//     }
-//     reset_state.msrs.efer = 0;
-//     reset_state.lapic.id = vcpu_id;
-//     reset_state.lapic.ldr = default_lapic_ldr(vcpu_id);
-//     reset_state.apic_timer.lvt_timer_bits = 1 << 16;
-//     reset_state.tsc.multiplier = VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK;
-
-//     *state = reset_state;
-// }
 
 pub(crate) fn reset_vcpu_for_init_locked(state: &mut VcpuState, vcpu_id: u32) {
     *state = VcpuState::new_with_vcpu_id(vcpu_id);
@@ -1247,13 +971,6 @@ pub(crate) fn start_vcpu_from_sipi_locked(state: &mut VcpuState, vector: u8, vcp
     state.interrupt = InterruptState::default();
     timer_deactivate_locked(state);
     state.mp_state = VcpuMpState::Runnable;
-
-    log::info!(
-        "rustshyper: SIPI starts vcpu id={} vector={:#x} gpa={:#x}",
-        vcpu_id,
-        vector,
-        u64::from(vector) << 12
-    );
 }
 
 fn real_mode_sregs(startup_vector: u8) -> VcpuSregs {

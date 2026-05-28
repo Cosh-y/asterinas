@@ -4,10 +4,7 @@ use alloc::{
     collections::BTreeMap,
     sync::{Arc, Weak},
 };
-use core::{
-    arch::x86_64::CpuidResult,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ostd::{
     arch::{

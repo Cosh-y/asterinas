@@ -3,20 +3,21 @@ use core::fmt;
 use ostd::arch::virt::*;
 use x86_64::registers::control::Cr0Flags;
 
-use super::{
+use crate::{
     emulate::apic::{
         emulate_ioapic_read, emulate_ioapic_write, emulate_lapic_read, emulate_lapic_write,
         LapicWriteEffect, Icr, ioapic_eoi, IOAPIC_BASE, IOAPIC_SIZE, LAPIC_BASE, LAPIC_SIZE,
     },
+    emulate::cpuid::emulate_cpuid,
     emulate::cr::emulate_cr_access,
     emulate::msr::emulate_msrrw,
     emulate::timer::{start_apic_timer_deadline_locked, start_apic_timer_locked},
     error::*,
+    interrupt::{
+        clear_interrupt_shadow_after_hlt, handle_external_interrupt, handle_interrupt_window,
+        inject_gp_fault, inject_pending_exception,
+    },
     vcpu::{Vcpu, VcpuState, VcpuMsrs},
-};
-use crate::interrupt::{
-    clear_interrupt_shadow_after_hlt, handle_external_interrupt, handle_interrupt_window,
-    inject_gp_fault, inject_pending_exception,
 };
 
 const MAX_INSN_LENGTH: usize = 15;
@@ -172,7 +173,7 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             Ok(None)
         }
         Ok(VmxExitReason::CPUID) => {
-            vcpu.emulate_cpuid()?;
+            emulate_cpuid(vcpu)?;
             advance_guest_rip(vcpu)?;
             Ok(None)
         }
