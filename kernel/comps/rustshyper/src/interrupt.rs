@@ -78,70 +78,61 @@ pub fn handle_external_interrupt() -> Result<()> {
     Ok(())
 }
 
-/// Return `true` if there is a pending exception that has not yet been
-/// injected into the guest VMCS.
-///
-/// Mirrors `has_pending_exception` from `injection.c`.
-pub fn has_pending_exception(exc: &ExceptionState) -> bool {
-    exc.pending && !exc.injected
-}
+// /// Queue a general-protection fault (#GP, vector 13) with error code 0.
+// pub fn inject_gp_fault(exc: &mut ExceptionState) {
+//     inject_queue_exception(exc, X86_TRAP_GP, 0);
+// }
 
-/// Queue a hardware exception for delivery on the next VM-entry.
-///
-/// Mirrors `inject_queue_exception` from `injection.c`.
-pub fn inject_queue_exception(exc: &mut ExceptionState, nr: u32, error_code: u32) {
-    if has_pending_exception(exc) {
-        log::warn!(
-            "VCPU: Has pending exception #{} when injecting exception #{}",
-            exc.nr,
-            nr
-        );
-    }
-    exc.pending = true;
-    exc.nr = nr;
-    exc.has_error_code = true;
-    exc.error_code = error_code;
-    exc.injected = false;
-}
+// /// Return `true` if there is a pending exception that has not yet been
+// /// injected into the guest VMCS.
+// pub fn has_pending_exception(exc: &ExceptionState) -> bool {
+//     exc.pending && !exc.injected
+// }
 
-/// Write the queued exception into the VMCS VM-entry interruption-information
-/// field so that it is delivered to the guest on the next VM-entry.
-///
-/// Mirrors `inject_pending_exception` from `injection.c`.
-pub fn inject_pending_exception(
-    exc: &mut ExceptionState,
-    perf_exception_count: &mut [u32; 32],
-) -> Result<()> {
-    let mut intr_info = exc.nr | INTR_INFO_VALID_MASK | INTR_TYPE_HARD_EXCEPTION;
+// /// Queue a hardware exception for delivery on the next VM-entry.
+// pub fn inject_queue_exception(exc: &mut ExceptionState, nr: u32, error_code: u32) {
+//     if has_pending_exception(exc) {
+//         log::warn!(
+//             "VCPU: Has pending exception #{} when injecting exception #{}",
+//             exc.nr,
+//             nr
+//         );
+//     }
+//     exc.pending = true;
+//     exc.nr = nr;
+//     exc.has_error_code = true;
+//     exc.error_code = error_code;
+//     exc.injected = false;
+// }
 
-    if exc.has_error_code {
-        VmcsControl32::VMENTRY_EXCEPTION_ERR_CODE
-            .write(exc.error_code)
-            .map_err(Error::from)?;
-        intr_info |= INTR_INFO_DELIVER_CODE_MASK;
-    }
+// /// Write the queued exception into the VMCS VM-entry interruption-information
+// /// field so that it is delivered to the guest on the next VM-entry.
+// pub fn inject_pending_exception(exc: &mut ExceptionState) -> Result<()> {
+//     let mut intr_info = exc.nr | INTR_INFO_VALID_MASK | INTR_TYPE_HARD_EXCEPTION;
 
-    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
-        .write(intr_info)
-        .map_err(Error::from)?;
+//     if exc.has_error_code {
+//         VmcsControl32::VMENTRY_EXCEPTION_ERR_CODE
+//             .write(exc.error_code)
+//             .map_err(Error::from)?;
+//         intr_info |= INTR_INFO_DELIVER_CODE_MASK;
+//     }
 
-    if exc.nr < 32 {
-        perf_exception_count[exc.nr as usize] =
-            perf_exception_count[exc.nr as usize].saturating_add(1);
-    }
+//     VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+//         .write(intr_info)
+//         .map_err(Error::from)?;
 
-    exc.pending = false;
-    exc.injected = true;
+//     exc.pending = false;
+//     exc.injected = true;
 
-    Ok(())
-}
+//     Ok(())
+// }
 
-/// Clear the VM-entry event-injection control field.
-pub fn clear_event_injection() -> Result<()> {
-    VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
-        .write(0)
-        .map_err(Error::from)
-}
+// /// Clear the VM-entry event-injection control field.
+// pub fn clear_event_injection() -> Result<()> {
+//     VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+//         .write(0)
+//         .map_err(Error::from)
+// }
 
 /// Clears interrupt shadow after an emulated HLT wakeup.
 /// remove BLOCKING_BY_STI bit in the guest interruptibility state(VMCS)
@@ -207,13 +198,6 @@ pub(crate) fn inject_lapic_interrupt(
 /// preparation step before the guest re-enters.
 pub fn handle_interrupt_window() -> Result<()> {
     disable_interrupt_window_exiting()
-}
-
-/// Queue a general-protection fault (#GP, vector 13) with error code 0.
-///
-/// Mirrors `inject_gp_fault` from `injection.c`.
-pub fn inject_gp_fault(exc: &mut ExceptionState) {
-    inject_queue_exception(exc, X86_TRAP_GP, 0);
 }
 
 /// Check whether the guest is currently in a state where an external interrupt

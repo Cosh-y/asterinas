@@ -1,5 +1,5 @@
 use alloc::sync::Weak;
-use x86::vmx::vmcs::guest;
+use x86::vmx::vmcs::{guest, host};
 use x86_64::registers::control::{Cr0Flags, Cr4Flags};
 use core::arch::x86_64::CpuidResult;
 
@@ -16,10 +16,7 @@ use crate::emulate::timer::{
     compute_preemption_timer_value, expire_lapic_timer_locked, timer_deactivate_locked, VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK
 };
 use crate::error::*;
-use crate::interrupt::{
-    clear_event_injection, has_pending_exception, inject_lapic_interrupt, inject_pending_exception, inject_pending_interrupt,
-    ExceptionState, InterruptState,
-};
+use crate::interrupt::{inject_lapic_interrupt, inject_pending_interrupt, ExceptionState, InterruptState, };
 use crate::vm::Vm;
 use crate::vmcs::{Vmcs, VmcsGuestState};
 
@@ -127,37 +124,16 @@ impl Vcpu {
 
         self.init_vmcs()?;
 
-        use super::handler::vmexit_handler;
         loop {
             let irq_guard = ostd::irq::disable_local();
 
-            vmptrld(self.vmcs.vmcs_phys())?;
-            self.prepare_pending_events()?;
-            self.prepare_guest_timing_before_entry()?;
+            let host_context = self.prepare_vmentry()?;
+            let run_result = self.vmlaunch_or_vmresume();
+            self.complete_vmexit(host_context, run_result)?;
 
-            let host_context = HostContext::save();
-
-            let (_exit_info, run_state) = {
-                let load_guest_result = self.load_guest_context();
-                if let Err(err) = load_guest_result {
-                    host_context.load();
-                    return Err(err);
-                }
-
-                let run_result = self.vmlaunch_or_vmresume();
-                let save_context_result = self.save_guest_context();
-                
-                host_context.load();
-
-                run_result?;
-                save_context_result?;
-
-                let exit_info = exit_info().map_err(Error::from)?;
-                self.note_vmexit_tsc()?;
-                let run_state = vmexit_handler(self, &exit_info)?;
-                (exit_info, run_state)
-            };
-
+            use super::handler::vmexit_handler;
+            let exit_info = exit_info().map_err(Error::from)?;
+            let run_state = vmexit_handler(self, &exit_info)?;
             drop(irq_guard);
 
             if let Some(run_state) = run_state {
@@ -209,6 +185,20 @@ impl Vcpu {
         Ok(())
     }
 
+    fn prepare_vmentry(&self) -> Result<HostContext> {
+        vmptrld(self.vmcs.vmcs_phys())?;
+
+        self.prepare_pending_events()?;
+        self.prepare_guest_timing_before_entry()?;
+        
+        let host_context = HostContext::save();
+        if let Err(err) = self.load_guest_context() {
+            host_context.load();
+            return Err(err);
+        }
+        Ok(host_context)
+    }
+
     fn vmlaunch_or_vmresume(&self) -> Result<()> {
         let launched: u64 = if self.state.lock().vmcs_launched { 1 } else { 0 };
         
@@ -222,6 +212,18 @@ impl Vcpu {
         }
         
         self.state.lock().vmcs_launched = true;
+        Ok(())
+    }
+
+    fn complete_vmexit(&self, host_context: HostContext, run_result: Result<()>) -> Result<()> {
+        let save_guest_context_result = self.save_guest_context();
+        host_context.load();
+        
+        run_result?;
+        save_guest_context_result?;
+
+        self.note_vmexit_tsc()?;
+        
         Ok(())
     }
 
@@ -495,8 +497,35 @@ impl Vcpu {
         state.tsc.tsc_physical = state.tsc.tsc_offset.wrapping_add(read_tsc());
     }
 
+    fn prepare_pending_events(&self) -> Result<()> {
+        let mut state = self.state.lock();
+
+        // clear_event_injection()?;
+
+        // if has_pending_exception(&state.exception) {
+        //     inject_pending_exception(&mut state.exception)?;
+        //     return Ok(());
+        // }
+
+        {
+            let VcpuState {
+                lapic, interrupt, ..
+            } = &mut *state;
+            inject_pending_interrupt(lapic, interrupt)?;
+        }
+        if state.interrupt.pending {
+            return Ok(());
+        }
+
+        if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
+            inject_lapic_interrupt(&mut state.lapic, u32::from(vector))?;
+        }
+
+        Ok(())
+    }
+
     /// 在 VMEntry 前更新 tsc offset 并设置 VMCS 中的 preemption timer 和 tsc offset
-    pub(crate) fn prepare_guest_timing_before_entry(&self) -> Result<()> {
+    fn prepare_guest_timing_before_entry(&self) -> Result<()> {
         self.refresh_guest_tsc();
 
         let state = self.state.lock();
@@ -504,59 +533,6 @@ impl Vcpu {
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(preemption_timer)?;
         VmcsControl64::TSC_OFFSET.write(state.tsc.tsc_offset)?;
         Ok(())
-    }
-
-    pub(crate) fn handle_preemption_timer_expire(&self) -> Result<()> {
-        let mut state = self.state.lock();
-        if !state.tsc.activated {
-            return Ok(());
-        }
-        if state.tsc.ddl_physical > state.tsc.tsc_physical {
-            return Ok(());
-        }
-
-        expire_lapic_timer_locked(&mut state);
-        Ok(())
-    }
-
-    /// 判断能否在内核中等到打破 hlt 的中断
-    pub(crate) fn wait_for_hlt_wakeup(&self) -> Result<bool> {
-        {
-            self.refresh_guest_tsc();
-            let mut state = self.state.lock();
-            if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
-                return Ok(true);
-            }
-            if !state.tsc.activated {
-                return Ok(false);
-            }
-            if state.tsc.ddl_physical <= state.tsc.tsc_physical {
-                expire_lapic_timer_locked(&mut state);
-                return Ok(true);
-            }
-        }
-
-        let wait_started_tsc = read_tsc();
-        let max_wait_ticks = hlt_wait_max_ticks();
-        loop {
-            self.refresh_guest_tsc();
-            let mut state = self.state.lock();
-            if state.interrupt.pending || lapic_check_pending_vector(&state.lapic).is_some() {
-                return Ok(true);
-            }
-            if state.tsc.activated && state.tsc.ddl_physical <= state.tsc.tsc_physical {
-                expire_lapic_timer_locked(&mut state);
-                return Ok(true);
-            }
-            debug_assert!(state.tsc.activated);
-            let raw_tsc = read_tsc();
-            if raw_tsc.saturating_sub(wait_started_tsc) >= max_wait_ticks {
-                return Ok(false);
-            }
-            drop(state);
-
-            core::hint::spin_loop();
-        }
     }
 
     pub(crate) fn translate_guest_gpa(&self, gpa: u64) -> Result<u64> {
@@ -641,34 +617,6 @@ impl Vcpu {
     fn read_guest_phys_u64(&self, gpa: u64) -> Result<u64> {
         let hpa = self.translate_guest_gpa(gpa)?;
         Ok(read_u64_from_paddr(hpa as usize))
-    }
-
-    fn prepare_pending_events(&self) -> Result<()> {
-        let mut state = self.state.lock();
-
-        clear_event_injection()?;
-
-        if has_pending_exception(&state.exception) {
-            let mut perf = [0_u32; 32];
-            inject_pending_exception(&mut state.exception, &mut perf)?;
-            return Ok(());
-        }
-
-        {
-            let VcpuState {
-                lapic, interrupt, ..
-            } = &mut *state;
-            inject_pending_interrupt(lapic, interrupt)?;
-        }
-        if state.interrupt.pending {
-            return Ok(());
-        }
-
-        if let Some(vector) = lapic_check_pending_vector(&state.lapic) {
-            inject_lapic_interrupt(&mut state.lapic, u32::from(vector))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -935,16 +883,6 @@ fn read_segment_from_vmcs(
         unusable: ((rights >> 16) & 0x1) as u8,
         padding: 0,
     })
-}
-
-const HLT_WAIT_MAX_TSC_FREQ_DIVISOR: u64 = 100;
-const HLT_WAIT_MAX_FALLBACK_TICKS: u64 = 25_000_000;
-
-fn hlt_wait_max_ticks() -> u64 {
-    match tsc_freq() {
-        0 => HLT_WAIT_MAX_FALLBACK_TICKS,
-        freq => (freq / HLT_WAIT_MAX_TSC_FREQ_DIVISOR).max(1),
-    }
 }
 
 pub(crate) fn reset_vcpu_for_init_locked(state: &mut VcpuState, vcpu_id: u32) {

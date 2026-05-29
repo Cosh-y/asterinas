@@ -29,12 +29,8 @@ use super::{
         icr_matches_destination, ApicTimer, Ioapic, Lapic, TscState, IOAPIC_NUM_PINS,
         default_lapic_ldr,
     },
-    emulate::timer::{
-        VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK,
-        timer_deactivate_locked,
-    },
+    emulate::timer::{VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK, timer_deactivate_locked, },
     error::*,
-    interrupt::{clear_event_injection, vmx_interrupt_snapshot,},
     utils::*,
 };
 

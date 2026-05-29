@@ -11,11 +11,10 @@ use crate::{
     emulate::cpuid::emulate_cpuid,
     emulate::cr::emulate_cr_access,
     emulate::msr::emulate_msrrw,
-    emulate::timer::{start_apic_timer_deadline_locked, start_apic_timer_locked},
+    emulate::timer::{handle_preemption_timer_expire, start_apic_timer_deadline_locked, start_apic_timer_locked, wait_for_hlt_wakeup},
     error::*,
     interrupt::{
         clear_interrupt_shadow_after_hlt, handle_external_interrupt, handle_interrupt_window,
-        inject_gp_fault, inject_pending_exception,
     },
     vcpu::{Vcpu, VcpuState, VcpuMsrs},
 };
@@ -158,7 +157,7 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
         }
         Ok(VmxExitReason::TRIPLE_FAULT) => Ok(Some(build_run_state(exit_info))),
         Ok(VmxExitReason::HLT) => {
-            if vcpu.wait_for_hlt_wakeup()? {
+            if wait_for_hlt_wakeup(vcpu)? {
                 // log::error!("Guest HLT. But wake up from host kernel due to event injection or interrupt window");
                 clear_interrupt_shadow_after_hlt()?;
                 advance_guest_rip(vcpu)?;
@@ -202,7 +201,7 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             }
         }
         Ok(VmxExitReason::PREEMPTION_TIMER) => {
-            vcpu.handle_preemption_timer_expire()?;
+            handle_preemption_timer_expire(vcpu)?;
             Ok(Some(build_run_state(exit_info)))
         }
         Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
@@ -284,13 +283,12 @@ fn instruction_len() -> core::result::Result<u32, ostd::Error> {
     VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read()
 }
 
-fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
-    let mut state = vcpu.state.lock();
-    inject_gp_fault(&mut state.exception);
-    let mut perf = [0u32; 32];
-    inject_pending_exception(&mut state.exception, &mut perf)?;
-    Ok(())
-}
+// fn queue_gp_fault(vcpu: &Vcpu) -> Result<()> {
+//     let mut state = vcpu.state.lock();
+//     inject_gp_fault(&mut state.exception);
+//     inject_pending_exception(&mut state.exception)?;
+//     Ok(())
+// }
 
 // TODO: why return bool here?
 fn emulate_apic_mmio(vcpu: &Vcpu, fault_gpa: u64) -> Result<bool> {
