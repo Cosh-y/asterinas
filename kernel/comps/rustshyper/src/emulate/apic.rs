@@ -130,8 +130,13 @@ impl IoapicRedtbl {
 /// I/O APIC state.
 #[derive(Debug)]
 pub struct Ioapic {
+    // reference to 82093AA I/O ADVANCED PROGRAMMABLE INTERRUPT CONTROLLER
+    // IOAPIC registers
+    // 3.1. IOREGSEL and IOWIN is memory mapped registers
     pub ioregsel: u32,
+    // 3.2. IOAPICID and others
     pub id: u32,
+    // 3.2.4. IOREDTBL[23:0] -- I/O REDIRECTION TABLE REGISTERS
     pub redtbl: [IoapicRedtbl; IOAPIC_NUM_PINS],
 }
 

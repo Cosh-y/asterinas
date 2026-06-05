@@ -13,17 +13,13 @@ use ostd::{
         virt::*,
     },
     mm::{
-        HasPaddr, PAGE_SIZE, VmIo, VmSpace, kspace::{read_bytes_from_paddr, read_u64_from_paddr}, vm_space::VmQueriedItem
+        HasPaddr, PAGE_SIZE, VmIo, VmSpace, kspace::{read_bytes_from_paddr, read_u64_from_paddr},
     },
     sync::{Mutex, SpinLock, SpinLockGuard},
 };
 
-use crate::vcpu::{
-    Vcpu, VcpuState, VcpuMpState, VcpuMsrs,
-    reset_vcpu_for_init_locked, start_vcpu_from_sipi_locked,
-};
-
-use super::{
+use crate::{
+    address::host::query_userspace_page_hpa,
     emulate::apic::{
         ioapic_kick_irq, lapic_set_irr, Icr,
         icr_matches_destination, ApicTimer, Ioapic, Lapic, TscState, IOAPIC_NUM_PINS,
@@ -32,6 +28,10 @@ use super::{
     emulate::timer::{VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK, timer_deactivate_locked, },
     error::*,
     utils::*,
+    vcpu::{
+        Vcpu, VcpuState, VcpuMpState, VcpuMsrs,
+        reset_vcpu_for_init_locked, start_vcpu_from_sipi_locked,
+    },
 };
 
 const PAUSE_DIAG_LOG_INTERVAL: u64 = 1 << 20;
@@ -290,68 +290,4 @@ impl Vm {
 
         Ok(())
     }
-}
-
-fn query_userspace_page_hpa(vm_space: &Arc<VmSpace>, userspace_addr: VirtAddr) -> Result<PhysAddr> {
-    debug_assert!(userspace_addr.is_multiple_of(PAGE_SIZE));
-
-    loop {
-        let page_range = userspace_addr..(userspace_addr + PAGE_SIZE);
-        let preempt_guard = ostd::task::disable_preempt();
-        let mut cursor = vm_space.cursor(&preempt_guard, &page_range).map_err(|_| {
-            Error::with_message(
-                Errno::Fault,
-                "failed to create vm_space cursor for guest memory",
-            )
-        })?;
-
-        let queried_item = cursor
-            .query()
-            .map_err(|_| {
-                Error::with_message(
-                    Errno::Fault,
-                    "failed to query vm_space mapping for guest memory",
-                )
-            })?
-            .1;
-
-        match queried_item {
-            Some(VmQueriedItem::MappedRam { frame, .. }) => return Ok(frame.paddr() as _),
-            Some(VmQueriedItem::MappedIoMem { paddr, .. }) => return Ok(paddr as _),
-            None => (),
-        }
-
-        drop(cursor);
-        drop(preempt_guard);
-
-        touch_userspace_page(vm_space, userspace_addr)?;
-    }
-}
-
-fn touch_userspace_page(vm_space: &Arc<VmSpace>, userspace_addr: VirtAddr) -> Result<()> {
-    let mut reader = vm_space.reader(userspace_addr, 1).map_err(|err| {
-        let _ = err;
-        Error::with_message(
-            Errno::Fault,
-            "failed to create userspace reader while faulting in guest memory",
-        )
-    })?;
-
-    let _: u8 = reader.read_val().map_err(|err| {
-        let _ = err;
-        Error::with_message(
-            Errno::Fault,
-            "failed to fault in userspace page for guest memory",
-        )
-    })?;
-
-    Ok(())
-}
-
-fn is_canonical_guest_kernel_pointer(value: u64) -> bool {
-    value >= (!0_u64 << 47)
-}
-
-fn lapic_bitmap_has_vector(bitmap: &[u32; 8], vector: u8) -> bool {
-    (bitmap[(vector / 32) as usize] & (1_u32 << (vector % 32))) != 0
 }

@@ -2,11 +2,9 @@ use core::arch::x86_64::CpuidResult;
 
 use ostd::arch::cpu::cpuid::cpuid;
 use ostd::arch::tsc_freq;
-use ostd::arch::virt::*;
 
 use crate::error::*;
-use crate::vcpu::{Vcpu, VcpuState, VcpuArchState};
-use crate::vm::Vm;
+use crate::vcpu::Vcpu;
 
 pub(crate) fn emulate_cpuid(vcpu: &Vcpu) -> Result<()> {
     const CPUID_1_ECX_VMX: u32 = 1 << 5;

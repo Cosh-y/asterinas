@@ -107,7 +107,7 @@ impl Vcpu {
             id,
             vm,
             vmcs: Vmcs::new()?,
-            state: SpinLock::new(VcpuState::new_with_vcpu_id(id)),
+            state: SpinLock::new(VcpuState::with_vcpu_id(id)),
         })
     }
 
@@ -535,7 +535,7 @@ impl Vcpu {
         Ok(())
     }
 
-    pub(crate) fn translate_guest_gpa(&self, gpa: u64) -> Result<u64> {
+    fn translate_guest_gpa(&self, gpa: u64) -> Result<u64> {
         self
             .vm
             .upgrade()
@@ -543,7 +543,7 @@ impl Vcpu {
             .translate_gpa_to_hpa(gpa)
     }
 
-    pub(crate) fn translate_guest_gva(&self, gva: u64) -> Result<u64> {
+    fn translate_guest_gva(&self, gva: u64) -> Result<u64> {
         const PTE_PRESENT: u64 = 1 << 0;
         const PTE_HUGE: u64 = 1 << 7;
         const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -608,12 +608,6 @@ impl Vcpu {
         Ok(())
     }
 
-    fn read_guest_u32(&self, gva: u64) -> Result<u32> {
-        let mut bytes = [0_u8; core::mem::size_of::<u32>()];
-        self.read_guest_memory(gva, &mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
     fn read_guest_phys_u64(&self, gpa: u64) -> Result<u64> {
         let hpa = self.translate_guest_gpa(gpa)?;
         Ok(read_u64_from_paddr(hpa as usize))
@@ -621,7 +615,7 @@ impl Vcpu {
 }
 
 impl VcpuState {
-    fn new_with_vcpu_id(vcpu_id: u32) -> VcpuState {
+    fn with_vcpu_id(vcpu_id: u32) -> VcpuState {
         let mut state = VcpuState::default();
         state.vmcs_initialized = false;
         state.vmcs_launched = false;
@@ -886,9 +880,9 @@ fn read_segment_from_vmcs(
 }
 
 pub(crate) fn reset_vcpu_for_init_locked(state: &mut VcpuState, vcpu_id: u32) {
-    *state = VcpuState::new_with_vcpu_id(vcpu_id);
-    (*state).arch.msrs.efer   = 0;
-    (*state).arch.regs.rflags = 0x2;
+    // *state = VcpuState::with_vcpu_id(vcpu_id);
+    // (*state).arch.msrs.efer   = 0;
+    // (*state).arch.regs.rflags = 0x2;
 }
 
 pub(crate) fn start_vcpu_from_sipi_locked(state: &mut VcpuState, vector: u8, vcpu_id: u32) {
@@ -899,15 +893,15 @@ pub(crate) fn start_vcpu_from_sipi_locked(state: &mut VcpuState, vector: u8, vcp
     };
     state.arch.sregs = real_mode_sregs(vector);
     state.arch.msrs.efer = 0;
-    state.arch.msrs.fs_base = 0;
-    state.arch.msrs.gs_base = 0;
-    state.arch.msrs.kernel_gs_base = 0;
+    // state.arch.msrs.fs_base = 0;
+    // state.arch.msrs.gs_base = 0;
+    // state.arch.msrs.kernel_gs_base = 0;
     state.arch.msrs.tsc_aux = u64::from(vcpu_id);
-    state.vmcs_initialized = false;
-    state.vmcs_launched = false;
-    state.exception = ExceptionState::default();
-    state.interrupt = InterruptState::default();
-    timer_deactivate_locked(state);
+    // state.vmcs_initialized = false;
+    // state.vmcs_launched = false;
+    // state.exception = ExceptionState::default();
+    // state.interrupt = InterruptState::default();
+    // timer_deactivate_locked(state);
     state.mp_state = VcpuMpState::Runnable;
 }
 

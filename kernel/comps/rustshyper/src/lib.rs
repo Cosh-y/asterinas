@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+mod address;
 mod context;
 mod emulate;
 mod error;

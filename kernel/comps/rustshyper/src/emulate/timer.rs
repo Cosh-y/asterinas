@@ -6,7 +6,7 @@ use crate::error::*;
 use crate::vcpu::{Vcpu, VcpuState};
 
 pub const VMX_PREEMPTION_TIMER_MULTIPLIER_FALLBACK: u8 = 0;
-pub const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 500_000;
+pub const VMX_PREEMPTION_TIMER_POLL_VALUE: u32 = 50_000;
 
 pub(crate) fn handle_preemption_timer_expire(vcpu: &Vcpu) -> Result<()> {
     let mut state = vcpu.state.lock();
