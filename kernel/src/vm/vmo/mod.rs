@@ -221,6 +221,15 @@ impl Vmo {
         self.try_commit_with_cursor(&mut cursor)
     }
 
+    /// Returns a committed page, performing pager I/O only when the page is absent.
+    fn commit_page_on_demand(&self, page_idx: usize, commit_flags: CommitFlags) -> Result<UFrame> {
+        match self.try_commit_page(page_idx * PAGE_SIZE) {
+            Ok(frame) => Ok(frame),
+            Err(VmoCommitError::Err(e)) => Err(e),
+            Err(VmoCommitError::NeedIo(index)) => self.commit_on(index, commit_flags),
+        }
+    }
+
     /// Traverses the indices within a specified range of a VMO sequentially.
     ///
     /// For each index position, you have the option to commit the page as well as
@@ -255,38 +264,6 @@ impl Vmo {
         Ok(())
     }
 
-    /// Traverses the indices within a specified range of a VMO sequentially.
-    ///
-    /// For each index position, you have the option to commit the page as well as
-    /// perform other operations.
-    ///
-    /// This method may involve I/O operations if the VMO needs to fetch a page from
-    /// the underlying page cache.
-    fn operate_on_range<F>(
-        &self,
-        mut range: Range<usize>,
-        mut operate: F,
-        commit_flags: CommitFlags,
-    ) -> Result<()>
-    where
-        F: FnMut(
-            &mut dyn FnMut() -> core::result::Result<UFrame, VmoCommitError>,
-        ) -> core::result::Result<(), VmoCommitError>,
-    {
-        'retry: loop {
-            let res = self.try_operate_on_range(&range, &mut operate);
-            match res {
-                Ok(_) => return Ok(()),
-                Err(VmoCommitError::Err(e)) => return Err(e),
-                Err(VmoCommitError::NeedIo(index)) => {
-                    self.commit_on(index, commit_flags)?;
-                    range.start = index * PAGE_SIZE;
-                    continue 'retry;
-                }
-            }
-        }
-    }
-
     /// Decommits a range of pages in the VMO.
     ///
     /// The range must be within the size of the VMO.
@@ -305,59 +282,62 @@ impl Vmo {
     /// Reads the specified amount of buffer content starting from the target offset in the VMO.
     pub fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
         let read_len = writer.avail().min(self.size().saturating_sub(offset));
-        let read_range = offset..(offset + read_len);
-        let mut read_offset = offset % PAGE_SIZE;
+        let mut current = offset;
+        let end = offset + read_len;
 
-        let read =
-            move |commit_fn: &mut dyn FnMut() -> core::result::Result<UFrame, VmoCommitError>| {
-                let frame = commit_fn()?;
-                frame
-                    .reader()
-                    .skip(read_offset)
-                    .read_fallible(writer)
-                    .map_err(|e| VmoCommitError::from(e.0))?;
-                read_offset = 0;
-                Ok(())
-            };
+        while current < end && writer.avail() > 0 {
+            let page_idx = current / PAGE_SIZE;
+            let in_page_offset = current % PAGE_SIZE;
+            let frame = self.commit_page_on_demand(page_idx, CommitFlags::empty())?;
+            let copied = frame
+                .reader()
+                .skip(in_page_offset)
+                .read_fallible(writer)
+                .map_err(|(e, _)| e)?;
 
-        self.operate_on_range(read_range, read, CommitFlags::empty())
+            if copied == 0 {
+                break;
+            }
+            current += copied;
+        }
+
+        Ok(())
     }
 
     /// Writes the specified amount of buffer content starting from the target offset in the VMO.
     pub fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
         let write_len = reader.remain();
         let write_range = offset..(offset + write_len);
-        let mut write_offset = offset % PAGE_SIZE;
-        let mut write =
-            move |commit_fn: &mut dyn FnMut() -> core::result::Result<UFrame, VmoCommitError>| {
-                let frame = commit_fn()?;
-                frame
-                    .writer()
-                    .skip(write_offset)
-                    .write_fallible(reader)
-                    .map_err(|e| VmoCommitError::from(e.0))?;
-                write_offset = 0;
-                Ok(())
+
+        if write_range.end > self.size() {
+            return_errno_with_message!(Errno::EINVAL, "operated range exceeds the vmo size");
+        }
+
+        let mut current = offset;
+        while current < write_range.end && reader.remain() > 0 {
+            let page_idx = current / PAGE_SIZE;
+            let in_page_offset = current % PAGE_SIZE;
+            let bytes_left_in_page = PAGE_SIZE - in_page_offset;
+            let flags = if in_page_offset == 0
+                && reader.remain() >= bytes_left_in_page
+                && current + bytes_left_in_page <= write_range.end
+            {
+                CommitFlags::WILL_OVERWRITE
+            } else {
+                CommitFlags::empty()
             };
 
-        if write_range.len() < PAGE_SIZE {
-            self.operate_on_range(write_range.clone(), write, CommitFlags::empty())?;
-        } else {
-            let temp = write_range.start + PAGE_SIZE - 1;
-            let up_align_start = temp - temp % PAGE_SIZE;
-            let down_align_end = write_range.end - write_range.end % PAGE_SIZE;
-            if write_range.start != up_align_start {
-                let head_range = write_range.start..up_align_start;
-                self.operate_on_range(head_range, &mut write, CommitFlags::empty())?;
+            let frame = self.commit_page_on_demand(page_idx, flags)?;
+            let copied = frame
+                .writer()
+                .skip(in_page_offset)
+                .write_fallible(reader)
+                .map_err(|(e, _)| e)?;
+
+            if copied == 0 {
+                break;
             }
-            if up_align_start != down_align_end {
-                let mid_range = up_align_start..down_align_end;
-                self.operate_on_range(mid_range, &mut write, CommitFlags::WILL_OVERWRITE)?;
-            }
-            if down_align_end != write_range.end {
-                let tail_range = down_align_end..write_range.end;
-                self.operate_on_range(tail_range, &mut write, CommitFlags::empty())?;
-            }
+            current += copied;
         }
 
         if let Some(pager) = &self.pager {
