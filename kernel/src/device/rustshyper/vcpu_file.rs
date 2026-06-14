@@ -2,9 +2,16 @@
 
 //! VCPU file descriptor implementation
 
-use aster_rustshyper::vcpu::Vcpu;
+use ostd::{
+    arch::vm::{GuestContext, GuestExitInfo, VcpuRegs, VcpuSregs, VmxExitReason},
+    vm::{GuestInterruptPort, GuestMode, GuestTimerPort},
+};
 
-use super::ioctl_defs;
+use super::{
+    apic::{Lapic, emulate_apic_mmio},
+    ioctl_defs,
+    vm_file::Vm,
+};
 use crate::{
     fs::{
         file::{FileLike, file_table::FdFlags},
@@ -15,10 +22,105 @@ use crate::{
     util::ioctl::{RawIoctl, dispatch_ioctl},
 };
 
+// Periodically return timer exits so a busy vCPU cannot monopolize scheduling.
+const PREEMPTION_TIMER_USER_EXIT_INTERVAL: u64 = 16;
+const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 10_000;
+const HLT_WAKEUP_WAIT_FALLBACK_TICKS: u64 = 250_000;
+
 /// VCPU file descriptor
 pub struct VcpuFile {
     vcpu: Arc<Vcpu>,
     pseudo_path: Path,
+}
+
+pub struct Vcpu {
+    pub(super) id: u32,
+    pub(super) vm: Weak<Vm>,
+    pub(super) guest_context: Mutex<GuestContext>,
+    pub(super) lapic: SpinLock<Lapic>,
+}
+
+impl Vcpu {
+    pub fn lapic(&self) -> SpinLockGuard<'_, Lapic, ostd::sync::PreemptDisabled> {
+        self.lapic.lock()
+    }
+
+    pub fn guest_context(&self) -> MutexGuard<'_, GuestContext> {
+        self.guest_context.lock()
+    }
+
+    pub fn vm(&self) -> Result<Arc<Vm>> {
+        self.vm
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::ENOENT, "vm not found"))
+    }
+
+    pub fn get_regs(&self) -> Result<VcpuRegs> {
+        let context = self.guest_context.lock();
+        if context.is_running() {
+            return_errno_with_message!(Errno::EBUSY, "cannot get regs while vCPU is running");
+        }
+        Ok(context.regs())
+    }
+
+    pub fn set_regs(&self, regs: VcpuRegs) -> Result<()> {
+        let mut context = self.guest_context.lock();
+        if context.is_running() {
+            return_errno_with_message!(Errno::EBUSY, "cannot set regs while vCPU is running");
+        }
+        context.set_regs(regs);
+        Ok(())
+    }
+
+    pub fn get_sregs(&self) -> Result<VcpuSregs> {
+        let context = self.guest_context.lock();
+        if context.is_running() {
+            return_errno_with_message!(Errno::EBUSY, "cannot get sregs while vCPU is running");
+        }
+        Ok(context.sregs())
+    }
+
+    pub fn set_sregs(&self, sregs: VcpuSregs) -> Result<()> {
+        let mut context = self.guest_context.lock();
+        if context.is_running() {
+            return_errno_with_message!(Errno::EBUSY, "cannot set sregs while vCPU is running");
+        }
+        context.set_sregs(sregs);
+        Ok(())
+    }
+
+    pub fn receive_sipi(&self, vector: u8) {
+        self.guest_context.lock().receive_sipi(vector);
+    }
+
+    fn wait_for_hlt_wakeup(&self) -> bool {
+        use ostd::arch::{read_tsc, tsc_freq};
+        let wait_max_ticks = match tsc_freq() {
+            0 => HLT_WAKEUP_WAIT_FALLBACK_TICKS,
+            freq => (freq / HLT_WAKEUP_WAIT_TSC_DIVISOR).max(1),
+        };
+        let start_tsc = read_tsc();
+        loop {
+            if let Some(tsc_deadline) = self.lapic.lock().timer.deadline_tsc
+                && self.guest_context().guest_tsc() >= tsc_deadline
+            {
+                return true;
+            }
+
+            // TODO: decide timer expire in deadline mode
+
+            if self.lapic.lock().check_pending_interrupt().is_some() {
+                return true;
+            }
+
+            let tsc = read_tsc();
+            if tsc.saturating_sub(start_tsc) >= wait_max_ticks {
+                return false;
+            }
+
+            core::hint::spin_loop();
+        }
+    }
 }
 
 impl VcpuFile {
@@ -27,7 +129,6 @@ impl VcpuFile {
         let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[rustshyper-vcpu]".to_string());
         Self { vcpu, pseudo_path }
     }
-
 }
 
 impl FileLike for VcpuFile {
@@ -44,48 +145,79 @@ impl FileLike for VcpuFile {
 
         dispatch_ioctl!(match raw_ioctl {
             cmd @ Run => {
-                let run_state = self.vcpu.run().map_err(|err| {
-                    match err.message() {
-                        Some(msg) => {
-                            error!(
-                                "rustshyper: RSH_RUN failed: errno={:?}, msg={}",
-                                err.errno(),
-                                msg
-                            );
+                let mut guest_mode =
+                    GuestMode::new(&self.vcpu.guest_context, &self.vcpu.lapic, &self.vcpu.lapic);
+                let mut consecutive_preemption_timer_exits = 0_u64;
+
+                loop {
+                    let eptp = self.vcpu.vm()?.guest_mem().eptp();
+                    let exit_info = match guest_mode.execute(eptp as u64) {
+                        Ok(exit_info) => exit_info,
+                        Err(err) => {
+                            error!("rustshyper: GuestMode::execute failed: {:?}", err);
+                            return Err(err.into());
                         }
-                        None => {
-                            error!("rustshyper: RSH_RUN failed: errno={:?}", err.errno());
+                    };
+                    let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
+                        Ok(VmxExitReason::IO_INSTRUCTION) => Some(exit_info),
+                        Ok(VmxExitReason::EPT_VIOLATION) => {
+                            let handled = emulate_apic_mmio(
+                                self.vcpu.clone(),
+                                &guest_mode,
+                                self.vcpu.vm()?.guest_mem(),
+                                exit_info.guest_phys_addr as u64,
+                            )
+                            .inspect_err(|err| {
+                                error!(
+                                    "rustshyper: APIC MMIO handling failed: reason={:#x}, len={}, \
+                                     rip={:#x}, gpa={:#x}, qualification={:#x}, err={:?}",
+                                    exit_info.exit_reason,
+                                    exit_info.instruction_len,
+                                    exit_info.guest_rip,
+                                    exit_info.guest_phys_addr,
+                                    exit_info.exit_qualification,
+                                    err
+                                );
+                            })?;
+                            if handled {
+                                consecutive_preemption_timer_exits = 0;
+                                None
+                            } else {
+                                Some(exit_info)
+                            }
                         }
+                        Ok(VmxExitReason::PREEMPTION_TIMER) => {
+                            consecutive_preemption_timer_exits =
+                                consecutive_preemption_timer_exits.saturating_add(1);
+                            if consecutive_preemption_timer_exits
+                                >= PREEMPTION_TIMER_USER_EXIT_INTERVAL
+                            {
+                                Some(exit_info)
+                            } else {
+                                None
+                            }
+                        }
+                        Ok(VmxExitReason::HLT) => {
+                            consecutive_preemption_timer_exits = 0;
+                            self.vcpu
+                                .guest_context()
+                                .advance_rip(exit_info.instruction_len as _);
+                            if self.vcpu.wait_for_hlt_wakeup() {
+                                None
+                            } else {
+                                Some(exit_info)
+                            }
+                        }
+                        Ok(_) => Some(exit_info),
+                        Err(_) => panic!("Unknown exit reason: {:?}", exit_info.exit_reason),
+                    };
+                    if let Some(exit_info) = exit_info {
+                        // Return to userspace with exit info.
+                        let run_state = build_run_state_message(exit_info);
+                        cmd.write(&run_state)?;
+                        return Ok(0);
                     }
-                    Error::from(err)
-                })?;
-                let user_run_state = RunStateMessage {
-                    exit_reason: run_state.exit_reason,
-                    instruction_len: run_state.instruction_len,
-                    guest_rip: run_state.guest_rip,
-                    guest_phys_addr: run_state.guest_phys_addr,
-                    exit_qualification: run_state.exit_qualification,
-                    io: IoExitInfo {
-                        port: run_state.io.port,
-                        size: run_state.io.size,
-                        is_in: run_state.io.is_in,
-                        is_string: run_state.io.is_string,
-                        is_repeat: run_state.io.is_repeat,
-                        reserved: run_state.io.reserved,
-                        count: run_state.io.count,
-                        padding: 0,
-                        data: run_state.io.data,
-                    },
-                    mmio: MmioInfo {
-                        phys_addr: run_state.mmio.phys_addr,
-                        data: run_state.mmio.data,
-                        len: run_state.mmio.len,
-                        is_write: run_state.mmio.is_write,
-                        reserved: run_state.mmio.reserved,
-                    },
-                };
-                cmd.write(&user_run_state)?;
-                Ok(0)
+                }
             }
             cmd @ GetRegs => {
                 let regs = self.vcpu.get_regs()?;
@@ -135,5 +267,15 @@ impl crate::process::signal::Pollable for VcpuFile {
     ) -> crate::events::IoEvents {
         // VCPUs don't support polling
         crate::events::IoEvents::empty()
+    }
+}
+
+fn build_run_state_message(exit_info: GuestExitInfo) -> ioctl_defs::RunStateMessage {
+    ioctl_defs::RunStateMessage {
+        exit_reason: exit_info.exit_reason,
+        instruction_len: exit_info.instruction_len,
+        guest_rip: exit_info.guest_rip as u64,
+        guest_phys_addr: exit_info.guest_phys_addr as u64,
+        exit_qualification: exit_info.exit_qualification,
     }
 }

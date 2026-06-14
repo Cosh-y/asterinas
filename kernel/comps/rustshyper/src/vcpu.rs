@@ -152,8 +152,6 @@ impl Vcpu {
             guest_rip: state.arch.regs.rip,
             guest_phys_addr: 0,
             exit_qualification: 0,
-            io: super::handler::IoExitInfo::default(),
-            mmio: super::handler::MmioInfo::default(),
         }
     }
 

@@ -14,7 +14,7 @@ pub use ostd_macros::ktest;
 
 pub use crate::{
     alert, crit, debug, early_print as print, early_println as println, emerg, error, info, log,
-    mm::{HasPaddr, HasSize, Paddr, Vaddr},
+    mm::{HasPaddr, HasSize, Paddr, Vaddr, Gpaddr},
     notice,
     panic::abort,
     warn,

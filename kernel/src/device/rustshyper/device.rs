@@ -5,7 +5,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use aster_rustshyper::vm::Vm;
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::task::Task;
 
@@ -113,7 +112,8 @@ impl FileIo for RustShyperDeviceFile {
                 let vm_id = self.alloc_vm_id();
 
                 // Create the VM
-                let vm = Vm::new(vm_id)?;
+                use super::vm_file::Vm;
+                let vm = Vm::new(vm_id);
 
                 // Create a file descriptor for the VM
                 let vm_file = Arc::new(VmFile::new(vm));

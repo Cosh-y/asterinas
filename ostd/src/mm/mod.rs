@@ -50,6 +50,9 @@ use crate::arch::mm::PagingConsts;
 /// Virtual addresses.
 pub type Vaddr = usize;
 
+/// Guest physical addresses.
+pub type Gpaddr = usize;
+
 /// Physical addresses.
 pub type Paddr = usize;
 

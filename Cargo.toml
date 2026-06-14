@@ -35,7 +35,6 @@ members = [
     "kernel/comps/mlsdisk",
     "kernel/comps/network",
     "kernel/comps/pci",
-    "kernel/comps/rustshyper",
     "kernel/comps/softirq",
     "kernel/comps/systree",
     "kernel/comps/time",
@@ -107,7 +106,6 @@ aster-logger = { path = "kernel/comps/logger" }
 aster-mlsdisk = { path = "kernel/comps/mlsdisk" }
 aster-network = { path = "kernel/comps/network" }
 aster-pci = { path = "kernel/comps/pci" }
-aster-rustshyper = { path = "kernel/comps/rustshyper" }
 aster-softirq = { path = "kernel/comps/softirq" }
 aster-systree = { path = "kernel/comps/systree" }
 aster-time = { path = "kernel/comps/time" }

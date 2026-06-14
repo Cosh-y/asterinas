@@ -26,8 +26,8 @@ pub(super) type GetSregs = ioc!(RSH_GET_SREGS, b'H', 0x83, OutData<VcpuSregs>);
 pub(super) type SetSregs = ioc!(RSH_SET_SREGS, b'H', 0x84, InData<VcpuSregs>);
 pub(super) type InjectInterrupt = ioc!(RSH_INJECT_INTERRUPT, b'H', 0x85, InData<u32>);
 
-// Re-export types from parent module
-pub(super) use super::{VcpuRegs, VcpuSregs};
+// Re-export ioctl-facing register types from OSTD.
+pub(super) use ostd::arch::vm::{VcpuRegs, VcpuSregs};
 
 /// User memory region structure for VM memory mapping
 #[repr(C)]
@@ -59,36 +59,10 @@ pub(super) struct DirtyLog {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod)]
-pub(super) struct IoExitInfo {
-    pub port: u16,
-    pub size: u8,
-    pub is_in: u8,
-    pub is_string: u8,
-    pub is_repeat: u8,
-    pub reserved: [u8; 2],
-    pub count: u32,
-    pub padding: u32,
-    pub data: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod)]
-pub(super) struct MmioInfo {
-    pub phys_addr: u64,
-    pub data: u64,
-    pub len: u32,
-    pub is_write: u8,
-    pub reserved: [u8; 3],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod)]
 pub(super) struct RunStateMessage {
     pub exit_reason: u32,
     pub instruction_len: u32,
     pub guest_rip: u64,
     pub guest_phys_addr: u64,
     pub exit_qualification: u64,
-    pub io: IoExitInfo,
-    pub mmio: MmioInfo,
 }

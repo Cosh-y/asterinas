@@ -6,13 +6,13 @@
 
 use crate::{device::registry::char, fs::vfs::path::PathResolver, prelude::*};
 
+mod apic;
 mod device;
 mod ioctl_defs;
 mod vcpu_file;
 mod vm_file;
 
 pub use device::RustShyperDevice;
-pub use ostd::arch::virt::{VcpuRegs, VcpuSregs};
 /// API version constant
 pub const RUSTSHYPER_API_VERSION: i32 = 1;
 
@@ -23,7 +23,7 @@ const RUSTSHYPER_MINOR: u16 = 232;
 
 /// Initializes the RustShyper device
 pub(super) fn init_in_first_process(_path_resolver: &PathResolver) -> Result<()> {
-    aster_rustshyper::init()?;
+    ostd::arch::vm::init_vmx()?;
     let device = Arc::new(RustShyperDevice::new());
     char::register(device)?;
     Ok(())

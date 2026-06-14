@@ -22,32 +22,6 @@ use crate::{
 const MAX_INSN_LENGTH: usize = 15;
 const PAUSE_INSN_LENGTH: usize = 2;
 
-const VMX_EXIT_REASON_IO_INSTRUCTION: u32 = 30;
-const VMX_EXIT_REASON_EPT_VIOLATION: u32 = 48;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct IoExitInfo {
-    pub port: u16,
-    pub size: u8,
-    pub is_in: u8,
-    pub is_string: u8,
-    pub is_repeat: u8,
-    pub reserved: [u8; 2],
-    pub count: u32,
-    pub data: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MmioInfo {
-    pub phys_addr: u64,
-    pub data: u64,
-    pub len: u32,
-    pub is_write: u8,
-    pub reserved: [u8; 3],
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunStateMessage {
@@ -56,8 +30,6 @@ pub struct RunStateMessage {
     pub guest_rip: u64,
     pub guest_phys_addr: u64,
     pub exit_qualification: u64,
-    pub io: IoExitInfo,
-    pub mmio: MmioInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,12 +164,12 @@ pub fn vmexit_handler(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> Result<Option<Run
             advance_guest_rip(vcpu)?;
             Ok(None)
         }
-        Ok(VmxExitReason::IO_INSTRUCTION) => Ok(Some(build_io_run_state(vcpu, exit_info))),
+        Ok(VmxExitReason::IO_INSTRUCTION) => Ok(Some(build_run_state(exit_info))),
         Ok(VmxExitReason::EPT_VIOLATION) => {
             if emulate_apic_mmio(vcpu, exit_info.guest_phys_addr)? {
                 Ok(None)
             } else {
-                Ok(Some(build_mmio_run_state(exit_info)))
+                Ok(Some(build_run_state(exit_info)))
             }
         }
         Ok(VmxExitReason::PREEMPTION_TIMER) => {
@@ -221,61 +193,6 @@ fn build_run_state(exit_info: &VmxExitInfo) -> RunStateMessage {
         guest_rip: exit_info.guest_rip,
         guest_phys_addr: exit_info.guest_phys_addr,
         exit_qualification: exit_info.exit_qualification,
-        io: IoExitInfo::default(),
-        mmio: MmioInfo::default(),
-    }
-}
-
-fn build_io_run_state(vcpu: &Vcpu, exit_info: &VmxExitInfo) -> RunStateMessage {
-    let qualification = exit_info.exit_qualification;
-    let access_size = ((qualification & 0b111) + 1) as u8;
-    let is_in = ((qualification & (1 << 3)) != 0) as u8;
-    let is_string = ((qualification & (1 << 4)) != 0) as u8;
-    let is_repeat = ((qualification & (1 << 5)) != 0) as u8;
-    let port = ((qualification >> 16) & 0xffff) as u16;
-    let regs = vcpu.get_regs().unwrap_or_default();
-
-    RunStateMessage {
-        exit_reason: VMX_EXIT_REASON_IO_INSTRUCTION,
-        instruction_len: instruction_len().unwrap_or(0),
-        guest_rip: exit_info.guest_rip,
-        guest_phys_addr: exit_info.guest_phys_addr,
-        exit_qualification: qualification,
-        io: IoExitInfo {
-            port,
-            size: access_size,
-            is_in,
-            is_string,
-            is_repeat,
-            reserved: [0; 2],
-            count: 1,
-            data: match access_size {
-                1 => regs.rax & 0xff,
-                2 => regs.rax & 0xffff,
-                4 => regs.rax & 0xffff_ffff,
-                _ => regs.rax,
-            },
-        },
-        mmio: MmioInfo::default(),
-    }
-}
-
-fn build_mmio_run_state(exit_info: &VmxExitInfo) -> RunStateMessage {
-    let qualification = exit_info.exit_qualification;
-    RunStateMessage {
-        exit_reason: VMX_EXIT_REASON_EPT_VIOLATION,
-        instruction_len: instruction_len().unwrap_or(0),
-        guest_rip: exit_info.guest_rip,
-        guest_phys_addr: exit_info.guest_phys_addr,
-        exit_qualification: qualification,
-        io: IoExitInfo::default(),
-        mmio: MmioInfo {
-            phys_addr: exit_info.guest_phys_addr,
-            data: 0,
-            len: 0,
-            is_write: ((qualification & 0b010) != 0) as u8,
-            reserved: [0; 3],
-        },
     }
 }
 

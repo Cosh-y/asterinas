@@ -41,8 +41,6 @@ const XLAPIC_RW_TIMER_DIVI: u64 = 0x3E0;
 
 pub const IOAPIC_NUM_PINS: usize = 24;
 
-// ===== Data Structures =====
-
 /// Local APIC state.
 #[derive(Debug, Default)]
 pub struct Lapic {
