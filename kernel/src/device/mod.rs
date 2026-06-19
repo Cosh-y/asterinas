@@ -7,7 +7,6 @@ mod mem;
 pub mod misc;
 mod pty;
 mod registry;
-// pub mod rustshyper;
 mod shm;
 pub mod tty;
 
