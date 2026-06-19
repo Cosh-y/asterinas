@@ -122,6 +122,12 @@ impl FileIo for HypervisorDeviceFile {
                 Ok(KVM_RUN_MMAP_SIZE as i32)
             }
             _ => {
+                let ioctl_nr = raw_ioctl.cmd() & 0xff;
+                error!(
+                    "rustshyper: unimplemented device ioctl command: cmd={:#x}, nr={:#x}",
+                    raw_ioctl.cmd(),
+                    ioctl_nr
+                );
                 return_errno_with_message!(Errno::ENOTTY, "unknown device ioctl command");
             }
         })

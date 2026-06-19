@@ -187,7 +187,7 @@ impl Lapic {
 
 use ostd::{
     arch::tsc_freq,
-    vm::{GuestInterruptPort, GuestPhysMemSpace, GuestTimerPort},
+    vm::{self, GuestInterruptPort, GuestTimerPort},
 };
 
 impl GuestInterruptPort for Lapic {
@@ -417,10 +417,7 @@ struct MmioInstruction {
 
 use alloc::sync::Arc;
 
-use ostd::{
-    mm::{FallibleVmRead, VmWriter},
-    vm::GuestMode,
-};
+use ostd::mm::{FallibleVmRead, VmWriter};
 
 use super::vcpu_file::Vcpu;
 
@@ -428,12 +425,7 @@ use super::vcpu_file::Vcpu;
 /// Returns `Ok(true)` if the access is successfully emulated.
 ///         `Ok(false)` if the access is not to APIC MMIO or is unsupported.
 ///         `Err` if an error occurs during emulation.
-pub(super) fn emulate_apic_mmio(
-    vcpu: Arc<Vcpu>,
-    guest_mode: &GuestMode,
-    guest_mem: &GuestPhysMemSpace,
-    fault_gpa: u64,
-) -> Result<bool> {
+pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool> {
     // log::error!("Guest access to APIC MMIO at GPA {:#x}", fault_gpa);
     let is_lapic = (LAPIC_BASE..(LAPIC_BASE + LAPIC_SIZE)).contains(&fault_gpa);
     let is_ioapic = (IOAPIC_BASE..(IOAPIC_BASE + IOAPIC_SIZE)).contains(&fault_gpa);
@@ -441,17 +433,23 @@ pub(super) fn emulate_apic_mmio(
         return Ok(false);
     }
 
-    let guest_rip = vcpu.guest_context().rip() as usize;
+    let vm_handle = vcpu.vm()?;
+    let guest_mem = vm_handle.guest_mem();
     let mut insn_bytes = [0_u8; MAX_INSN_LENGTH];
-    let guest_rip_gpa = match guest_mode.translate_gva_to_gpa(guest_mem, guest_rip) {
-        Ok(gpa) => gpa,
-        Err(err) => {
-            error!(
-                "rustshyper: failed to translate APIC MMIO instruction RIP {:#x}: {:?}",
-                guest_rip, err
-            );
-            return Err(err.into());
-        }
+    let (guest_rip, guest_rip_gpa) = {
+        let context = vcpu.guest_context();
+        let guest_rip = context.rip() as usize;
+        let guest_rip_gpa = match vm::translate_gva_to_gpa(&context, guest_mem, guest_rip) {
+            Ok(gpa) => gpa,
+            Err(err) => {
+                error!(
+                    "rustshyper: failed to translate APIC MMIO instruction RIP {:#x}: {:?}",
+                    guest_rip, err
+                );
+                return Err(err.into());
+            }
+        };
+        (guest_rip, guest_rip_gpa)
     };
     let mut reader = guest_mem.reader(guest_rip_gpa, insn_bytes.len())?;
     if let Err((err, _)) =

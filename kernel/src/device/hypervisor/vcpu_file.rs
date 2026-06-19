@@ -79,6 +79,12 @@ impl FileLike for VcpuFile {
                 Ok(0)
             }
             _ => {
+                let ioctl_nr = raw_ioctl.cmd() & 0xff;
+                error!(
+                    "rustshyper: unimplemented VCPU ioctl command: cmd={:#x}, nr={:#x}",
+                    raw_ioctl.cmd(),
+                    ioctl_nr
+                );
                 return_errno_with_message!(Errno::ENOTTY, "unknown VCPU ioctl command");
             }
         })
@@ -121,24 +127,20 @@ impl VcpuFile {
             let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
                 Ok(VmxExitReason::IO_INSTRUCTION) => Some(exit_info),
                 Ok(VmxExitReason::EPT_VIOLATION) => {
-                    let handled = emulate_apic_mmio(
-                        self.vcpu.clone(),
-                        &guest_mode,
-                        self.vcpu.vm()?.guest_mem(),
-                        exit_info.guest_phys_addr as u64,
-                    )
-                    .inspect_err(|err| {
-                        error!(
-                            "rustshyper: APIC MMIO handling failed: reason={:#x}, len={}, \
+                    let handled =
+                        emulate_apic_mmio(self.vcpu.clone(), exit_info.guest_phys_addr as u64)
+                            .inspect_err(|err| {
+                                error!(
+                                    "rustshyper: APIC MMIO handling failed: reason={:#x}, len={}, \
                              rip={:#x}, gpa={:#x}, qualification={:#x}, err={:?}",
-                            exit_info.exit_reason,
-                            exit_info.instruction_len,
-                            exit_info.guest_rip,
-                            exit_info.guest_phys_addr,
-                            exit_info.exit_qualification,
-                            err
-                        );
-                    })?;
+                                    exit_info.exit_reason,
+                                    exit_info.instruction_len,
+                                    exit_info.guest_rip,
+                                    exit_info.guest_phys_addr,
+                                    exit_info.exit_qualification,
+                                    err
+                                );
+                            })?;
                     if handled {
                         consecutive_preemption_timer_exits = 0;
                         None

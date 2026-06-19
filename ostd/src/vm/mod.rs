@@ -36,6 +36,62 @@ pub struct GuestMode<'a> {
     timer_port: &'a SpinLock<dyn GuestTimerPort>,
 }
 
+/// Translates a guest virtual address to a guest physical address.
+pub fn translate_gva_to_gpa(
+    context: &GuestContext,
+    guest_mem: &GuestPhysMemSpace,
+    gva: usize,
+) -> Result<Gpaddr> {
+    const PTE_PRESENT: u64 = 1 << 0;
+    const PTE_HUGE: u64 = 1 << 7;
+    const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+    const PAGE_2M_MASK: Gpaddr = (1 << 21) - 1;
+    const PAGE_1G_MASK: Gpaddr = (1 << 30) - 1;
+    const PTE_SIZE: Gpaddr = core::mem::size_of::<u64>();
+
+    let cr0 = context.arch().cr0();
+    let cr3 = context.arch().cr3();
+    if (cr0 & (1 << 31)) == 0 {
+        return Ok(gva);
+    }
+
+    let read_guest_pte = |gpa: Gpaddr| -> Result<u64> {
+        let mut reader = guest_mem.reader(gpa, PTE_SIZE)?;
+        reader.read_val::<u64>()
+    };
+    let pte_addr = |entry: u64| -> Gpaddr { (entry & PTE_ADDR_MASK) as Gpaddr };
+
+    let cr3 = (cr3 as Gpaddr) & !0xfff;
+    let pml4e_gpa = cr3 + (((gva >> 39) & 0x1ff) * PTE_SIZE);
+    let pml4e = read_guest_pte(pml4e_gpa)?;
+    if (pml4e & PTE_PRESENT) == 0 {
+        return Err(Error::PageFault);
+    }
+
+    let pdpte = read_guest_pte(pte_addr(pml4e) + (((gva >> 30) & 0x1ff) * PTE_SIZE))?;
+    if (pdpte & PTE_PRESENT) == 0 {
+        return Err(Error::PageFault);
+    }
+    if (pdpte & PTE_HUGE) != 0 {
+        return Ok(pte_addr(pdpte) | (gva & PAGE_1G_MASK));
+    }
+
+    let pde = read_guest_pte(pte_addr(pdpte) + (((gva >> 21) & 0x1ff) * PTE_SIZE))?;
+    if (pde & PTE_PRESENT) == 0 {
+        return Err(Error::PageFault);
+    }
+    if (pde & PTE_HUGE) != 0 {
+        return Ok(pte_addr(pde) | (gva & PAGE_2M_MASK));
+    }
+
+    let pte = read_guest_pte(pte_addr(pde) + (((gva >> 12) & 0x1ff) * PTE_SIZE))?;
+    if (pte & PTE_PRESENT) == 0 {
+        return Err(Error::PageFault);
+    }
+
+    Ok(pte_addr(pte) | (gva & 0xfff))
+}
+
 impl<'a> GuestMode<'a> {
     pub fn new(
         context: &'a Mutex<GuestContext>,
@@ -76,63 +132,6 @@ impl<'a> GuestMode<'a> {
                 return Ok(exit_info);
             }
         }
-    }
-
-    pub fn translate_gva_to_gpa(
-        &self,
-        guest_mem: &GuestPhysMemSpace,
-        gva: usize,
-    ) -> Result<Gpaddr> {
-        const PTE_PRESENT: u64 = 1 << 0;
-        const PTE_HUGE: u64 = 1 << 7;
-        const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-        const PAGE_2M_MASK: Gpaddr = (1 << 21) - 1;
-        const PAGE_1G_MASK: Gpaddr = (1 << 30) - 1;
-        const PTE_SIZE: Gpaddr = core::mem::size_of::<u64>();
-
-        let (cr0, cr3) = {
-            let context = self.context.lock();
-            (context.arch().cr0(), context.arch().cr3())
-        };
-        if (cr0 & (1 << 31)) == 0 {
-            return Ok(gva);
-        }
-
-        let read_guest_pte = |gpa: Gpaddr| -> Result<u64> {
-            let mut reader = guest_mem.reader(gpa, PTE_SIZE)?;
-            reader.read_val::<u64>()
-        };
-        let pte_addr = |entry: u64| -> Gpaddr { (entry & PTE_ADDR_MASK) as Gpaddr };
-
-        let cr3 = (cr3 as Gpaddr) & !0xfff;
-        let pml4e_gpa = cr3 + (((gva >> 39) & 0x1ff) * PTE_SIZE);
-        let pml4e = read_guest_pte(pml4e_gpa)?;
-        if (pml4e & PTE_PRESENT) == 0 {
-            return Err(Error::PageFault);
-        }
-
-        let pdpte = read_guest_pte(pte_addr(pml4e) + (((gva >> 30) & 0x1ff) * PTE_SIZE))?;
-        if (pdpte & PTE_PRESENT) == 0 {
-            return Err(Error::PageFault);
-        }
-        if (pdpte & PTE_HUGE) != 0 {
-            return Ok(pte_addr(pdpte) | (gva & PAGE_1G_MASK));
-        }
-
-        let pde = read_guest_pte(pte_addr(pdpte) + (((gva >> 21) & 0x1ff) * PTE_SIZE))?;
-        if (pde & PTE_PRESENT) == 0 {
-            return Err(Error::PageFault);
-        }
-        if (pde & PTE_HUGE) != 0 {
-            return Ok(pte_addr(pde) | (gva & PAGE_2M_MASK));
-        }
-
-        let pte = read_guest_pte(pte_addr(pde) + (((gva >> 12) & 0x1ff) * PTE_SIZE))?;
-        if (pte & PTE_PRESENT) == 0 {
-            return Err(Error::PageFault);
-        }
-
-        Ok(pte_addr(pte) | (gva & 0xfff))
     }
 
     fn enter_run(&self, eptp: u64) -> Result<GuestRunGuard<'a>> {

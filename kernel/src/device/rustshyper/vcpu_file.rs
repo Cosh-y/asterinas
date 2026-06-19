@@ -73,8 +73,6 @@ impl FileLike for VcpuFile {
                         Ok(VmxExitReason::EPT_VIOLATION) => {
                             let handled = emulate_apic_mmio(
                                 self.vcpu.clone(),
-                                &guest_mode,
-                                self.vcpu.vm()?.guest_mem(),
                                 exit_info.guest_phys_addr as u64,
                             )
                             .inspect_err(|err| {

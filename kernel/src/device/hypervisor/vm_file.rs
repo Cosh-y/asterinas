@@ -7,11 +7,7 @@ use ostd::{
     task::Task,
 };
 
-use super::{
-    ioctl::*,
-    vcpu_file::VcpuFile,
-    vm::Vm,
-};
+use super::{ioctl::*, vcpu_file::VcpuFile, vm::Vm};
 use crate::{
     fs::{
         file::{FileLike, file_table::FdFlags},
@@ -135,6 +131,12 @@ impl FileLike for VmFile {
                 Ok(0)
             }
             _ => {
+                let ioctl_nr = raw_ioctl.cmd() & 0xff;
+                error!(
+                    "rustshyper: unimplemented VM ioctl command: cmd={:#x}, nr={:#x}",
+                    raw_ioctl.cmd(),
+                    ioctl_nr
+                );
                 return_errno_with_message!(Errno::ENOTTY, "unknown VM ioctl command");
             }
         })
