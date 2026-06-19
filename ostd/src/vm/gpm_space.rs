@@ -1,5 +1,6 @@
 //! Guest physical memory space.
 
+use alloc::collections::BTreeMap;
 use core::ops::Range;
 
 use crate::{
@@ -17,8 +18,55 @@ use crate::{
 
 pub struct GuestPhysMemSpace {
     pt: PageTable<EptPtConfig>,
-    /// map: uva -> gpa.
-    map: Mutex<(Vaddr, Gpaddr)>,
+    memory_slots: Mutex<BTreeMap<u32, MemorySlot>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemorySlot {
+    userspace_start: Vaddr,
+    userspace_end: Vaddr,
+    guest_start: Gpaddr,
+    guest_end: Gpaddr,
+}
+
+impl MemorySlot {
+    fn new(userspace_start: Vaddr, guest_start: Gpaddr, memory_size: usize) -> Result<Self> {
+        let userspace_end = userspace_start
+            .checked_add(memory_size)
+            .ok_or(Error::Overflow)?;
+        let guest_end = guest_start
+            .checked_add(memory_size)
+            .ok_or(Error::Overflow)?;
+
+        Ok(Self {
+            userspace_start,
+            userspace_end,
+            guest_start,
+            guest_end,
+        })
+    }
+
+    fn overlaps_guest_range(&self, other: &Self) -> bool {
+        self.guest_start < other.guest_end && other.guest_start < self.guest_end
+    }
+
+    fn translate_guest_range(&self, gpa: Gpaddr, len: usize) -> Result<Option<Vaddr>> {
+        let gpa_end = gpa.checked_add(len).ok_or(Error::Overflow)?;
+        if gpa < self.guest_start || gpa_end > self.guest_end {
+            return Ok(None);
+        }
+
+        let offset = gpa.checked_sub(self.guest_start).ok_or(Error::Overflow)?;
+        let userspace_addr = self
+            .userspace_start
+            .checked_add(offset)
+            .ok_or(Error::Overflow)?;
+        if userspace_addr.checked_add(len).ok_or(Error::Overflow)? > self.userspace_end {
+            return Ok(None);
+        }
+
+        Ok(Some(userspace_addr))
+    }
 }
 
 impl GuestPhysMemSpace {
@@ -26,7 +74,7 @@ impl GuestPhysMemSpace {
     pub fn new() -> Self {
         Self {
             pt: PageTable::<EptPtConfig>::empty(),
-            map: Mutex::new((0, 0)),
+            memory_slots: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -66,8 +114,29 @@ impl GuestPhysMemSpace {
         })
     }
 
-    pub fn record_map(&self, uva: Vaddr, gpa: Gpaddr) {
-        *self.map.lock() = (uva, gpa);
+    /// Records a userspace-backed guest memory slot.
+    pub fn record_memory_slot(
+        &self,
+        slot: u32,
+        userspace_start: Vaddr,
+        guest_start: Gpaddr,
+        memory_size: usize,
+    ) -> Result<()> {
+        let mut memory_slots = self.memory_slots.lock();
+        if memory_size == 0 {
+            memory_slots.remove(&slot);
+            return Ok(());
+        }
+
+        let new_slot = MemorySlot::new(userspace_start, guest_start, memory_size)?;
+        for (&existing_slot_id, existing_slot) in memory_slots.iter() {
+            if existing_slot_id != slot && existing_slot.overlaps_guest_range(&new_slot) {
+                return Err(Error::InvalidArgs);
+            }
+        }
+
+        memory_slots.insert(slot, new_slot);
+        Ok(())
     }
 
     pub fn eptp(&self) -> u64 {
@@ -78,11 +147,18 @@ impl GuestPhysMemSpace {
     }
 
     pub fn reader(&self, gpa: Gpaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
-        let (uva_base, gpa_base) = *self.map.lock();
-        let offset = gpa.checked_sub(gpa_base).ok_or(Error::InvalidArgs)?;
-        let uva = uva_base.checked_add(offset).ok_or(Error::Overflow)?;
+        let memory_slots = self.memory_slots.lock();
+        let mut userspace_addr = None;
+        for memory_slot in memory_slots.values() {
+            if let Some(translated_addr) = memory_slot.translate_guest_range(gpa, len)? {
+                userspace_addr = Some(translated_addr);
+                break;
+            }
+        }
+        let userspace_addr = userspace_addr.ok_or(Error::InvalidArgs)?;
+
         // SAFETY: The memory range is in user space, as checked above.
-        Ok(unsafe { VmReader::<Fallible>::from_user_space(uva as *const u8, len) })
+        Ok(unsafe { VmReader::<Fallible>::from_user_space(userspace_addr as *const u8, len) })
     }
 }
 

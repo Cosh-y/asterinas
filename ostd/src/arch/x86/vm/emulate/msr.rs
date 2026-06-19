@@ -1,10 +1,7 @@
 use x86::msr::*;
-use x86_64::registers::{control::Cr0Flags, model_specific::EferFlags};
 
 use crate::{
-    arch::vm::{
-        context::{GuestContext, sanitize_apic_base_for_vcpu},
-    },
+    arch::vm::context::{GuestContext, sanitize_apic_base_for_vcpu},
     prelude::*,
     sync::Mutex,
 };
@@ -32,16 +29,7 @@ pub(crate) fn emulate_msrrw(context: &Mutex<GuestContext>, is_write: bool) -> Re
                 context.arch_mut().set_msr(IA32_APIC_BASE, apic_base);
             }
             IA32_EFER => {
-                let mut guest_efer = msr_value;
-                let guest_cr0 = context.arch().cr0();
-                if (guest_efer & EferFlags::LONG_MODE_ENABLE.bits()) != 0
-                    && (guest_cr0 & Cr0Flags::PAGING.bits()) != 0
-                {
-                    guest_efer |= EferFlags::LONG_MODE_ACTIVE.bits();
-                } else {
-                    guest_efer &= !EferFlags::LONG_MODE_ACTIVE.bits();
-                }
-                context.arch_mut().set_msr(IA32_EFER, guest_efer);
+                context.arch_mut().set_efer(msr_value);
             }
             IA32_BIOS_SIGN_ID => {}
             IA32_MISC_ENABLE => {}

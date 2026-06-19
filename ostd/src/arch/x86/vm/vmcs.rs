@@ -2,13 +2,12 @@ use x86::vmx::vmcs::control::{
     EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
 };
 use x86_64::registers::{
-    control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags},
+    control::{Cr0, Cr3, Cr4},
     model_specific::EferFlags,
 };
 
 use super::{
-    context::{VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
-    emulate::cr::{sanitize_guest_cr0, sanitize_guest_cr4},
+    context::{VcpuControlRegisters, VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::*,
     x86::{DescriptorTablePointer, cs, ds, es, fs, get_tr_base, gs, sgdt, sidt, ss, tr},
 };
@@ -40,6 +39,7 @@ struct VmcsState {
 pub(crate) struct VmcsGuestState {
     pub(crate) regs: VcpuRegs,
     pub(crate) sregs: VcpuSregs,
+    pub(crate) control_regs: VcpuControlRegisters,
     pub(crate) msrs: VcpuMsrs,
 }
 
@@ -176,23 +176,18 @@ impl Vmcs {
     fn setup_vmcs_guest(&self, vmcs_guest_state: &VmcsGuestState) -> Result<()> {
         let regs = vmcs_guest_state.regs;
         let sregs = vmcs_guest_state.sregs;
+        let control_regs = vmcs_guest_state.control_regs;
         let msrs = vmcs_guest_state.msrs;
 
-        let cr0_host_owned = Cr0Flags::PROTECTED_MODE_ENABLE
-            | Cr0Flags::PAGING
-            | Cr0Flags::NUMERIC_ERROR
-            | Cr0Flags::NOT_WRITE_THROUGH
-            | Cr0Flags::CACHE_DISABLE;
-        let guest_cr0 = sanitize_guest_cr0(sregs.cr0);
-        VmcsGuestNW::CR0.write(guest_cr0 as _)?;
-        VmcsControlNW::CR0_GUEST_HOST_MASK.write((cr0_host_owned.bits()) as _)?;
-        VmcsControlNW::CR0_READ_SHADOW.write(sregs.cr0 as _)?;
+        let cr0 = control_regs.cr0();
+        VmcsGuestNW::CR0.write(cr0.real() as _)?;
+        VmcsControlNW::CR0_GUEST_HOST_MASK.write(cr0.host_mask() as _)?;
+        VmcsControlNW::CR0_READ_SHADOW.write(cr0.read_shadow() as _)?;
 
-        let cr4_host_owned = (Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS | Cr4Flags::FSGSBASE).bits();
-        let guest_cr4 = sanitize_guest_cr4(sregs.cr4);
-        VmcsGuestNW::CR4.write(guest_cr4 as _)?;
-        VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4_host_owned as _)?;
-        VmcsControlNW::CR4_READ_SHADOW.write(guest_cr4 as _)?;
+        let cr4 = control_regs.cr4();
+        VmcsGuestNW::CR4.write(cr4.real() as _)?;
+        VmcsControlNW::CR4_GUEST_HOST_MASK.write(cr4.host_mask() as _)?;
+        VmcsControlNW::CR4_READ_SHADOW.write(cr4.read_shadow() as _)?;
 
         {
             use VmcsGuest16::*;

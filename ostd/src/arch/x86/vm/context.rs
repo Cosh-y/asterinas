@@ -1,4 +1,12 @@
-use super::vmcs::{Vmcs, VmcsGuestState};
+use x86_64::registers::{
+    control::{Cr0Flags, Cr4Flags},
+    model_specific::EferFlags,
+};
+
+use super::{
+    vmcs::{Vmcs, VmcsGuestState},
+    vmx::Msr,
+};
 use crate::{arch::cpu::context::FpuContext, prelude::*};
 
 pub struct GuestContext {
@@ -31,6 +39,8 @@ pub(crate) struct VcpuArchState {
     regs: VcpuRegs,
     /// Special registers and descriptor tables provided by userspace.
     sregs: VcpuSregs,
+    /// VMX control-register state split into guest-visible and hardware values.
+    control_regs: VcpuControlRegisters,
     /// Guest-visible MSRs emulated by the hypervisor.
     msrs: VcpuMsrs,
     /// FPU/SIMD context.
@@ -65,8 +75,8 @@ impl GuestContext {
             rflags: 0x2,
             ..VcpuRegs::default()
         };
-        self.arch.sregs = VcpuSregs::with_startup(vector);
-        self.arch.msrs.efer = 0;
+        self.arch.set_sregs(VcpuSregs::with_startup(vector));
+        self.arch.set_efer(0);
         // self.arch.msrs.tsc_aux = u64::from(vcpu_id);
         self.run = VcpuRunState::Runnable;
     }
@@ -80,19 +90,12 @@ impl GuestContext {
     }
 
     pub fn sregs(&self) -> VcpuSregs {
-        self.arch.sregs
+        self.arch.sregs()
     }
 
     pub fn set_sregs(&mut self, mut sregs: VcpuSregs) {
-        use super::emulate::cr::sanitize_guest_cr4;
-
-        sregs.cr4 = sanitize_guest_cr4(sregs.cr4);
         sregs.apic_base = sanitize_apic_base_for_vcpu(sregs.apic_base, self.id);
-        self.arch.sregs = sregs;
-        self.arch.msrs.efer = sregs.efer;
-        self.arch.msrs.apic_base = sregs.apic_base;
-        self.arch.msrs.fs_base = sregs.fs.base;
-        self.arch.msrs.gs_base = sregs.gs.base;
+        self.arch.set_sregs(sregs);
     }
 
     pub fn gpr(&self, index: u8) -> u64 {
@@ -160,9 +163,14 @@ impl GuestContext {
 
 impl Default for VcpuArchState {
     fn default() -> Self {
+        let sregs = VcpuSregs::with_startup(0);
         Self {
-            regs: VcpuRegs::default(),
-            sregs: VcpuSregs::default(),
+            regs: VcpuRegs {
+                rflags: 0x2,
+                ..VcpuRegs::default()
+            },
+            sregs,
+            control_regs: VcpuControlRegisters::from_sregs(&sregs),
             msrs: VcpuMsrs::default(),
             fpu: FpuContext::new(),
         }
@@ -197,6 +205,109 @@ impl Default for VcpuRunState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VcpuControlRegisters {
+    cr0: VcpuControlRegister,
+    cr4: VcpuControlRegister,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VcpuControlRegister {
+    host_mask: u64,
+    read_shadow: u64,
+    real: u64,
+}
+
+impl VcpuControlRegisters {
+    fn from_sregs(sregs: &VcpuSregs) -> Self {
+        Self {
+            cr0: VcpuControlRegister::for_cr0_guest_value(sregs.cr0),
+            cr4: VcpuControlRegister::for_cr4_guest_value(sregs.cr4),
+        }
+    }
+
+    pub(crate) fn from_vmcs(cr0: VcpuControlRegister, cr4: VcpuControlRegister) -> Self {
+        Self { cr0, cr4 }
+    }
+
+    pub(crate) fn cr0(&self) -> VcpuControlRegister {
+        self.cr0
+    }
+
+    pub(crate) fn cr4(&self) -> VcpuControlRegister {
+        self.cr4
+    }
+
+    fn write_cr0(&mut self, guest_value: u64) {
+        self.cr0 = VcpuControlRegister::for_cr0_guest_value(guest_value);
+    }
+
+    fn write_cr4(&mut self, guest_value: u64) {
+        self.cr4 = VcpuControlRegister::for_cr4_guest_value(guest_value);
+    }
+}
+
+impl VcpuControlRegister {
+    pub(crate) fn from_vmcs(host_mask: u64, read_shadow: u64, real: u64) -> Self {
+        Self {
+            host_mask,
+            read_shadow,
+            real,
+        }
+    }
+
+    fn for_cr0_guest_value(guest_value: u64) -> Self {
+        Self::from_vmcs(cr0_host_mask(), guest_value, cr0_real_value(guest_value))
+    }
+
+    fn for_cr4_guest_value(guest_value: u64) -> Self {
+        Self::from_vmcs(cr4_host_mask(), guest_value, cr4_real_value(guest_value))
+    }
+
+    pub(crate) fn host_mask(&self) -> u64 {
+        self.host_mask
+    }
+
+    pub(crate) fn read_shadow(&self) -> u64 {
+        self.read_shadow
+    }
+
+    pub(crate) fn real(&self) -> u64 {
+        self.real
+    }
+
+    fn guest_value(&self) -> u64 {
+        (self.real & !self.host_mask) | (self.read_shadow & self.host_mask)
+    }
+}
+
+fn cr0_host_mask() -> u64 {
+    (Cr0Flags::PROTECTED_MODE_ENABLE
+        | Cr0Flags::PAGING
+        | Cr0Flags::NUMERIC_ERROR
+        | Cr0Flags::NOT_WRITE_THROUGH
+        | Cr0Flags::CACHE_DISABLE)
+        .bits()
+}
+
+fn cr4_host_mask() -> u64 {
+    (Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS | Cr4Flags::FSGSBASE).bits()
+}
+
+fn cr0_real_value(guest_value: u64) -> u64 {
+    let fixed0 = Msr::IA32_VMX_CR0_FIXED0.read();
+    let fixed1 = Msr::IA32_VMX_CR0_FIXED1.read();
+    let fixed0 = fixed0 & !Cr0Flags::PROTECTED_MODE_ENABLE.bits() & !Cr0Flags::PAGING.bits();
+    (guest_value | fixed0) & fixed1
+}
+
+fn cr4_real_value(guest_value: u64) -> u64 {
+    let fixed0 = Msr::IA32_VMX_CR4_FIXED0.read();
+    let fixed1 = Msr::IA32_VMX_CR4_FIXED1.read();
+    (guest_value | fixed0 | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits())
+        & (fixed1 & !Cr4Flags::FSGSBASE.bits())
+}
+
 #[derive(Debug, Default)]
 pub struct GuestCpuConfig {
     pub vcpu_id: u32,
@@ -207,6 +318,23 @@ pub struct GuestCpuConfig {
 impl VcpuArchState {
     pub(crate) fn regs_mut_ptr(&mut self) -> *mut VcpuRegs {
         &mut self.regs
+    }
+
+    pub(crate) fn sregs(&self) -> VcpuSregs {
+        let mut sregs = self.sregs;
+        sregs.cr0 = self.cr0();
+        sregs.cr4 = self.cr4();
+        sregs
+    }
+
+    pub(crate) fn set_sregs(&mut self, sregs: VcpuSregs) {
+        self.sregs = sregs;
+        self.control_regs = VcpuControlRegisters::from_sregs(&sregs);
+        self.msrs.efer = sregs.efer;
+        self.msrs.apic_base = sregs.apic_base;
+        self.msrs.fs_base = sregs.fs.base;
+        self.msrs.gs_base = sregs.gs.base;
+        self.sync_efer_lma();
     }
 
     pub fn gpr(&self, index: u8) -> u64 {
@@ -320,10 +448,7 @@ impl VcpuArchState {
             IA32_SYSENTER_CS => self.msrs.sysenter_cs = value,
             IA32_SYSENTER_ESP => self.msrs.sysenter_esp = value,
             IA32_SYSENTER_EIP => self.msrs.sysenter_eip = value,
-            IA32_EFER => {
-                self.msrs.efer = value;
-                self.sregs.efer = value;
-            }
+            IA32_EFER => self.set_efer(value),
             IA32_PAT => self.msrs.pat = value,
             IA32_KERNEL_GSBASE => self.msrs.kernel_gs_base = value,
             IA32_TSC_AUX => self.msrs.tsc_aux = value,
@@ -339,7 +464,7 @@ impl VcpuArchState {
     }
 
     pub(crate) fn cr0(&self) -> u64 {
-        self.sregs.cr0
+        self.control_regs.cr0.guest_value()
     }
 
     pub(crate) fn cr2(&self) -> u64 {
@@ -351,11 +476,23 @@ impl VcpuArchState {
     }
 
     pub(crate) fn cr4(&self) -> u64 {
-        self.sregs.cr4
+        self.control_regs.cr4.guest_value()
     }
 
-    pub(crate) fn set_cr0(&mut self, value: u64) {
-        self.sregs.cr0 = value;
+    pub(crate) fn control_regs(&self) -> VcpuControlRegisters {
+        self.control_regs
+    }
+
+    pub(crate) fn set_control_regs_from_vmcs(&mut self, control_regs: VcpuControlRegisters) {
+        self.control_regs = control_regs;
+        self.sregs.cr0 = self.control_regs.cr0.guest_value();
+        self.sregs.cr4 = self.control_regs.cr4.guest_value();
+    }
+
+    pub(crate) fn write_cr0(&mut self, value: u64) {
+        self.control_regs.write_cr0(value);
+        self.sregs.cr0 = self.control_regs.cr0.guest_value();
+        self.sync_efer_lma();
     }
 
     pub(crate) fn set_cr2(&mut self, value: u64) {
@@ -366,8 +503,9 @@ impl VcpuArchState {
         self.sregs.cr3 = value;
     }
 
-    pub(crate) fn set_cr4(&mut self, value: u64) {
-        self.sregs.cr4 = value;
+    pub(crate) fn write_cr4(&mut self, value: u64) {
+        self.control_regs.write_cr4(value);
+        self.sregs.cr4 = self.control_regs.cr4.guest_value();
     }
 
     pub(crate) fn set_cs(&mut self, segment: VcpuSegment) {
@@ -422,6 +560,22 @@ impl VcpuArchState {
         self.msrs.gs_base = value;
     }
 
+    pub(crate) fn set_efer(&mut self, value: u64) {
+        self.msrs.efer = value;
+        self.sync_efer_lma();
+    }
+
+    fn sync_efer_lma(&mut self) {
+        if (self.msrs.efer & EferFlags::LONG_MODE_ENABLE.bits()) != 0
+            && (self.cr0() & Cr0Flags::PAGING.bits()) != 0
+        {
+            self.msrs.efer |= EferFlags::LONG_MODE_ACTIVE.bits();
+        } else {
+            self.msrs.efer &= !EferFlags::LONG_MODE_ACTIVE.bits();
+        }
+        self.sregs.efer = self.msrs.efer;
+    }
+
     pub(crate) fn load_fpu(&mut self) {
         self.fpu.load();
     }
@@ -434,6 +588,7 @@ impl VcpuArchState {
         VmcsGuestState {
             regs: self.regs,
             sregs: self.sregs,
+            control_regs: self.control_regs,
             msrs: self.msrs,
         }
     }
@@ -566,7 +721,6 @@ impl VcpuSregs {
         let code_selector = u16::from(startup_vector) << 8;
         let data = VcpuSegment::real_mode_data_segment(0, 0);
 
-        use x86_64::registers::control::{Cr0Flags, Cr4Flags};
         Self {
             cs: VcpuSegment::real_mode_code_segment(code_selector, code_base),
             ds: data,
@@ -580,7 +734,6 @@ impl VcpuSregs {
                 ..VcpuSegment::default()
             },
             cr0: (Cr0Flags::EXTENSION_TYPE | Cr0Flags::NUMERIC_ERROR).bits(),
-            cr4: Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits(),
             ..VcpuSregs::default()
         }
     }

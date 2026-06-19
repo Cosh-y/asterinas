@@ -9,7 +9,9 @@ use crate::{device::registry::char, fs::vfs::path::PathResolver, prelude::*};
 mod apic;
 mod device;
 mod ioctl_defs;
+mod vcpu;
 mod vcpu_file;
+mod vm;
 mod vm_file;
 
 pub use device::RustShyperDevice;

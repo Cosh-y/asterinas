@@ -14,7 +14,10 @@ pub use self::{
 use crate::{
     Error,
     arch::vm::{
-        context::{GuestContext, VcpuDtable, VcpuRunState, VcpuSegment},
+        context::{
+            GuestContext, VcpuControlRegister, VcpuControlRegisters, VcpuDtable, VcpuRunState,
+            VcpuSegment,
+        },
         exit::GuestExitInfo,
         vmx::{
             Msr, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
@@ -153,7 +156,7 @@ impl<'a> GuestMode<'a> {
             return Ok(());
         }
 
-        error!("Vcpu init vmcs");
+        debug!("rustshyper: initializing vcpu vmcs");
         let mut context = self.context.lock();
         let vmcs_guest_state = context.vmcs_guest_state();
         context.vmcs.init(vmcs_guest_state, eptp as u64)?;
@@ -278,13 +281,7 @@ impl<'a> GuestMode<'a> {
             .write((context.arch().rflags() | 0x2) as usize)
             .map_err(Error::from)?;
 
-        let guest_cr0 = context.arch().cr0();
-        VmcsControlNW::CR0_READ_SHADOW
-            .write(guest_cr0 as usize)
-            .map_err(Error::from)?;
-        VmcsGuestNW::CR0
-            .write(guest_cr0 as usize)
-            .map_err(Error::from)?;
+        write_control_registers_to_vmcs(context.arch().control_regs())?;
 
         use x86::{msr::*, vmx::vmcs::control::EntryControls};
         use x86_64::registers::model_specific::EferFlags;
@@ -307,14 +304,6 @@ impl<'a> GuestMode<'a> {
         let guest_cr3 = context.arch().cr3();
         VmcsGuestNW::CR3
             .write(guest_cr3 as usize)
-            .map_err(Error::from)?;
-
-        let guest_cr4 = context.arch().cr4();
-        VmcsGuestNW::CR4
-            .write(guest_cr4 as usize)
-            .map_err(Error::from)?;
-        VmcsControlNW::CR4_READ_SHADOW
-            .write(guest_cr4 as usize)
             .map_err(Error::from)?;
 
         VmcsGuest64::IA32_PAT
@@ -359,11 +348,9 @@ impl<'a> GuestMode<'a> {
         let guest_cr3 = VmcsGuestNW::CR3.read().map_err(Error::from)?;
         context.arch_mut().set_cr3(guest_cr3 as u64);
 
-        let guest_cr4 = VmcsGuestNW::CR4.read().map_err(Error::from)?;
-        context.arch_mut().set_cr4(guest_cr4 as u64);
-
-        let guest_cr0 = VmcsGuestNW::CR0.read().map_err(Error::from)?;
-        context.arch_mut().set_cr0(guest_cr0 as u64);
+        context
+            .arch_mut()
+            .set_control_regs_from_vmcs(read_control_registers_from_vmcs()?);
 
         let guest_efer = VmcsGuest64::IA32_EFER.read().map_err(Error::from)?;
         context.arch_mut().set_msr(IA32_EFER, guest_efer);
@@ -508,6 +495,61 @@ fn read_dtable_from_vmcs(base_field: VmcsGuestNW, limit_field: VmcsGuest32) -> R
     })
 }
 
+fn write_control_registers_to_vmcs(control_regs: VcpuControlRegisters) -> Result<()> {
+    write_control_register_to_vmcs(
+        control_regs.cr0(),
+        VmcsGuestNW::CR0,
+        VmcsControlNW::CR0_GUEST_HOST_MASK,
+        VmcsControlNW::CR0_READ_SHADOW,
+    )?;
+    write_control_register_to_vmcs(
+        control_regs.cr4(),
+        VmcsGuestNW::CR4,
+        VmcsControlNW::CR4_GUEST_HOST_MASK,
+        VmcsControlNW::CR4_READ_SHADOW,
+    )
+}
+
+fn write_control_register_to_vmcs(
+    reg: VcpuControlRegister,
+    real_field: VmcsGuestNW,
+    mask_field: VmcsControlNW,
+    shadow_field: VmcsControlNW,
+) -> Result<()> {
+    real_field.write(reg.real() as usize).map_err(Error::from)?;
+    mask_field
+        .write(reg.host_mask() as usize)
+        .map_err(Error::from)?;
+    shadow_field
+        .write(reg.read_shadow() as usize)
+        .map_err(Error::from)
+}
+
+fn read_control_registers_from_vmcs() -> Result<VcpuControlRegisters> {
+    let cr0 = read_control_register_state_from_vmcs(
+        VmcsGuestNW::CR0,
+        VmcsControlNW::CR0_GUEST_HOST_MASK,
+        VmcsControlNW::CR0_READ_SHADOW,
+    )?;
+    let cr4 = read_control_register_state_from_vmcs(
+        VmcsGuestNW::CR4,
+        VmcsControlNW::CR4_GUEST_HOST_MASK,
+        VmcsControlNW::CR4_READ_SHADOW,
+    )?;
+    Ok(VcpuControlRegisters::from_vmcs(cr0, cr4))
+}
+
+fn read_control_register_state_from_vmcs(
+    value_field: VmcsGuestNW,
+    mask_field: VmcsControlNW,
+    shadow_field: VmcsControlNW,
+) -> Result<VcpuControlRegister> {
+    let real = value_field.read().map_err(Error::from)? as u64;
+    let mask = mask_field.read().map_err(Error::from)? as u64;
+    let shadow = shadow_field.read().map_err(Error::from)? as u64;
+    Ok(VcpuControlRegister::from_vmcs(mask, shadow, real))
+}
+
 fn read_segment_from_vmcs(
     selector_field: VmcsGuest16,
     base_field: VmcsGuestNW,
@@ -533,26 +575,26 @@ fn read_segment_from_vmcs(
 }
 
 fn log_vcpu_run_failure(launched: u64) {
-        error!(
-            "rustshyper: vcpu_run failed, launched={} vm_instruction_error={:?} \
+    error!(
+        "rustshyper: vcpu_run failed, launched={} vm_instruction_error={:?} \
              guest_rip={:?} guest_rsp={:?} guest_rflags={:?} guest_cr0={:?} \
              guest_cr3={:?} guest_cr4={:?} guest_efer={:?} pin_ctls={:?} \
              primary_ctls={:?} secondary_ctls={:?} exit_ctls={:?} entry_ctls={:?} \
              eptp={:?}",
-            launched,
-            VmcsReadOnly32::VM_INSTRUCTION_ERROR.read().ok(),
-            VmcsGuestNW::RIP.read().ok(),
-            VmcsGuestNW::RSP.read().ok(),
-            VmcsGuestNW::RFLAGS.read().ok(),
-            VmcsGuestNW::CR0.read().ok(),
-            VmcsGuestNW::CR3.read().ok(),
-            VmcsGuestNW::CR4.read().ok(),
-            VmcsGuest64::IA32_EFER.read().ok(),
-            VmcsControl32::PINBASED_EXEC_CONTROLS.read().ok(),
-            VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read().ok(),
-            VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read().ok(),
-            VmcsControl32::VMEXIT_CONTROLS.read().ok(),
-            VmcsControl32::VMENTRY_CONTROLS.read().ok(),
-            VmcsControl64::EPTP.read().ok(),
-        );
-    }
+        launched,
+        VmcsReadOnly32::VM_INSTRUCTION_ERROR.read().ok(),
+        VmcsGuestNW::RIP.read().ok(),
+        VmcsGuestNW::RSP.read().ok(),
+        VmcsGuestNW::RFLAGS.read().ok(),
+        VmcsGuestNW::CR0.read().ok(),
+        VmcsGuestNW::CR3.read().ok(),
+        VmcsGuestNW::CR4.read().ok(),
+        VmcsGuest64::IA32_EFER.read().ok(),
+        VmcsControl32::PINBASED_EXEC_CONTROLS.read().ok(),
+        VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS.read().ok(),
+        VmcsControl32::SECONDARY_PROCBASED_EXEC_CONTROLS.read().ok(),
+        VmcsControl32::VMEXIT_CONTROLS.read().ok(),
+        VmcsControl32::VMENTRY_CONTROLS.read().ok(),
+        VmcsControl64::EPTP.read().ok(),
+    );
+}

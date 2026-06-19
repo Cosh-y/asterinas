@@ -365,6 +365,10 @@ run_nixos:
 sync_rustshyper_vmm:
 	@./tools/nixos/sync_rustshyper_vmm.sh
 
+.PHONY: sync_kvm_hello_world
+sync_kvm_hello_world:
+	@./tools/nixos/sync_kvm_hello_world.sh
+
 .PHONY: capture_rustshyper_vmm
 capture_rustshyper_vmm: OVMF = off
 capture_rustshyper_vmm:
