@@ -49,17 +49,23 @@ impl<R: Deref<Target = RingBuffer<u8>>> ProducerU8Ext for Producer<u8, R> {
 
             let mut writer = self.segment().writer();
             writer.skip(offset).limit(self.capacity() - offset);
-            write_len += reader.read(&mut writer)?;
+            write_len += reader
+                .read(&mut writer)
+                .map_err(|(err, _)| Error::from(err))?;
 
             let mut writer = self.segment().writer();
             writer.limit(free_len - (self.capacity() - offset));
-            write_len += reader.read(&mut writer)?;
+            write_len += reader
+                .read(&mut writer)
+                .map_err(|(err, _)| Error::from(err))?;
 
             write_len
         } else {
             let mut writer = self.segment().writer();
             writer.skip(offset).limit(free_len);
-            reader.read(&mut writer)?
+            reader
+                .read(&mut writer)
+                .map_err(|(err, _)| Error::from(err))?
         };
 
         self.commit_write(write_len);
