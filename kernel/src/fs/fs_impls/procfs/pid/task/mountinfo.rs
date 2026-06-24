@@ -129,7 +129,6 @@ impl MountInfoFileOps {
             let fs_type = mount.fs().name();
             let source = mount.source().unwrap_or("none");
             let fs_flags = mount.fs().flags();
-
             let entry = MountInfoEntry {
                 mount_id,
                 parent_id,
