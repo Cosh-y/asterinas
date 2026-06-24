@@ -28,6 +28,10 @@ impl_socket_options!(
     pub struct SendTimeout(SocketTimeout);
     pub struct ReusePort(bool);
     pub struct PassCred(bool);
+    pub struct Timestamp(bool);
+    pub struct TimestampNs(bool);
+    pub struct Timestamping(bool);
+    pub struct PassSec(bool);
     pub struct PeerCred(CUserCred);
     pub struct AcceptConn(bool);
     pub struct SendBufForce(u32);
