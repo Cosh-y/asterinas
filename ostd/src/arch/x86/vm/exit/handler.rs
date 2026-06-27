@@ -1,5 +1,6 @@
 use super::super::emulate::{cpuid::emulate_cpuid, cr::emulate_cr_access, msr::emulate_msrrw};
 use crate::{
+    Error,
     arch::vm::{
         context::GuestContext,
         exit::GuestExitInfo,
@@ -10,7 +11,6 @@ use crate::{
     },
     prelude::*,
     sync::Mutex,
-    Error,
 };
 
 const PAUSE_INSN_LENGTH: u64 = 2;

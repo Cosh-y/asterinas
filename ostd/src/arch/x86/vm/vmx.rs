@@ -3,7 +3,8 @@
 //! This module provides wrappers for VMX instructions and VMCS access
 #![allow(missing_docs)]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::{
     arch::vm::types::VcpuRegs, error, error::Error, info, mm::Frame, prelude::*, sync::SpinLock,
@@ -12,12 +13,13 @@ use crate::{
 type GuestPhysAddr = Gpaddr;
 type PhysAddr = Paddr;
 
-/// VMCS revision identifier (read from MSR)
-static mut VMCS_REVISION: u32 = 0;
+/// VMCS revision identifier read from `IA32_VMX_BASIC`.
+static VMCS_REVISION: AtomicU32 = AtomicU32::new(0);
 
 static EPT_FLUSH_LOCK: SpinLock<()> = SpinLock::new(());
 static EPT_FLUSH_ACKS: AtomicUsize = AtomicUsize::new(0);
 static EPT_FLUSH_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static VMXON_REGIONS: SpinLock<BTreeMap<usize, Frame<()>>> = SpinLock::new(BTreeMap::new());
 
 const INVEPT_ALL_CONTEXTS: u64 = 2;
 const EPT_VPID_CAP_INVEPT: u64 = 1 << 20;
@@ -28,9 +30,15 @@ const EPT_VPID_CAP_INVEPT_ALL_CONTEXTS: u64 = 1 << 26;
  * Source: https://github.com/equation314/RVM-Tutorial
  */
 #[expect(
-    dead_code,
     non_camel_case_types,
     reason = "VMX names follow Intel SDM terminology, and the catalog includes MSRs reserved for future VMX paths."
+)]
+#[cfg_attr(
+    not(ktest),
+    expect(
+        dead_code,
+        reason = "VMX names follow Intel SDM terminology, and the catalog includes MSRs reserved for future VMX paths."
+    )
 )]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug)]
@@ -108,11 +116,7 @@ impl Msr {
     }
 }
 
-// ============================================
-
-// ============================================
-// VMCS Access Functions
-// ============================================
+// Reads a VMCS field and reports VM-instruction failure through `Result`.
 #[inline]
 unsafe fn vmread(field: u32) -> Result<u64> {
     let value: u64;
@@ -139,6 +143,7 @@ unsafe fn vmread(field: u32) -> Result<u64> {
     Ok(value)
 }
 
+// Writes a VMCS field and reports VM-instruction failure through `Result`.
 #[inline]
 unsafe fn vmwrite(field: u32, value: u64) -> Result<()> {
     let mut rflags: u64;
@@ -224,57 +229,57 @@ pub(crate) enum VmcsControl16 {
     reason = "VMCS field names follow Intel SDM terminology, including fields reserved for future use."
 )]
 pub(crate) enum VmcsControl64 {
-    /// Address of I/O bitmap A (full).
+    /// Address of I/O bitmap A.
     IO_BITMAP_A_ADDR = 0x2000,
-    /// Address of I/O bitmap B (full).
+    /// Address of I/O bitmap B.
     IO_BITMAP_B_ADDR = 0x2002,
-    /// Address of MSR bitmaps (full).
+    /// Address of MSR bitmaps.
     MSR_BITMAPS_ADDR = 0x2004,
-    /// VM-exit MSR-store address (full).
+    /// VM-exit MSR-store address.
     VMEXIT_MSR_STORE_ADDR = 0x2006,
-    /// VM-exit MSR-load address (full).
+    /// VM-exit MSR-load address.
     VMEXIT_MSR_LOAD_ADDR = 0x2008,
-    /// VM-entry MSR-load address (full).
+    /// VM-entry MSR-load address.
     VMENTRY_MSR_LOAD_ADDR = 0x200A,
-    /// Executive-VMCS pointer (full).
+    /// Executive-VMCS pointer.
     EXECUTIVE_VMCS_PTR = 0x200C,
-    /// PML address (full).
+    /// PML address.
     PML_ADDR = 0x200E,
-    /// TSC offset (full).
+    /// TSC offset.
     TSC_OFFSET = 0x2010,
-    /// Virtual-APIC address (full).
+    /// Virtual-APIC address.
     VIRT_APIC_ADDR = 0x2012,
-    /// APIC-access address (full).
+    /// APIC-access address.
     APIC_ACCESS_ADDR = 0x2014,
-    /// Posted-interrupt descriptor address (full).
+    /// Posted-interrupt descriptor address.
     POSTED_INTERRUPT_DESC_ADDR = 0x2016,
-    /// VM-function controls (full).
+    /// VM-function controls.
     VM_FUNCTION_CONTROLS = 0x2018,
-    /// EPT pointer (full).
+    /// EPT pointer.
     EPTP = 0x201A,
-    /// EOI-exit bitmap 0 (full).
+    /// EOI-exit bitmap 0.
     EOI_EXIT0 = 0x201C,
-    /// EOI-exit bitmap 1 (full).
+    /// EOI-exit bitmap 1.
     EOI_EXIT1 = 0x201E,
-    /// EOI-exit bitmap 2 (full).
+    /// EOI-exit bitmap 2.
     EOI_EXIT2 = 0x2020,
-    /// EOI-exit bitmap 3 (full).
+    /// EOI-exit bitmap 3.
     EOI_EXIT3 = 0x2022,
-    /// EPTP-list address (full).
+    /// EPTP-list address.
     EPTP_LIST_ADDR = 0x2024,
-    /// VMREAD-bitmap address (full).
+    /// VMREAD-bitmap address.
     VMREAD_BITMAP_ADDR = 0x2026,
-    /// VMWRITE-bitmap address (full).
+    /// VMWRITE-bitmap address.
     VMWRITE_BITMAP_ADDR = 0x2028,
-    /// Virtualization-exception information address (full).
+    /// Virtualization-exception information address.
     VIRT_EXCEPTION_INFO_ADDR = 0x202A,
-    /// XSS-exiting bitmap (full).
+    /// XSS-exiting bitmap.
     XSS_EXITING_BITMAP = 0x202C,
-    /// ENCLS-exiting bitmap (full).
+    /// ENCLS-exiting bitmap.
     ENCLS_EXITING_BITMAP = 0x202E,
-    /// Sub-page-permission-table pointer (full).
+    /// Sub-page-permission-table pointer.
     SUBPAGE_PERM_TABLE_PTR = 0x2030,
-    /// TSC multiplier (full).
+    /// TSC multiplier.
     TSC_MULTIPLIER = 0x2032,
 }
 vmcs_read!(VmcsControl64, u64);
@@ -396,27 +401,27 @@ vmcs_write!(VmcsGuest16, u16);
     reason = "VMCS field names follow Intel SDM terminology, including fields reserved for future use."
 )]
 pub(crate) enum VmcsGuest64 {
-    /// VMCS link pointer (full).
+    /// VMCS link pointer.
     LINK_PTR = 0x2800,
-    /// Guest IA32_DEBUGCTL (full).
+    /// Guest IA32_DEBUGCTL.
     IA32_DEBUGCTL = 0x2802,
-    /// Guest IA32_PAT (full).
+    /// Guest IA32_PAT.
     IA32_PAT = 0x2804,
-    /// Guest IA32_EFER (full).
+    /// Guest IA32_EFER.
     IA32_EFER = 0x2806,
-    /// Guest IA32_PERF_GLOBAL_CTRL (full).
+    /// Guest IA32_PERF_GLOBAL_CTRL.
     IA32_PERF_GLOBAL_CTRL = 0x2808,
-    /// Guest PDPTE0 (full).
+    /// Guest PDPTE0.
     PDPTE0 = 0x280A,
-    /// Guest PDPTE1 (full).
+    /// Guest PDPTE1.
     PDPTE1 = 0x280C,
-    /// Guest PDPTE2 (full).
+    /// Guest PDPTE2.
     PDPTE2 = 0x280E,
-    /// Guest PDPTE3 (full).
+    /// Guest PDPTE3.
     PDPTE3 = 0x2810,
-    /// Guest IA32_BNDCFGS (full).
+    /// Guest IA32_BNDCFGS.
     IA32_BNDCFGS = 0x2812,
-    /// Guest IA32_RTIT_CTL (full).
+    /// Guest IA32_RTIT_CTL.
     IA32_RTIT_CTL = 0x2814,
 }
 vmcs_read!(VmcsGuest64, u64);
@@ -565,11 +570,11 @@ vmcs_write!(VmcsHost16, u16);
     reason = "VMCS field names follow Intel SDM terminology, including fields reserved for future use."
 )]
 pub(super) enum VmcsHost64 {
-    /// Host IA32_PAT (full).
+    /// Host IA32_PAT.
     IA32_PAT = 0x2C00,
-    /// Host IA32_EFER (full).
+    /// Host IA32_EFER.
     IA32_EFER = 0x2C02,
-    /// Host IA32_PERF_GLOBAL_CTRL (full).
+    /// Host IA32_PERF_GLOBAL_CTRL.
     IA32_PERF_GLOBAL_CTRL = 0x2C04,
 }
 vmcs_write!(VmcsHost64, u64);
@@ -590,9 +595,15 @@ vmcs_write!(VmcsHost32, u32);
 #[derive(Clone, Copy, Debug)]
 #[expect(
     clippy::upper_case_acronyms,
-    dead_code,
     non_camel_case_types,
     reason = "VMCS field names follow Intel SDM terminology, including fields reserved for future use."
+)]
+#[cfg_attr(
+    not(ktest),
+    expect(
+        dead_code,
+        reason = "VMCS field names follow Intel SDM terminology, including fields reserved for future use."
+    )
 )]
 pub(super) enum VmcsHostNW {
     /// Host CR0.
@@ -620,6 +631,8 @@ pub(super) enum VmcsHostNW {
     /// Host RIP.
     RIP = 0x6C16,
 }
+#[cfg(ktest)]
+vmcs_read!(VmcsHostNW, usize);
 vmcs_write!(VmcsHostNW, usize);
 
 /// 64-Bit Read-Only Data Fields. (SDM Vol. 3D, Appendix B.2.2)
@@ -629,7 +642,7 @@ vmcs_write!(VmcsHostNW, usize);
     reason = "VMX names follow Intel SDM terminology."
 )]
 pub(crate) enum VmcsReadOnly64 {
-    /// Guest-physical address (full).
+    /// Guest-physical address.
     GUEST_PHYSICAL_ADDR = 0x2400,
 }
 vmcs_read!(VmcsReadOnly64, u64);
@@ -684,12 +697,8 @@ pub(crate) enum VmcsReadOnlyNW {
 }
 vmcs_read!(VmcsReadOnlyNW, usize);
 
-// ============================================
-
-// ============================================
-// VMX Build Functions
-// ============================================
-
+/// Writes a VMCS control field using the fixed-0/fixed-1 capability MSR.
+/// Reference: Intel SDM Vol. 3D, A.2, A.3.
 pub(super) fn set_control(
     control: VmcsControl32,
     capability_msr: Msr,
@@ -713,7 +722,7 @@ pub(super) fn set_control(
         // failed if clear 1-bits in allowed0
         return Err(Error::InvalidArgs);
     }
-    // SDM Vol. 3C, Section 31.5.1, Algorithm 3
+
     let flexible = !allowed0 & allowed1; // therse bits can be either 0 or 1
     let unknown = flexible & !(set | clear); // hypervisor untouched bits
     let default = unknown & old_value; // these bits keep unchanged in old value
@@ -721,12 +730,6 @@ pub(super) fn set_control(
     control.write(fixed1 | default | set)?;
     Ok(())
 }
-
-// ============================================
-
-// ============================================
-// about VM Exit
-// ============================================
 
 macro_rules! def_exit_reasons {
     (
@@ -839,6 +842,7 @@ pub(crate) struct VmxExitInfo {
     pub(crate) guest_rip: GuestPhysAddr,
 }
 
+/// Reads the VM-exit information fields from the current VMCS.
 pub(crate) fn exit_info() -> Result<VmxExitInfo> {
     let reason_raw = VmcsReadOnly32::EXIT_REASON.read()?;
     let entry_failure = (reason_raw & (1 << 31)) != 0;
@@ -857,9 +861,7 @@ pub(crate) fn exit_info() -> Result<VmxExitInfo> {
     })
 }
 
-// ============================================
-
-/// Initialize VMX support
+/// Initializes VMX support on every CPU.
 pub(crate) fn init_vmx() -> Result<()> {
     // Check CPUID for VMX support
     let cpuid_result = core::arch::x86_64::__cpuid(1);
@@ -868,13 +870,8 @@ pub(crate) fn init_vmx() -> Result<()> {
         return Err(Error::NotEnoughResources);
     }
 
-    // Read VMX basic MSR to get VMCS revision ID
-    unsafe {
-        let msr_value = Msr::IA32_VMX_BASIC.read();
-        let vmcs_version = (msr_value & 0x7FFFFFFF) as u32;
-        info!("VMCS revision: {:#x}", vmcs_version);
-        VMCS_REVISION = vmcs_version;
-    }
+    let vmcs_revision = init_vmcs_revision();
+    info!("VMCS revision: {:#x}", vmcs_revision);
 
     // Enable VMX on all CPUs
     let all_cpus = crate::cpu::CpuSet::new_full();
@@ -895,18 +892,31 @@ pub(crate) fn init_vmx() -> Result<()> {
             );
         }
 
-        // Allocate VMXON region and execute VMXON
-        let _vmxon_region = alloc_vmxon_region().unwrap();
-        unsafe {
-            vmxon(_vmxon_region).unwrap();
-        }
+        vmxon_current_cpu().unwrap();
     });
 
     info!("VMX initialized successfully");
     Ok(())
 }
 
-/// Execute VMXON
+fn init_vmcs_revision() -> u32 {
+    let msr_value = Msr::IA32_VMX_BASIC.read();
+    let vmcs_revision = (msr_value & 0x7FFF_FFFF) as u32;
+    VMCS_REVISION.store(vmcs_revision, Ordering::Release);
+    vmcs_revision
+}
+
+fn vmcs_revision() -> u32 {
+    VMCS_REVISION.load(Ordering::Acquire)
+}
+
+/// Enters VMX operation using the supplied VMXON region.
+///
+/// # Safety
+///
+/// The physical address must reference a page-aligned VMXON region whose first
+/// 31 bits contain the current VMCS revision identifier, and the current CPU
+/// must have `CR4.VMXE` set.
 #[inline]
 unsafe fn vmxon(vmxon_region: PhysAddr) -> Result<()> {
     let mut rflags: u64;
@@ -927,6 +937,104 @@ unsafe fn vmxon(vmxon_region: PhysAddr) -> Result<()> {
     }
     if (rflags & (1 << 6)) != 0 {
         return Err(Error::InvalidArgs); // VMfailValid
+    }
+
+    Ok(())
+}
+
+fn vmxon_current_cpu() -> Result<()> {
+    let preempt_guard = crate::task::disable_preempt();
+    let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
+    if VMXON_REGIONS.lock().contains_key(&cpu) {
+        return Err(Error::InvalidArgs);
+    }
+
+    let vmxon_region = alloc_vmx_revision_region()?;
+    let vmxon_region_paddr = vmxon_region.paddr();
+    // SAFETY: The VMXON region is page-sized, aligned, initialized with the
+    // current VMCS revision ID, and kept alive in `VMXON_REGIONS` until VMXOFF.
+    unsafe {
+        vmxon(vmxon_region_paddr)?;
+    }
+
+    let old_region = VMXON_REGIONS.lock().insert(cpu, vmxon_region);
+    debug_assert!(old_region.is_none());
+    Ok(())
+}
+
+/// Leaves VMX operation on the current CPU.
+#[inline]
+#[cfg_attr(
+    not(ktest),
+    expect(
+        dead_code,
+        reason = "VMX shutdown is used by tests and future CPU teardown."
+    )
+)]
+pub(super) fn vmxoff() -> Result<()> {
+    let cpu = {
+        let preempt_guard = crate::task::disable_preempt();
+        let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
+
+        let mut rflags: u64;
+        // SAFETY: `VMXOFF` only changes VMX operation state on the current CPU.
+        unsafe {
+            core::arch::asm!(
+                "vmxoff",
+                "pushfq",
+                "pop {}",
+                out(reg) rflags,
+                options(nostack)
+            );
+        }
+
+        if (rflags & 1) != 0 {
+            return Err(Error::InvalidArgs);
+        }
+        if (rflags & (1 << 6)) != 0 {
+            return Err(Error::InvalidArgs);
+        }
+
+        cpu
+    };
+
+    let _vmxon_region = VMXON_REGIONS.lock().remove(&cpu);
+    Ok(())
+}
+
+#[cfg(ktest)]
+pub(super) mod test_support {
+    use crate::prelude::Result;
+
+    pub(in crate::arch::vm) fn init_vmcs_revision() -> u32 {
+        super::init_vmcs_revision()
+    }
+
+    pub(in crate::arch::vm) fn vmxon_current_cpu() -> Result<()> {
+        super::vmxon_current_cpu()
+    }
+}
+
+/// Clears a VMCS region from any CPU that currently owns it.
+#[inline]
+pub(super) fn vmclear(vmcs: u64) -> Result<()> {
+    let mut rflags: u64;
+    unsafe {
+        core::arch::asm!(
+            "vmclear [{}]",
+            "pushfq",
+            "pop {}",
+            in(reg) &vmcs,
+            out(reg) rflags,
+            options(nostack)
+        );
+    }
+
+    if (rflags & 1) != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    if (rflags & (1 << 6)) != 0 {
+        return Err(Error::InvalidArgs);
     }
 
     Ok(())
@@ -970,6 +1078,7 @@ fn flush_ept_all_contexts_on_cpu() {
     EPT_FLUSH_ACKS.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Invalidates all EPT contexts on the current CPU.
 fn invept_all_contexts() -> Result<()> {
     let descriptor = InveptDescriptor {
         eptp: 0,
@@ -1000,32 +1109,7 @@ fn invept_all_contexts() -> Result<()> {
     Ok(())
 }
 
-/// Execute VMCLEAR
-#[inline]
-pub(super) fn vmclear(vmcs: u64) -> Result<()> {
-    let mut rflags: u64;
-    unsafe {
-        core::arch::asm!(
-            "vmclear [{}]",
-            "pushfq",
-            "pop {}",
-            in(reg) &vmcs,
-            out(reg) rflags,
-            options(nostack)
-        );
-    }
-
-    if (rflags & 1) != 0 {
-        return Err(Error::InvalidArgs);
-    }
-    if (rflags & (1 << 6)) != 0 {
-        return Err(Error::InvalidArgs);
-    }
-
-    Ok(())
-}
-
-/// Execute VMPTRLD
+/// Makes a VMCS region current on this CPU.
 #[inline]
 pub(super) fn vmptrld(vmcs: u64) -> Result<()> {
     let mut rflags: u64;
@@ -1050,11 +1134,14 @@ pub(super) fn vmptrld(vmcs: u64) -> Result<()> {
     Ok(())
 }
 
-/// Allocate and initialize VMCS region
+/// Allocates a zeroed VMCS region with the current VMCS revision ID.
 pub(super) fn alloc_vmcs() -> Result<Frame<()>> {
-    use crate::mm::{paddr_to_vaddr, FrameAllocOptions};
+    alloc_vmx_revision_region()
+}
 
-    // Allocate a single page frame with zero initialization
+fn alloc_vmx_revision_region() -> Result<Frame<()>> {
+    use crate::mm::{FrameAllocOptions, paddr_to_vaddr};
+
     let frame = FrameAllocOptions::new()
         .zeroed(true)
         .alloc_frame()
@@ -1063,48 +1150,22 @@ pub(super) fn alloc_vmcs() -> Result<Frame<()>> {
     let phys_addr = frame.paddr();
     let virt_addr = paddr_to_vaddr(phys_addr);
 
+    // SAFETY: The allocated frame is linearly mapped and at least four bytes
+    // long, so writing the VMCS revision ID to the first word is valid.
     unsafe {
-        // Write VMCS revision identifier
         let ptr = virt_addr as *mut u32;
-        *ptr = VMCS_REVISION;
-
-        // Rest of page is already zeroed by FrameAllocOptions
+        *ptr = vmcs_revision();
     }
 
     Ok(frame)
 }
 
-/// Allocate and initialize VMXON region
-fn alloc_vmxon_region() -> Result<PhysAddr> {
-    use crate::mm::{paddr_to_vaddr, FrameAllocOptions};
-
-    // Allocate a single page frame with zero initialization
-    let frame = FrameAllocOptions::new()
-        .zeroed(true)
-        .alloc_frame()
-        .map_err(|_| Error::NoMemory)?;
-
-    let phys_addr = frame.paddr();
-    let virt_addr = paddr_to_vaddr(phys_addr);
-
-    unsafe {
-        // Write VMCS revision identifier (same format as VMCS)
-        let ptr = virt_addr as *mut u32;
-        *ptr = VMCS_REVISION;
-
-        // Rest of page is already zeroed by FrameAllocOptions
-    }
-
-    // Leak the frame to prevent deallocation
-    core::mem::forget(frame);
-
-    Ok(phys_addr)
-}
-
+/// Enters or resumes the guest and returns after a VM exit.
 pub(crate) fn vcpu_run(guest_regs_ptr: *mut VcpuRegs, launched: u64) -> u64 {
     unsafe { __rkvm_vcpu_run(guest_regs_ptr, launched) }
 }
 
+/// Returns the assembly VM-exit handler entry address for VMCS host state.
 pub(super) fn vm_exit_handler_virtaddr() -> usize {
     __rkvm_vm_exit_handler as *const () as usize
 }

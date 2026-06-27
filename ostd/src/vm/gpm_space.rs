@@ -4,19 +4,19 @@ use alloc::collections::BTreeMap;
 use core::ops::Range;
 
 use crate::{
+    Error,
     arch::vm::{
         ept::{EptItem, EptPtConfig},
         vmx::flush_ept_all_contexts_sync,
     },
     mm::{
+        PAGE_SIZE, PageProperty, UFrame, VmReader,
         io::Fallible,
         page_table::{self, PageTable, PageTableFrag},
-        PageProperty, UFrame, VmReader, PAGE_SIZE,
     },
     prelude::*,
     sync::Mutex,
     task::atomic_mode::AsAtomicModeGuard,
-    Error,
 };
 
 /// Manages the guest physical memory space of a VM.

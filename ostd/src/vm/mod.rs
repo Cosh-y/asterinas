@@ -12,19 +12,19 @@ pub use self::{
     gpm_space::GuestPhysMemSpace, interrupt::GuestInterruptPort, timer::GuestTimerPort,
 };
 use crate::{
+    Error,
     arch::vm::{
+        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
         context::VcpuRunState,
         control_regs::{VcpuControlRegister, VcpuControlRegisters},
         vmx::{
-            exit_info, Msr, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
-            VmcsGuest64, VmcsGuestNW, VmcsReadOnly32,
+            Msr, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
+            VmcsGuest64, VmcsGuestNW, VmcsReadOnly32, exit_info,
         },
         x86::write_cr2_raw,
-        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
     },
     prelude::*,
     sync::{Mutex, SpinLock},
-    Error,
 };
 
 /// Initializes guest virtualization support on this platform.

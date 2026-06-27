@@ -17,7 +17,7 @@ use super::{
     x86::get_tr_base,
 };
 use crate::{
-    mm::{Frame, FrameAllocOptions, VmIo, PAGE_SIZE},
+    mm::{Frame, FrameAllocOptions, PAGE_SIZE, VmIo},
     prelude::*,
 };
 
@@ -268,7 +268,7 @@ impl Vmcs {
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
-            (PinbasedControls::from_bits_truncate(1 << 0)
+            (PinbasedControls::EXTERNAL_INTERRUPT_EXITING
                 | PinbasedControls::NMI_EXITING
                 | PinbasedControls::VMX_PREEMPTION_TIMER)
                 .bits(),
@@ -381,7 +381,7 @@ impl Drop for Vmcs {
 }
 
 // TODO: clear up the following code.
-fn segment_access_rights(segment: &VcpuSegment) -> u32 {
+pub(super) fn segment_access_rights(segment: &VcpuSegment) -> u32 {
     let mut rights = u32::from(segment.type_ & 0x0f);
     rights |= u32::from(segment.s & 0x1) << 4;
     rights |= u32::from(segment.dpl & 0x3) << 5;

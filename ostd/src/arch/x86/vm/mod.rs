@@ -22,9 +22,12 @@ pub(crate) mod vmcs;
 pub(crate) mod vmx;
 pub(crate) mod x86;
 
+#[cfg(ktest)]
+mod tests;
+
 pub use self::{
     context::GuestContext,
-    cpuid::{default_cpuid_entries, GuestCpuidEntry},
+    cpuid::{GuestCpuidEntry, default_cpuid_entries},
     exit::GuestExitInfo,
     types::{VcpuDtable, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::VmxExitReason,

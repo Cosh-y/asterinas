@@ -2,7 +2,7 @@ use x86_64::registers::{control::Cr0Flags, model_specific::EferFlags};
 
 use super::{
     control_regs::VcpuControlRegisters,
-    cpuid::{default_cpuid_entries, GuestCpuidEntry},
+    cpuid::{GuestCpuidEntry, default_cpuid_entries},
     types::{VcpuDtable, VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
     vmcs::{Vmcs, VmcsGuestState},
 };
@@ -181,11 +181,7 @@ impl GuestContext {
     pub fn guest_tsc(&self) -> u64 {
         use crate::arch::read_tsc;
         let tsc = read_tsc() as i64 + self.tsc_offset;
-        if tsc < 0 {
-            0
-        } else {
-            tsc as u64
-        }
+        if tsc < 0 { 0 } else { tsc as u64 }
     }
 
     /// Returns the guest-visible value of a supported MSR.
