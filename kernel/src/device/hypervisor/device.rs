@@ -5,24 +5,20 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use device_id::{DeviceId, MajorId, MinorId};
-use ostd::{
-    arch::vm::{GuestCpuConfig, default_cpuid_entries},
-    mm::VmIo,
-    task::Task,
-};
+use ostd::{arch::vm::default_cpuid_entries, mm::VmIo, task::Task};
 
-use super::{KVM_MAJOR, KVM_MINOR, ioctl::*, vm::Vm, vm_file::VmFile};
+use super::{ioctl::*, vm::Vm, vm_file::VmFile, KVM_MAJOR, KVM_MINOR};
 use crate::{
     context::current_userspace,
     device::{Device, DeviceType, DevtmpfsInodeMeta},
     events::IoEvents,
     fs::{
-        file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
+        file::{file_table::FdFlags, PerOpenFileOps, StatusFlags},
         vfs::inode::FileOps,
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::{dispatch_ioctl, RawIoctl},
 };
 
 /// The main KVM-compatible hypervisor device (`/dev/kvm`).
@@ -71,11 +67,7 @@ impl HypervisorDeviceFile {
     }
 
     fn get_supported_cpuid(&self, mut cpuid: VcpuCpuid2, arg: usize) -> Result<i32> {
-        let entries = default_cpuid_entries(GuestCpuConfig {
-            vcpu_id: 0,
-            lapic_id: 0,
-            vcpu_count: KVM_RECOMMENDED_VCPUS as u32,
-        });
+        let entries = default_cpuid_entries();
         let needed = u32::try_from(entries.len())?;
         let requested = usize::try_from(cpuid.nent)?;
         cpuid.nent = needed;

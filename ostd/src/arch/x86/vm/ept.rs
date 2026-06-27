@@ -1,10 +1,10 @@
 use core::ops::Range;
 
 use crate::mm::{
-    AnyUFrameMeta, HasPaddr, Paddr, PageProperty, PagingConstsTrait, PagingLevel, PodOnce, UFrame,
-    frame::{FrameRef, uframe_from_raw, uframe_ref_from_raw},
+    frame::{uframe_from_raw, uframe_ref_from_raw, FrameRef},
     page_prop::{CachePolicy, PageFlags, PageTableFlags, PrivilegedPageFlags as PrivFlags},
     page_table::{PageTableConfig, PteScalar, PteTrait},
+    AnyUFrameMeta, HasPaddr, Paddr, PageProperty, PagingConstsTrait, PagingLevel, PodOnce, UFrame,
 };
 
 /// The page table used by ept maps the guest physical address

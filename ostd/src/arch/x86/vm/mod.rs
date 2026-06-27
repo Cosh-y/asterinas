@@ -1,37 +1,31 @@
-///     
-/// mod vm;
-///     mod ept;
-///     mod x86;
-///     mod vmx;
-///     mod vmcs;
-///     mod context; // implements GuestContext
-///     mod exit;
-///         mod handler;
-///     mod emulate;
-///         mod cr;
-///         mod cpuid;
-///         mod msr;
-///     
-/// mod vm;  // implements GuestMode
-///          // new
-///          // execute
-///     mod gpm_space; // implements GuestPhysMemSpace
-///
-///  
+// SPDX-License-Identifier: MPL-2.0
+
+//! Provides Intel VMX-based guest virtualization support.
+//!
+//! This module contains the x86-specific guest CPU model, VMX/VMCS helpers,
+//! EPT support, VM-exit decoding, and low-level instruction emulation used by
+//! OSTD's guest virtualization layer.
+//!
+//! Public exports are limited to the vCPU state and exit types that the
+//! kernel-side KVM-compatible device needs. VMX implementation details remain
+//! crate-private.
+
 pub(crate) mod context;
+pub(crate) mod control_regs;
+mod cpuid;
 mod emulate;
 pub(crate) mod ept;
 pub(crate) mod exit;
 pub(crate) mod interrupt;
+mod types;
 pub(crate) mod vmcs;
 pub(crate) mod vmx;
 pub(crate) mod x86;
 
 pub use self::{
-    context::{
-        GuestContext, GuestCpuConfig, GuestCpuidEntry, VcpuDtable, VcpuRegs, VcpuSegment,
-        VcpuSregs, default_cpuid_entries,
-    },
+    context::GuestContext,
+    cpuid::{default_cpuid_entries, GuestCpuidEntry},
     exit::GuestExitInfo,
+    types::{VcpuDtable, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::VmxExitReason,
 };

@@ -6,7 +6,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
-    arch::vm::context::VcpuRegs, error, error::Error, info, mm::Frame, prelude::*, sync::SpinLock,
+    arch::vm::types::VcpuRegs, error, error::Error, info, mm::Frame, prelude::*, sync::SpinLock,
 };
 
 type GuestPhysAddr = Gpaddr;
@@ -1052,7 +1052,7 @@ pub(super) fn vmptrld(vmcs: u64) -> Result<()> {
 
 /// Allocate and initialize VMCS region
 pub(super) fn alloc_vmcs() -> Result<Frame<()>> {
-    use crate::mm::{FrameAllocOptions, paddr_to_vaddr};
+    use crate::mm::{paddr_to_vaddr, FrameAllocOptions};
 
     // Allocate a single page frame with zero initialization
     let frame = FrameAllocOptions::new()
@@ -1076,7 +1076,7 @@ pub(super) fn alloc_vmcs() -> Result<Frame<()>> {
 
 /// Allocate and initialize VMXON region
 fn alloc_vmxon_region() -> Result<PhysAddr> {
-    use crate::mm::{FrameAllocOptions, paddr_to_vaddr};
+    use crate::mm::{paddr_to_vaddr, FrameAllocOptions};
 
     // Allocate a single page frame with zero initialization
     let frame = FrameAllocOptions::new()

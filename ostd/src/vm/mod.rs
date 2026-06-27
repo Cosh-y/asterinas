@@ -13,16 +13,14 @@ pub use self::{
 };
 use crate::{
     arch::vm::{
-        context::{
-            GuestContext, VcpuControlRegister, VcpuControlRegisters, VcpuDtable, VcpuRunState,
-            VcpuSegment,
-        },
-        exit::GuestExitInfo,
+        context::VcpuRunState,
+        control_regs::{VcpuControlRegister, VcpuControlRegisters},
         vmx::{
             exit_info, Msr, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
             VmcsGuest64, VmcsGuestNW, VmcsReadOnly32,
         },
         x86::write_cr2_raw,
+        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
     },
     prelude::*,
     sync::{Mutex, SpinLock},

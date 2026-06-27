@@ -1,11 +1,9 @@
+use x86_64::registers::control::Cr2;
+
 use crate::arch::{
     cpu::context::FpuContext,
-    vm::{
-        vmx::Msr,
-        x86::write_cr2_raw,
-    },
+    vm::{vmx::Msr, x86::write_cr2_raw},
 };
-use x86_64::registers::control::Cr2;
 
 #[derive(Debug, Clone)]
 /// Host Contexts that can't be auto loaded/saved by VMCS

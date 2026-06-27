@@ -1,9 +1,9 @@
-use x86::vmx::vmcs::control::{
-    EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
-};
 use x86::{
     dtables::{self, DescriptorTablePointer},
     segmentation, task,
+    vmx::vmcs::control::{
+        EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls,
+    },
 };
 use x86_64::registers::{
     control::{Cr0, Cr3, Cr4},
@@ -11,12 +11,13 @@ use x86_64::registers::{
 };
 
 use super::{
-    context::{VcpuControlRegisters, VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
+    control_regs::VcpuControlRegisters,
+    types::{VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::*,
     x86::get_tr_base,
 };
 use crate::{
-    mm::{Frame, FrameAllocOptions, PAGE_SIZE, VmIo},
+    mm::{Frame, FrameAllocOptions, VmIo, PAGE_SIZE},
     prelude::*,
 };
 

@@ -1,12 +1,12 @@
-use ostd::{arch::vm::GuestCpuConfig, vm::GuestPhysMemSpace};
+use ostd::vm::GuestPhysMemSpace;
 
 use super::{
     apic::{
-        IOAPIC_NUM_PINS, Icr, Ioapic, Lapic, default_lapic_ldr, default_lapic_lvt_lint0,
-        icr_matches_destination,
+        default_lapic_ldr, default_lapic_lvt_lint0, icr_matches_destination, Icr, Ioapic, Lapic,
+        IOAPIC_NUM_PINS,
     },
     ioctl::{
-        IrqLevel, IrqRoutingEntry, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC,
+        IrqLevel, IrqRoutingEntry, KVM_IRQCHIP_IOAPIC, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
     },
     vcpu::Vcpu,
 };
@@ -60,21 +60,8 @@ impl Vm {
         let vcpu = Vcpu::new(vcpu_id, self, lapic)?;
         vcpus.insert(vcpu_id, vcpu.clone());
         drop(vcpus);
-        // self.refresh_guest_cpu_config();
         Ok(vcpu)
     }
-
-    // fn refresh_guest_cpu_config(&self) {
-    //     let vcpus = self.vcpus.lock();
-    //     let vcpu_count = vcpus.len() as u32;
-    //     for (&vcpu_id, vcpu) in vcpus.iter() {
-    //         vcpu.guest_context().set_guest_cpu_config(GuestCpuConfig {
-    //             vcpu_id,
-    //             lapic_id: vcpu_id,
-    //             vcpu_count,
-    //         });
-    //     }
-    // }
 
     pub(super) fn create_irqchip(&self) -> Result<()> {
         // TODO: Add PIC state and stricter KVM irqchip lifecycle checks.
