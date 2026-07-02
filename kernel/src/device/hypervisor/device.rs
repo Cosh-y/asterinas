@@ -7,18 +7,18 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{arch::vm::default_cpuid_entries, mm::VmIo, task::Task};
 
-use super::{ioctl::*, vm::Vm, vm_file::VmFile, KVM_MAJOR, KVM_MINOR};
+use super::{KVM_MAJOR, KVM_MINOR, ioctl::*, kvmclock, vm::Vm, vm_file::VmFile};
 use crate::{
     context::current_userspace,
     device::{Device, DeviceType, DevtmpfsInodeMeta},
     events::IoEvents,
     fs::{
-        file::{file_table::FdFlags, PerOpenFileOps, StatusFlags},
+        file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
         vfs::inode::FileOps,
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
-    util::ioctl::{dispatch_ioctl, RawIoctl},
+    util::ioctl::{RawIoctl, dispatch_ioctl},
 };
 
 /// The main KVM-compatible hypervisor device (`/dev/kvm`).
@@ -95,6 +95,41 @@ impl HypervisorDeviceFile {
 
         Ok(0)
     }
+
+    fn get_msr_index_list(&self, mut msr_list: MsrList, arg: usize) -> Result<i32> {
+        let indices = {
+            let mut indices = Vec::from(kvmclock::msr_indices());
+            indices.push(IA32_TSC_DEADLINE);
+            indices
+        };
+        // TODO: Add MSRs emulated in ostd.
+        let needed = u32::try_from(indices.len())?;
+        let requested = usize::try_from(msr_list.nmsrs)?;
+        msr_list.nmsrs = needed;
+
+        if requested < indices.len() {
+            current_userspace!().write_val(arg, &msr_list)?;
+            return_errno_with_message!(Errno::E2BIG, "the userspace MSR buffer is too small");
+        }
+
+        current_userspace!().write_val(arg, &msr_list)?;
+        let entries_addr = arg
+            .checked_add(size_of::<MsrList>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let entries_len = indices
+            .len()
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let current = Task::current().unwrap();
+        let thread_local = current.as_thread_local().unwrap();
+        let user_space = CurrentUserSpace::new(thread_local);
+        let mut writer = user_space.writer(entries_addr, entries_len)?;
+        for index in &indices {
+            writer.write_val(index)?;
+        }
+
+        Ok(0)
+    }
 }
 
 impl Pollable for HypervisorDeviceFile {
@@ -148,6 +183,10 @@ impl PerOpenFileOps for HypervisorDeviceFile {
 
                 Ok(vm_fd.into())
             }
+            cmd @ GetMsrIndexList => {
+                let msr_list = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+                self.get_msr_index_list(msr_list, raw_ioctl.arg())
+            }
             CheckExtension => {
                 Ok(check_extension(raw_ioctl.arg()))
             }
@@ -158,10 +197,15 @@ impl PerOpenFileOps for HypervisorDeviceFile {
                 let cpuid = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
                 self.get_supported_cpuid(cpuid, raw_ioctl.arg())
             }
+            cmd @ X86GetMceCapSupported => {
+                // TODO: Implement this ioctl which is about x86 MCA(Machine Check Architecture)
+                cmd.write(&u64::MAX)?;
+                Ok(0)
+            }
             _ => {
                 let ioctl_nr = raw_ioctl.cmd() & 0xff;
                 error!(
-                    "rustshyper: unimplemented device ioctl command: cmd={:#x}, nr={:#x}",
+                    "hypervisor: unimplemented device ioctl command: cmd={:#x}, nr={:#x}",
                     raw_ioctl.cmd(),
                     ioctl_nr
                 );

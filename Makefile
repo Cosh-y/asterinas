@@ -331,6 +331,10 @@ sync_kvm_hello_world:
 sync_kvmtool:
 	@./tools/nixos/sync_kvmtool.sh
 
+.PHONY: sync_qemu
+sync_qemu:
+	@./tools/nixos/sync_qemu.sh
+
 # Build the Asterinas NixOS patched packages
 cachix:
 	@nix-build distro/cachix \

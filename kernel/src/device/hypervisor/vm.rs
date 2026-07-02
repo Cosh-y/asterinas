@@ -2,15 +2,19 @@ use ostd::vm::GuestPhysMemSpace;
 
 use super::{
     apic::{
-        default_lapic_ldr, default_lapic_lvt_lint0, icr_matches_destination, Icr, Ioapic, Lapic,
-        IOAPIC_NUM_PINS,
+        IOAPIC_NUM_PINS, Icr, Ioapic, Lapic, default_lapic_ldr, default_lapic_lvt_lint0,
+        icr_matches_destination,
     },
     ioctl::{
-        IrqLevel, IrqRoutingEntry, KVM_IRQCHIP_IOAPIC, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
+        ClockData, EnableCapData, IrqLevel, IrqRoutingEntry, KVM_CAP_MAX_VCPU_ID,
+        KVM_CAP_SPLIT_IRQCHIP, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC,
     },
     vcpu::Vcpu,
 };
 use crate::prelude::*;
+
+const KVM_CLOCK_REALTIME: u32 = 1 << 2;
+const KVM_CLOCK_HOST_TSC: u32 = 1 << 3;
 
 #[derive(Clone, Copy, Debug)]
 enum IrqRoute {
@@ -24,6 +28,7 @@ pub(super) struct Vm {
     ioapic: Mutex<Ioapic>,
     irqchip_created: Mutex<bool>,
     irq_routes: Mutex<BTreeMap<u32, Vec<IrqRoute>>>,
+    clock: Mutex<ClockData>,
 }
 
 impl Vm {
@@ -35,6 +40,7 @@ impl Vm {
             ioapic: Mutex::new(Ioapic::default()),
             irqchip_created: Mutex::new(false),
             irq_routes: Mutex::new(BTreeMap::new()),
+            clock: Mutex::new(ClockData::default()),
         })
     }
 
@@ -71,6 +77,34 @@ impl Vm {
         Ok(())
     }
 
+    pub(super) fn set_clock(&self, clock: ClockData) {
+        *self.clock.lock() = clock;
+    }
+
+    pub(super) fn get_clock(&self) -> ClockData {
+        let mut clock = *self.clock.lock();
+        clock.clock = monotonic_nanos();
+        clock.host_tsc = ostd::arch::read_tsc();
+        clock.flags |= KVM_CLOCK_HOST_TSC;
+        if let Ok(realtime) = realtime_nanos() {
+            clock.realtime = realtime;
+            clock.flags |= KVM_CLOCK_REALTIME;
+        }
+        clock
+    }
+
+    pub(super) fn enable_cap(&self, cap: EnableCapData) -> Result<()> {
+        match usize::try_from(cap.cap)? {
+            KVM_CAP_SPLIT_IRQCHIP => {
+                return_errno_with_message!(Errno::EINVAL, "split irqchip is not supported");
+            }
+            KVM_CAP_MAX_VCPU_ID => Ok(()),
+            _ => {
+                return_errno_with_message!(Errno::EINVAL, "unsupported VM capability");
+            }
+        }
+    }
+
     pub(super) fn set_gsi_routing(&self, entries: &[IrqRoutingEntry]) -> Result<()> {
         self.ensure_irqchip_created()?;
 
@@ -96,11 +130,11 @@ impl Vm {
                         .push(IrqRoute::Ioapic { pin });
                 }
                 KVM_IRQ_ROUTING_MSI => {
-                    debug!("rustshyper: ignoring MSI GSI route {}", entry.gsi);
+                    debug!("hypervisor: ignoring MSI GSI route {}", entry.gsi);
                 }
                 route_type => {
                     debug!(
-                        "rustshyper: ignoring unsupported GSI route type {} for GSI {}",
+                        "hypervisor: ignoring unsupported GSI route type {} for GSI {}",
                         route_type, entry.gsi
                     );
                 }
@@ -111,11 +145,11 @@ impl Vm {
         Ok(())
     }
 
-    pub(super) fn set_irq_line(&self, irq_level: IrqLevel) -> Result<()> {
+    pub(super) fn set_irq_line(&self, irq_level: IrqLevel) -> Result<bool> {
         self.ensure_irqchip_created()?;
 
         if irq_level.level == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let (routes, has_routing_table) = {
@@ -137,15 +171,19 @@ impl Vm {
                 }
                 vec![IrqRoute::Ioapic { pin }]
             }
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
+        let mut delivered = false;
         for route in routes {
             match route {
-                IrqRoute::Ioapic { pin } => self.inject_ioapic_pin(pin)?,
+                IrqRoute::Ioapic { pin } => {
+                    self.inject_ioapic_pin(pin)?;
+                    delivered = true;
+                }
             }
         }
-        Ok(())
+        Ok(delivered)
     }
 
     fn ensure_irqchip_created(&self) -> Result<()> {
@@ -208,7 +246,7 @@ impl Vm {
                 APIC_ICR_DELIVERY_MODE_STARTUP => vcpu.receive_sipi(icr.vector),
                 _ => {
                     error!(
-                        "rustshyper: unsupported LAPIC ICR delivery mode {}",
+                        "hypervisor: unsupported LAPIC ICR delivery mode {}",
                         icr.delivery_mode,
                     );
                 }
@@ -216,5 +254,24 @@ impl Vm {
         }
 
         Ok(())
+    }
+}
+
+pub(super) fn monotonic_nanos() -> u64 {
+    let nanos = aster_time::read_monotonic_time().as_nanos();
+    saturating_u128_to_u64(nanos)
+}
+
+pub(super) fn realtime_nanos() -> Result<u64> {
+    let duration =
+        crate::time::SystemTime::now().duration_since(&crate::time::SystemTime::UNIX_EPOCH)?;
+    Ok(saturating_u128_to_u64(duration.as_nanos()))
+}
+
+fn saturating_u128_to_u64(nanos: u128) -> u64 {
+    if nanos > u128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        nanos as u64
     }
 }

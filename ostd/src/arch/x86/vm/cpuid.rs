@@ -13,6 +13,13 @@ use crate::{
 const GUEST_CPUID_FLAG_SIGNIFICANT_INDEX: u32 = 1 << 0;
 const DEFAULT_CPUID_VCPU_COUNT: u32 = 1;
 const DEFAULT_CPUID_APIC_ID: u32 = 0;
+const KVM_CPUID_SIGNATURE: u32 = 0x4000_0000;
+const KVM_CPUID_FEATURES: u32 = 0x4000_0001;
+const KVM_FEATURE_CLOCKSOURCE: u32 = 1 << 0;
+const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+
+/// The virtual crystal clock frequency advertised through CPUID leaf `0x15`.
+pub const VIRTUAL_TSC_CRYSTAL_HZ: u64 = 24_000_000;
 
 /// A CPUID result entry visible to a guest vCPU.
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +110,30 @@ pub fn default_cpuid_entries() -> Vec<GuestCpuidEntry> {
         entries.push(default_cpuid_entry(function, 0, 0));
     }
 
+    push_kvm_cpuid_entries(&mut entries);
+
     entries
+}
+
+fn push_kvm_cpuid_entries(entries: &mut Vec<GuestCpuidEntry>) {
+    entries.push(GuestCpuidEntry {
+        function: KVM_CPUID_SIGNATURE,
+        index: 0,
+        flags: 0,
+        eax: KVM_CPUID_FEATURES,
+        ebx: u32::from_le_bytes(*b"KVMK"),
+        ecx: u32::from_le_bytes(*b"VMKV"),
+        edx: u32::from_le_bytes(*b"M\0\0\0"),
+    });
+    entries.push(GuestCpuidEntry {
+        function: KVM_CPUID_FEATURES,
+        index: 0,
+        flags: 0,
+        eax: KVM_FEATURE_CLOCKSOURCE | KVM_FEATURE_CLOCKSOURCE2,
+        ebx: 0,
+        ecx: 0,
+        edx: 0,
+    });
 }
 
 fn push_cache_cpuid_entries(entries: &mut Vec<GuestCpuidEntry>) {
@@ -160,6 +190,7 @@ fn sanitize_cpuid_result(function: u32, index: u32, result: CpuidResult) -> Cpui
     const CPUID_1_ECX_AVX: u32 = 1 << 28;
     const CPUID_1_EDX_APIC: u32 = 1 << 9;
     const CPUID_1_EDX_HTT: u32 = 1 << 28;
+    const CPUID_6_EAX_ARAT: u32 = 1 << 2;
     const CPUID_7_EBX_FSGSBASE: u32 = 1 << 0;
     const CPUID_7_EBX_HLE: u32 = 1 << 4;
     const CPUID_7_EBX_AVX2: u32 = 1 << 5;
@@ -176,8 +207,6 @@ fn sanitize_cpuid_result(function: u32, index: u32, result: CpuidResult) -> Cpui
     const CPUID_7_ECX_AVX512VNNI: u32 = 1 << 11;
     const CPUID_7_ECX_AVX512BITALG: u32 = 1 << 12;
     const CPUID_7_ECX_AVX512VPOPCNTDQ: u32 = 1 << 14;
-    const CPUID_TSC_CRYSTAL_HZ: u32 = 1_000_000;
-
     let CpuidResult {
         mut eax,
         mut ebx,
@@ -193,16 +222,19 @@ fn sanitize_cpuid_result(function: u32, index: u32, result: CpuidResult) -> Cpui
             ecx &= !(CPUID_1_ECX_VMX
                 | CPUID_1_ECX_FMA
                 | CPUID_1_ECX_X2APIC
-                | CPUID_1_ECX_TSC_DEADLINE
                 | CPUID_1_ECX_PCID
                 | CPUID_1_ECX_XSAVE
                 | CPUID_1_ECX_OSXSAVE
                 | CPUID_1_ECX_AVX);
+            ecx |= CPUID_1_ECX_TSC_DEADLINE;
             ebx = (ebx & 0x0000_ffff)
                 | ((DEFAULT_CPUID_VCPU_COUNT & 0xff) << 16)
                 | ((DEFAULT_CPUID_APIC_ID & 0xff) << 24);
             edx |= CPUID_1_EDX_APIC;
             edx &= !CPUID_1_EDX_HTT;
+        }
+        6 => {
+            eax |= CPUID_6_EAX_ARAT;
         }
         4 if (eax & 0x1f) != 0 => {
             let cores_per_package_minus_one = DEFAULT_CPUID_VCPU_COUNT.saturating_sub(1).min(0x3f);
@@ -240,10 +272,10 @@ fn sanitize_cpuid_result(function: u32, index: u32, result: CpuidResult) -> Cpui
             edx = topology.edx;
         }
         0x15 => {
-            if let Some(tsc_mhz) = virtual_tsc_mhz() {
-                eax = 1;
-                ebx = tsc_mhz;
-                ecx = CPUID_TSC_CRYSTAL_HZ;
+            if let Some((denominator, numerator, crystal_hz)) = virtual_tsc_ratio() {
+                eax = denominator;
+                ebx = numerator;
+                ecx = crystal_hz;
                 edx = 0;
             }
         }
@@ -273,4 +305,27 @@ fn default_topology_cpuid(subleaf: u32) -> CpuidResult {
 fn virtual_tsc_mhz() -> Option<u32> {
     let mhz = (tsc_freq().saturating_add(500_000)) / 1_000_000;
     u32::try_from(mhz).ok().filter(|&mhz| mhz != 0)
+}
+
+fn virtual_tsc_ratio() -> Option<(u32, u32, u32)> {
+    let tsc_hz = tsc_freq();
+    let divisor = gcd(tsc_hz, VIRTUAL_TSC_CRYSTAL_HZ);
+    let denominator = VIRTUAL_TSC_CRYSTAL_HZ / divisor;
+    let numerator = tsc_hz / divisor;
+    Some((
+        u32::try_from(denominator)
+            .ok()
+            .filter(|&value| value != 0)?,
+        u32::try_from(numerator).ok().filter(|&value| value != 0)?,
+        u32::try_from(VIRTUAL_TSC_CRYSTAL_HZ).ok()?,
+    ))
+}
+
+fn gcd(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
 }

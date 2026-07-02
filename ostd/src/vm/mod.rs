@@ -175,7 +175,7 @@ impl<'a> GuestMode<'a> {
             return Ok(());
         }
 
-        debug!("rustshyper: initializing vcpu vmcs");
+        debug!("hypervisor: initializing vcpu vmcs");
         let mut context = self.context.lock();
         let vmcs_guest_state = context.vmcs_guest_state();
         context.vmcs.init(vmcs_guest_state, guest_mem.eptp())?;
@@ -264,13 +264,10 @@ impl<'a> GuestMode<'a> {
     fn prepare_preemption_timer(&self) -> Result<()> {
         let context = self.context.lock();
         let guest_tsc = context.guest_tsc();
-        let msr_deadline = context
-            .tsc_deadline()
-            .filter(|deadline| *deadline > guest_tsc);
         let timer_deadline = self.timer_port.lock().check_deadline(guest_tsc);
-        let msr_gap = msr_deadline.map(|deadline| deadline.saturating_sub(guest_tsc).max(1));
-        let timer_gap = timer_deadline.map(|deadline| deadline.saturating_sub(guest_tsc).max(1));
-        let gap = min_gap(msr_gap, timer_gap).unwrap_or(500_000);
+        let gap = timer_deadline
+            .map(|deadline| deadline.saturating_sub(guest_tsc).max(1))
+            .unwrap_or(500_000);
         let timer_value = vmx_preemption_timer_ticks(gap);
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(timer_value)?;
         VmcsControl64::TSC_OFFSET.write(context.tsc_offset as u64)?;
@@ -465,14 +462,6 @@ fn vmx_preemption_timer_ticks(tsc_cycles: u64) -> u32 {
     (tsc_cycles.saturating_add(rounding) >> rate) as u32
 }
 
-fn min_gap(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(gap), None) | (None, Some(gap)) => Some(gap),
-        (None, None) => None,
-    }
-}
-
 fn read_dtable_from_vmcs(base_field: VmcsGuestNW, limit_field: VmcsGuest32) -> Result<VcpuDtable> {
     Ok(VcpuDtable {
         base: base_field.read()? as u64,
@@ -558,7 +547,7 @@ fn read_segment_from_vmcs(
 
 fn log_vcpu_run_failure(launched: u64) {
     error!(
-        "rustshyper: vcpu_run failed, launched={} vm_instruction_error={:?} \
+        "hypervisor: vcpu_run failed, launched={} vm_instruction_error={:?} \
              guest_rip={:?} guest_rsp={:?} guest_rflags={:?} guest_cr0={:?} \
              guest_cr3={:?} guest_cr4={:?} guest_efer={:?} pin_ctls={:?} \
              primary_ctls={:?} secondary_ctls={:?} exit_ctls={:?} entry_ctls={:?} \

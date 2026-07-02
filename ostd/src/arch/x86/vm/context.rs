@@ -38,7 +38,6 @@ pub struct GuestContext {
     /// The VMCS owned by this vCPU.
     pub(crate) vmcs: Vmcs,
 
-    pub(crate) tsc_deadline: Option<u64>,
     pub(crate) tsc_offset: i64,
 
     /// The last VM exit was due to `HLT`.
@@ -81,7 +80,6 @@ impl GuestContext {
                 VcpuRunState::WaitForSipi
             },
             vmcs: Vmcs::new()?,
-            tsc_deadline: None,
             tsc_offset: 0,
             after_hlt: false,
         })
@@ -184,9 +182,12 @@ impl GuestContext {
         if tsc < 0 { 0 } else { tsc as u64 }
     }
 
-    /// Returns the guest-visible value of a supported MSR.
+    /// Returns the guest-visible value of an OSTD-owned MSR.
     ///
-    /// Unsupported MSR indexes return `None`.
+    /// Unsupported MSR indexes return `None`. Some MSRs, such as KVM clock
+    /// MSRs and `IA32_TSC_DEADLINE`, intentionally belong to the kernel-side
+    /// VM policy or virtual device model. Those MSRs are routed to the kernel
+    /// on VM exit instead of being stored in this low-level CPU context.
     pub fn read_msr(&self, index: u32) -> Option<u64> {
         use x86::msr::*;
 
@@ -197,12 +198,15 @@ impl GuestContext {
         }
     }
 
-    /// Sets the guest-visible value of a supported MSR.
+    /// Sets the guest-visible value of an OSTD-owned MSR.
     ///
-    /// Returns `false` if the MSR index is not supported. Supported MSRs are
-    /// stored in the context and may update derived state such as TSC offset,
-    /// TSC deadline, APIC base, or EFER.LMA. The caller remains responsible
-    /// for choosing MSR values that are meaningful for the guest.
+    /// Returns `false` if the MSR index is not supported by this context.
+    /// Supported MSRs are stored in the context and may update derived state
+    /// such as TSC offset, APIC base, or EFER.LMA. Kernel-owned MSRs, such as
+    /// KVM clock MSRs and `IA32_TSC_DEADLINE`, must be handled by the kernel
+    /// VM policy or virtual device model after OSTD routes their VM exits out.
+    /// The caller remains responsible for choosing MSR values that are
+    /// meaningful for the guest.
     pub fn write_msr(&mut self, index: u32, value: u64) -> bool {
         use x86::msr::*;
 
@@ -231,14 +235,6 @@ impl GuestContext {
                 true
             }
             IA32_BIOS_SIGN_ID => true,
-            IA32_TSC_DEADLINE => {
-                if !self.arch.set_msr(IA32_TSC_DEADLINE, value) {
-                    return false;
-                }
-
-                self.tsc_deadline = (value != 0).then_some(value);
-                true
-            }
             _ => self.arch.set_msr(index, value),
         }
     }
@@ -281,10 +277,6 @@ impl GuestContext {
 
     pub(crate) fn quit_running(&mut self) {
         self.run = VcpuRunState::Runnable;
-    }
-
-    pub(crate) fn tsc_deadline(&self) -> Option<u64> {
-        self.tsc_deadline
     }
 }
 
@@ -463,7 +455,6 @@ impl VcpuArchState {
             IA32_LSTAR => self.msrs.lstar,
             IA32_CSTAR => self.msrs.cstar,
             IA32_FMASK => self.msrs.syscall_mask,
-            IA32_TSC_DEADLINE => self.msrs.tsc_deadline,
             IA32_MISC_ENABLE => self.msrs.misc_enable,
             _ => return None,
         })
@@ -488,7 +479,6 @@ impl VcpuArchState {
             IA32_LSTAR => self.msrs.lstar = value,
             IA32_CSTAR => self.msrs.cstar = value,
             IA32_FMASK => self.msrs.syscall_mask = value,
-            IA32_TSC_DEADLINE => self.msrs.tsc_deadline = value,
             IA32_FS_BASE => self.set_fs_base(value),
             IA32_GS_BASE => self.set_gs_base(value),
             IA32_MISC_ENABLE => self.msrs.misc_enable = value,

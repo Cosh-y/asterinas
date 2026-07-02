@@ -10,7 +10,7 @@ use crate::{
         vmx::flush_ept_all_contexts_sync,
     },
     mm::{
-        PAGE_SIZE, PageProperty, UFrame, VmReader,
+        MAX_USERSPACE_VADDR, PAGE_SIZE, PageProperty, UFrame, VmReader, VmWriter,
         io::Fallible,
         page_table::{self, PageTable, PageTableFrag},
     },
@@ -268,6 +268,9 @@ impl GuestPhysMemSpace {
     /// recorded memory slots to translate the requested guest physical range
     /// back to the userspace virtual address range that backs it, then reuses
     /// [`VmReader`] to access that userspace memory.
+    /// 
+    /// If the translated userspace virtual address is not within the userspace
+    /// range, an error will be returned.
     pub fn reader(&self, gpa: Gpaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
         let memory_slots = self.memory_slots.lock();
         let mut userspace_addr = None;
@@ -278,9 +281,34 @@ impl GuestPhysMemSpace {
             }
         }
         let userspace_addr = userspace_addr.ok_or(Error::InvalidArgs)?;
+        validate_userspace_range(userspace_addr, len)?;
 
         // SAFETY: The memory range is in user space, as checked above.
         Ok(unsafe { VmReader::<Fallible>::from_user_space(userspace_addr as *const u8, len) })
+    }
+
+    /// Returns a writer for a userspace-backed guest physical range.
+    ///
+    /// This is the writable counterpart of [`Self::reader`]. It translates a
+    /// guest physical range back to the userspace virtual range backing the
+    /// memory slot, then reuses [`VmWriter`] to update that memory.
+    /// 
+    /// If the translated userspace virtual address is not within the userspace
+    /// range, an error will be returned.
+    pub fn writer(&self, gpa: Gpaddr, len: usize) -> Result<VmWriter<'_, Fallible>> {
+        let memory_slots = self.memory_slots.lock();
+        let mut userspace_addr = None;
+        for memory_slot in memory_slots.values() {
+            if let Some(translated_addr) = memory_slot.translate_guest_range(gpa, len)? {
+                userspace_addr = Some(translated_addr);
+                break;
+            }
+        }
+        let userspace_addr = userspace_addr.ok_or(Error::InvalidArgs)?;
+        validate_userspace_range(userspace_addr, len)?;
+
+        // SAFETY: The memory range is in user space, as checked above.
+        Ok(unsafe { VmWriter::<Fallible>::from_user_space(userspace_addr as *mut u8, len) })
     }
 }
 
@@ -311,6 +339,16 @@ fn validate_memory_region(
         || !guest_start.is_multiple_of(PAGE_SIZE)
         || !memory_size.is_multiple_of(PAGE_SIZE)
     {
+        return Err(Error::InvalidArgs);
+    }
+    validate_userspace_range(userspace_start, memory_size)?;
+    Ok(())
+}
+
+fn validate_userspace_range(userspace_start: Vaddr, len: usize) -> Result<()> {
+    // Keep the unsafe `from_user_space` precondition explicit at this boundary.
+    let userspace_end = userspace_start.checked_add(len).ok_or(Error::Overflow)?;
+    if userspace_end > MAX_USERSPACE_VADDR {
         return Err(Error::InvalidArgs);
     }
     Ok(())

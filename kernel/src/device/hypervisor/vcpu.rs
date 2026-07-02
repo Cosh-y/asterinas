@@ -3,15 +3,17 @@ use ostd::{
         GuestContext, GuestCpuidEntry as ArchGuestCpuidEntry, VcpuDtable as ArchVcpuDtable,
         VcpuRegs as ArchVcpuRegs, VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
     },
-    vm::GuestInterruptPort,
+    vm::{GuestInterruptPort, GuestTimerPort},
 };
 
 use super::{
     apic::Lapic,
     ioctl::{
-        KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE, LapicState,
+        IA32_TSC_DEADLINE, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_UNINITIALIZED,
+        KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE, LapicState, MpState,
         VcpuCpuidEntry2, VcpuDtable, VcpuMsrEntry, VcpuRegs, VcpuSegment, VcpuSregs,
     },
+    kvmclock::{self, KvmClock},
     vm::Vm,
 };
 use crate::{
@@ -53,6 +55,8 @@ pub struct Vcpu {
     pub(super) lapic: SpinLock<Lapic>,
     run_page: Arc<Vmo>,
     pending_operation: Mutex<Option<PendingOperation>>,
+    mp_state: Mutex<MpState>,
+    kvmclock: Mutex<KvmClock>,
 }
 
 impl Vcpu {
@@ -64,6 +68,8 @@ impl Vcpu {
             lapic: SpinLock::new(lapic),
             run_page,
             pending_operation: Mutex::new(None),
+            mp_state: Mutex::new(initial_mp_state(id)),
+            kvmclock: Mutex::new(KvmClock::default()),
         }))
     }
 
@@ -177,14 +183,16 @@ impl Vcpu {
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get MSRs while vCPU is running");
         }
+        drop(context);
 
+        let kvmclock = self.kvmclock.lock();
         let mut handled_count = 0;
         for entry in entries {
-            let Some(data) = context.read_msr(entry.index) else {
-                break;
-            };
-
-            entry.data = data;
+            entry.data = kvmclock
+                .read_msr(entry.index)
+                .or_else(|| self.read_tsc_deadline_msr(entry.index))
+                .or_else(|| self.guest_context.lock().read_msr(entry.index))
+                .unwrap_or(0);
             handled_count += 1;
         }
 
@@ -192,21 +200,73 @@ impl Vcpu {
     }
 
     pub fn set_msrs(&self, entries: &[VcpuMsrEntry]) -> Result<i32> {
-        let mut context = self.guest_context.lock();
-        if context.is_running() {
-            return_errno_with_message!(Errno::EBUSY, "cannot set MSRs while vCPU is running");
+        {
+            let context = self.guest_context.lock();
+            if context.is_running() {
+                return_errno_with_message!(Errno::EBUSY, "cannot set MSRs while vCPU is running");
+            }
         }
 
         let mut handled_count = 0;
         for entry in entries {
-            if !context.write_msr(entry.index, entry.data) {
-                break;
+            if kvmclock::is_kvmclock_msr(entry.index)
+                && self.write_kvmclock_msr(entry.index, entry.data)?
+            {
+                handled_count += 1;
+                continue;
             }
+            if self.write_tsc_deadline_msr(entry.index, entry.data) {
+                handled_count += 1;
+                continue;
+            }
+
+            let mut context = self.guest_context.lock();
+            context.write_msr(entry.index, entry.data);
 
             handled_count += 1;
         }
 
         Ok(handled_count)
+    }
+
+    pub(super) fn read_kvmclock_msr(&self, index: u32) -> Option<u64> {
+        self.kvmclock.lock().read_msr(index)
+    }
+
+    pub(super) fn write_kvmclock_msr(&self, index: u32, value: u64) -> Result<bool> {
+        if !kvmclock::is_kvmclock_msr(index) {
+            return Ok(false);
+        }
+        let vm = self.vm()?;
+        let guest_tsc = self.guest_context.lock().guest_tsc();
+        self.kvmclock
+            .lock()
+            .write_msr(index, value, vm.guest_mem(), guest_tsc)
+    }
+
+    pub(super) fn read_tsc_deadline_msr(&self, index: u32) -> Option<u64> {
+        (index == IA32_TSC_DEADLINE).then(|| self.lapic.lock().read_tsc_deadline_msr())
+    }
+
+    pub(super) fn write_tsc_deadline_msr(&self, index: u32, value: u64) -> bool {
+        if index != IA32_TSC_DEADLINE {
+            return false;
+        }
+
+        self.lapic.lock().write_tsc_deadline_msr(value);
+        true
+    }
+
+    pub fn get_tsc_khz(&self) -> Result<i32> {
+        Ok(i32::try_from(current_tsc_khz()?)?)
+    }
+
+    pub fn set_tsc_khz(&self, khz: u64) -> Result<()> {
+        if khz == current_tsc_khz()? {
+            return Ok(());
+        }
+
+        return_errno_with_message!(Errno::EINVAL, "TSC frequency scaling is not supported");
     }
 
     pub fn get_lapic(&self) -> Result<LapicState> {
@@ -232,8 +292,24 @@ impl Vcpu {
         Ok(())
     }
 
+    pub fn get_mp_state(&self) -> Result<MpState> {
+        // This is KVM-ABI compatibility state. `SET_MP_STATE` currently does
+        // not mutate OSTD's vCPU run state, but SIPI delivery updates it so
+        // userspace can still observe AP startup progress.
+        Ok(*self.mp_state.lock())
+    }
+
+    pub fn set_mp_state(&self, state: MpState) -> Result<()> {
+        // See `get_mp_state`.
+        *self.mp_state.lock() = state;
+        Ok(())
+    }
+
     pub fn receive_sipi(&self, vector: u8) {
         self.guest_context.lock().receive_sipi(vector);
+        *self.mp_state.lock() = MpState {
+            mp_state: KVM_MP_STATE_RUNNABLE,
+        };
     }
 
     pub(super) fn wait_for_hlt_wakeup(&self) -> bool {
@@ -244,13 +320,8 @@ impl Vcpu {
         };
         let start_tsc = read_tsc();
         loop {
-            if let Some(tsc_deadline) = self.lapic.lock().timer.deadline_tsc
-                && self.guest_context().guest_tsc() >= tsc_deadline
-            {
-                return true;
-            }
-
-            // TODO: decide timer expire in deadline mode
+            let guest_tsc = self.guest_context().guest_tsc();
+            self.lapic.lock().check_deadline(guest_tsc);
 
             if self.lapic.lock().check_pending_interrupt().is_some() {
                 return true;
@@ -264,6 +335,24 @@ impl Vcpu {
             core::hint::spin_loop();
         }
     }
+}
+
+fn initial_mp_state(id: u32) -> MpState {
+    MpState {
+        mp_state: if id == 0 {
+            KVM_MP_STATE_RUNNABLE
+        } else {
+            KVM_MP_STATE_UNINITIALIZED
+        },
+    }
+}
+
+fn current_tsc_khz() -> Result<u64> {
+    let khz = ostd::arch::tsc_freq() / 1_000;
+    if khz == 0 {
+        return_errno_with_message!(Errno::EINVAL, "TSC frequency is not available");
+    }
+    Ok(khz)
 }
 
 fn kvm_regs_from_arch(regs: ArchVcpuRegs) -> VcpuRegs {

@@ -1,4 +1,8 @@
-use super::super::emulate::{cpuid::emulate_cpuid, cr::emulate_cr_access, msr::emulate_msrrw};
+use super::super::emulate::{
+    cpuid::emulate_cpuid,
+    cr::emulate_cr_access,
+    msr::{emulate_msrrw, needs_kernel_msr_handler},
+};
 use crate::{
     Error,
     arch::vm::{
@@ -26,11 +30,11 @@ pub fn vmexit_handler(
 
     match VmxExitReason::try_from(exit_info.exit_reason) {
         Ok(VmxExitReason::EXTERNAL_INTERRUPT) => {
-            // RustShyper intentionally leaves "acknowledge interrupt on exit"
+            // Hypervisor intentionally leaves "acknowledge interrupt on exit"
             // disabled in the VMCS. That keeps the host interrupt pending across the
             // VM-exit, so once the IRQ-disable guard around the VM-exit critical
             // section is released, Asterinas can receive and process the interrupt via
-            // its normal trap/IRQ path without any explicit handoff from RustShyper.
+            // its normal trap/IRQ path without any explicit handoff from Hypervisor.
             Ok(None)
         }
         Ok(VmxExitReason::INTERRUPT_WINDOW) => {
@@ -48,11 +52,17 @@ pub fn vmexit_handler(
             Ok(None)
         }
         Ok(VmxExitReason::MSR_READ) => {
+            if needs_kernel_msr_handler(context) {
+                return Ok(Some(GuestExitInfo::from(*exit_info)));
+            }
             emulate_msrrw(context, false)?;
             advance_guest_rip(context)?;
             Ok(None)
         }
         Ok(VmxExitReason::MSR_WRITE) => {
+            if needs_kernel_msr_handler(context) {
+                return Ok(Some(GuestExitInfo::from(*exit_info)));
+            }
             emulate_msrrw(context, true)?;
             advance_guest_rip(context)?;
             Ok(None)
@@ -118,19 +128,19 @@ fn log_vmentry_guest_state(exit_info: &VmxExitInfo) {
     let exit_reason_name = VmxExitReason::try_from(exit_info.exit_reason).ok();
 
     error!(
-        "rustshyper: VM-entry failure: exit_reason={:#x} ({:?}), vm_instruction_error={:?}",
+        "hypervisor: VM-entry failure: exit_reason={:#x} ({:?}), vm_instruction_error={:?}",
         exit_info.exit_reason, exit_reason_name, vm_instruction_error
     );
     error!(
-        "rustshyper: entry rip={:#x}, rsp={:?}, rflags={:?}, qualification={:#x}",
+        "hypervisor: entry rip={:#x}, rsp={:?}, rflags={:?}, qualification={:#x}",
         exit_info.guest_rip, guest_rsp, guest_rflags, exit_info.exit_qualification
     );
     error!(
-        "rustshyper: control cr0={:?}, cr3={:?}, cr4={:?}, efer={:?}",
+        "hypervisor: control cr0={:?}, cr3={:?}, cr4={:?}, efer={:?}",
         guest_cr0, guest_cr3, guest_cr4, guest_efer
     );
     error!(
-        "rustshyper: segments cs={:?}/{:?}, ss={:?}/{:?}, tr={:?}/{:?}, ldtr={:?}/{:?}",
+        "hypervisor: segments cs={:?}/{:?}, ss={:?}/{:?}, tr={:?}/{:?}, ldtr={:?}/{:?}",
         cs_selector, cs_ar, ss_selector, ss_ar, tr_selector, tr_ar, ldtr_selector, ldtr_ar
     );
 }

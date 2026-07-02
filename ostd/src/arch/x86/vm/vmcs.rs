@@ -375,7 +375,7 @@ impl Drop for Vmcs {
         }
 
         if let Err(err) = vmclear(self.vmcs_phys() as u64) {
-            warn!("rustshyper: failed to clear VMCS during drop: {:?}", err);
+            warn!("hypervisor: failed to clear VMCS during drop: {:?}", err);
         }
     }
 }

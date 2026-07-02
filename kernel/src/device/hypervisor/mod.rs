@@ -1,6 +1,7 @@
 mod apic;
 mod device;
 mod ioctl;
+mod kvmclock;
 mod vcpu;
 mod vcpu_file;
 mod vm;

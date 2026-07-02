@@ -22,7 +22,7 @@ pub(crate) fn emulate_cr_access(context: &Mutex<GuestContext>) -> Result<()> {
                 2 => context.arch_mut().set_cr2(value),
                 3 => context.arch_mut().set_cr3(value),
                 4 => context.arch_mut().write_cr4(value),
-                other => warn!("rustshyper: ignoring guest write to CR{}", other),
+                other => warn!("hypervisor: ignoring guest write to CR{}", other),
             }
         }
         // read
@@ -33,14 +33,14 @@ pub(crate) fn emulate_cr_access(context: &Mutex<GuestContext>) -> Result<()> {
                 3 => context.arch().cr3(),
                 4 => context.arch().cr4(),
                 other => {
-                    warn!("rustshyper: ignoring guest read from CR{}", other);
+                    warn!("hypervisor: ignoring guest read from CR{}", other);
                     0
                 }
             };
             context.arch_mut().set_gpr(gpr_index, 8, value);
         }
         other => {
-            warn!("rustshyper: unsupported CR access type {}", other);
+            warn!("hypervisor: unsupported CR access type {}", other);
         }
     }
 

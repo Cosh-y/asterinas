@@ -12,6 +12,7 @@ use ostd::{
 use super::{
     apic::emulate_apic_mmio,
     ioctl::*,
+    kvmclock,
     vcpu::{PendingMmioOperation, PendingOperation, PendingPioOperation, PioDirection},
     vm::Vm,
 };
@@ -28,6 +29,14 @@ use crate::{
 // Periodically return timer exits so a busy vCPU cannot monopolize scheduling.
 const PREEMPTION_TIMER_USER_EXIT_INTERVAL: u64 = 16;
 const GPR_RAX: u8 = 0;
+const GPR_RCX: u8 = 2;
+const GPR_RDX: u8 = 3;
+
+#[derive(Clone, Copy, Debug)]
+enum MsrAccess {
+    Read,
+    Write,
+}
 
 pub(super) use super::vcpu::Vcpu;
 
@@ -36,16 +45,37 @@ pub struct VcpuFile {
     vm: Arc<Vm>,
     vcpu: Arc<Vcpu>,
     pseudo_path: Path,
+    compat_state: Mutex<VcpuCompatState>,
+}
+
+// Compatibility state for KVM ioctls that are accepted but not wired into
+// guest execution yet. QEMU copies these GET results back into CPUX86State,
+// so keep the last SET value instead of returning a fresh default state.
+struct VcpuCompatState {
+    debug_regs: DebugRegs,
+    vcpu_events: VcpuEvents,
+    xsave: XsaveState,
+}
+
+impl Default for VcpuCompatState {
+    fn default() -> Self {
+        Self {
+            debug_regs: default_debug_regs(),
+            vcpu_events: VcpuEvents::default(),
+            xsave: XsaveState::default(),
+        }
+    }
 }
 
 impl VcpuFile {
     /// Creates a new VCPU file
     pub fn new(vm: Arc<Vm>, vcpu: Arc<Vcpu>) -> Self {
-        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[rustshyper-vcpu]".to_string());
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[hypervisor-vcpu]".to_string());
         Self {
             vm,
             vcpu,
             pseudo_path,
+            compat_state: Mutex::new(VcpuCompatState::default()),
         }
     }
 }
@@ -102,7 +132,7 @@ impl FileLike for VcpuFile {
             }
             cmd @ SetFpu => {
                 let _fpu = cmd.read()?;
-                // TODO: Install FPU/XMM state into the guest context.
+                // No-op compatibility API; FPU/XMM state is not installed yet.
                 Ok(0)
             }
             cmd @ GetLapic => {
@@ -121,10 +151,79 @@ impl FileLike for VcpuFile {
                 self.vcpu.set_cpuid_entries(entries)?;
                 Ok(0)
             }
+            cmd @ TprAccessReporting => {
+                let ctl = cmd.read()?;
+                // No-op compatibility API; report the accepted control back.
+                cmd.write(&ctl)?;
+                Ok(0)
+            }
+            cmd @ SetVapicAddr => {
+                let _addr = cmd.read()?;
+                // No-op compatibility API; VAPIC access-page acceleration is not modeled yet.
+                Ok(0)
+            }
+            cmd @ GetMpState => {
+                let state = self.vcpu.get_mp_state()?;
+                cmd.write(&state)?;
+                Ok(0)
+            }
+            cmd @ SetMpState => {
+                let state = cmd.read()?;
+                self.vcpu.set_mp_state(state)?;
+                Ok(0)
+            }
+            cmd @ X86SetupMce => {
+                let _mcg_cap = cmd.read()?;
+                // No-op compatibility API; machine-check state is not modeled yet.
+                Ok(0)
+            }
+            cmd @ GetVcpuEvents => {
+                // No-op compatibility API; return the last accepted value.
+                let events = self.compat_state.lock().vcpu_events;
+                cmd.write(&events)?;
+                Ok(0)
+            }
+            cmd @ SetVcpuEvents => {
+                let events = cmd.read()?;
+                self.compat_state.lock().vcpu_events = events;
+                Ok(0)
+            }
+            cmd @ GetDebugRegs => {
+                // No-op compatibility API; return the last accepted value.
+                let debug_regs = self.compat_state.lock().debug_regs;
+                cmd.write(&debug_regs)?;
+                Ok(0)
+            }
+            cmd @ SetDebugRegs => {
+                let debug_regs = cmd.read()?;
+                self.compat_state.lock().debug_regs = debug_regs;
+                Ok(0)
+            }
+            SetTscKhz => {
+                self.vcpu.set_tsc_khz(raw_ioctl.arg() as u64)?;
+                Ok(0)
+            }
+            GetTscKhz => {
+                self.vcpu.get_tsc_khz()
+            }
+            cmd @ GetXsave => {
+                // No-op compatibility API; return the last accepted value.
+                let xsave = self.compat_state.lock().xsave;
+                cmd.write(&xsave)?;
+                Ok(0)
+            }
+            cmd @ SetXsave => {
+                let xsave = cmd.read()?;
+                self.compat_state.lock().xsave = xsave;
+                Ok(0)
+            }
+            GetStatsFd => {
+                return_errno_with_message!(Errno::ENOTTY, "KVM stats fd is not supported");
+            }
             _ => {
                 let ioctl_nr = raw_ioctl.cmd() & 0xff;
                 error!(
-                    "rustshyper: unimplemented VCPU ioctl command: cmd={:#x}, nr={:#x}",
+                    "hypervisor: unimplemented VCPU ioctl command: cmd={:#x}, nr={:#x}",
                     raw_ioctl.cmd(),
                     ioctl_nr
                 );
@@ -142,7 +241,15 @@ impl FileLike for VcpuFile {
     }
 
     fn dump_proc_fdinfo(self: Arc<Self>, _fd_flags: FdFlags) -> Box<dyn core::fmt::Display> {
-        Box::new("rustshyper_vcpu\n")
+        Box::new("hypervisor_vcpu\n")
+    }
+}
+
+fn default_debug_regs() -> DebugRegs {
+    DebugRegs {
+        dr6: 0xffff0ff0,
+        dr7: 0x400,
+        ..DebugRegs::default()
     }
 }
 
@@ -220,7 +327,7 @@ impl VcpuFile {
     fn ioctl_run(&self) -> Result<i32> {
         self.complete_pending_operation()?;
         if self.immediate_exit()? {
-            return Ok(0);
+            return_errno_with_message!(Errno::EINTR, "KVM_RUN interrupted by immediate_exit");
         }
         self.vcpu.clear_run_output()?;
 
@@ -232,7 +339,7 @@ impl VcpuFile {
             let exit_info = match guest_mode.execute(self.vm.guest_mem()) {
                 Ok(exit_info) => exit_info,
                 Err(err) => {
-                    error!("rustshyper: GuestMode::execute failed: {:?}", err);
+                    error!("hypervisor: GuestMode::execute failed: {:?}", err);
                     return Err(err.into());
                 }
             };
@@ -243,7 +350,7 @@ impl VcpuFile {
                         emulate_apic_mmio(self.vcpu.clone(), exit_info.guest_phys_addr as u64)
                             .inspect_err(|err| {
                                 error!(
-                                    "rustshyper: APIC MMIO handling failed: reason={:#x}, len={}, \
+                                    "hypervisor: APIC MMIO handling failed: reason={:#x}, len={}, \
                              rip={:#x}, gpa={:#x}, qualification={:#x}, err={:?}",
                                     exit_info.exit_reason,
                                     exit_info.instruction_len,
@@ -264,7 +371,10 @@ impl VcpuFile {
                     consecutive_preemption_timer_exits =
                         consecutive_preemption_timer_exits.saturating_add(1);
                     if consecutive_preemption_timer_exits >= PREEMPTION_TIMER_USER_EXIT_INTERVAL {
-                        Some(exit_info)
+                        return_errno_with_message!(
+                            Errno::EINTR,
+                            "KVM_RUN interrupted by preemption timer"
+                        );
                     } else {
                         None
                     }
@@ -286,6 +396,22 @@ impl VcpuFile {
                 Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
                     consecutive_preemption_timer_exits = 0;
                     None
+                }
+                Ok(VmxExitReason::MSR_READ) => {
+                    consecutive_preemption_timer_exits = 0;
+                    if self.emulate_kernel_msr(&exit_info, MsrAccess::Read)? {
+                        None
+                    } else {
+                        Some(exit_info)
+                    }
+                }
+                Ok(VmxExitReason::MSR_WRITE) => {
+                    consecutive_preemption_timer_exits = 0;
+                    if self.emulate_kernel_msr(&exit_info, MsrAccess::Write)? {
+                        None
+                    } else {
+                        Some(exit_info)
+                    }
                 }
                 Ok(_) => Some(exit_info),
                 Err(_) => Some(exit_info),
@@ -349,6 +475,45 @@ impl VcpuFile {
         Ok(())
     }
 
+    fn emulate_kernel_msr(&self, exit_info: &GuestExitInfo, access: MsrAccess) -> Result<bool> {
+        let (msr_index, msr_value) = {
+            let context = self.vcpu.guest_context();
+            let msr_index = context.gpr(GPR_RCX) as u32;
+            let msr_value =
+                (context.gpr(GPR_RAX) as u32 as u64) | ((context.gpr(GPR_RDX) as u32 as u64) << 32);
+            (msr_index, msr_value)
+        };
+        if !kvmclock::is_kvmclock_msr(msr_index) && msr_index != IA32_TSC_DEADLINE {
+            return Ok(false);
+        }
+
+        match access {
+            MsrAccess::Read => {
+                let value = self
+                    .vcpu
+                    .read_kvmclock_msr(msr_index)
+                    .or_else(|| self.vcpu.read_tsc_deadline_msr(msr_index))
+                    .unwrap_or(0);
+                let mut context = self.vcpu.guest_context();
+                context.set_gpr(GPR_RAX, 8, value as u32 as u64);
+                context.set_gpr(GPR_RDX, 8, value >> 32);
+                context.advance_rip(u64::from(exit_info.instruction_len));
+            }
+            MsrAccess::Write => {
+                let handled = self.vcpu.write_kvmclock_msr(msr_index, msr_value)?
+                    || self.vcpu.write_tsc_deadline_msr(msr_index, msr_value);
+                if !handled {
+                    return Ok(false);
+                }
+                self.vcpu
+                    .guest_context()
+                    .advance_rip(u64::from(exit_info.instruction_len));
+            }
+        }
+
+        Ok(true)
+    }
+
     fn immediate_exit(&self) -> Result<bool> {
         let immediate_exit = self
             .vcpu
@@ -364,7 +529,6 @@ impl VcpuFile {
             Ok(VmxExitReason::IO_INSTRUCTION) => self.write_io_exit(exit_info),
             Ok(VmxExitReason::EPT_VIOLATION) => self.write_mmio_exit(exit_info),
             Ok(VmxExitReason::HLT) => self.write_simple_exit(KVM_EXIT_HLT),
-            Ok(VmxExitReason::PREEMPTION_TIMER) => self.write_simple_exit(KVM_EXIT_INTR),
             _ => self.write_internal_error_exit(exit_info),
         }
     }
@@ -463,7 +627,7 @@ impl VcpuFile {
 
     fn write_internal_error_exit(&self, exit_info: GuestExitInfo) -> Result<()> {
         warn!(
-            "rustshyper: unsupported VM exit for KVM_RUN: reason={:#x}, len={}, rip={:#x}, \
+            "hypervisor: unsupported VM exit for KVM_RUN: reason={:#x}, len={}, rip={:#x}, \
              gpa={:#x}, qualification={:#x}",
             exit_info.exit_reason,
             exit_info.instruction_len,

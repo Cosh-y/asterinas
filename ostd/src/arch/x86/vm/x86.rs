@@ -16,7 +16,7 @@ struct TssDescriptor64 {
 
 pub(crate) fn write_cr2_raw(value: u64) {
     // SAFETY: CR2 is the page-fault linear-address register. Updating it does
-    // not change paging, privilege, or memory mappings; RustShyper uses this to
+    // not change paging, privilege, or memory mappings; Hypervisor uses this to
     // swap host and guest CR2 values around VM entry/exit.
     unsafe {
         core::arch::asm!(

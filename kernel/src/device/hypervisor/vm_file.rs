@@ -3,19 +3,19 @@
 //! VM file descriptor implementation
 
 use ostd::{
-    mm::{CachePolicy, Gpaddr, PageFlags, PageProperty, vm_space::VmQueriedItem},
+    mm::{vm_space::VmQueriedItem, CachePolicy, Gpaddr, PageFlags, PageProperty, VmIo},
     task::Task,
 };
 
 use super::{ioctl::*, vcpu_file::VcpuFile, vm::Vm};
 use crate::{
     fs::{
-        file::{AccessMode, FileLike, file_table::FdFlags},
+        file::{file_table::FdFlags, AccessMode, FileLike},
         pseudofs::AnonInodeFs,
         vfs::path::Path,
     },
     prelude::*,
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::{dispatch_ioctl, RawIoctl},
     vm::vmar::{PageFaultInfo, Vmar},
 };
 
@@ -32,7 +32,7 @@ pub struct VmFile {
 impl VmFile {
     /// Creates a new VM file
     pub fn new(vm: Arc<Vm>) -> Self {
-        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[rustshyper-vm]".to_string());
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[hypervisor-vm]".to_string());
         Self { vm, pseudo_path }
     }
 
@@ -146,6 +146,9 @@ impl FileLike for VmFile {
 
                 Ok(vcpu_fd.into())
             }
+            SetNrMmuPages => {
+                Ok(0)
+            }
             cmd @ SetUserMemoryRegion => {
                 let region: UserMemoryRegion = cmd.read()?;
                 self.set_user_memory_region(region)?;
@@ -155,6 +158,10 @@ impl FileLike for VmFile {
                 // TODO:
                 Ok(0)
             }
+            cmd @ SetIdentityMapAddr => {
+                // KVM quirk api.
+                Ok(0)
+            }
             CreateIrqchip => {
                 self.vm.create_irqchip()?;
                 Ok(0)
@@ -162,6 +169,38 @@ impl FileLike for VmFile {
             cmd @ IrqLine => {
                 let irq_level = cmd.read()?;
                 self.vm.set_irq_line(irq_level)?;
+                Ok(0)
+            }
+            cmd @ GetIrqchip => {
+                let irqchip = cmd.read()?;
+                match irqchip.chip_id {
+                    KVM_IRQCHIP_PIC_MASTER | KVM_IRQCHIP_PIC_SLAVE | KVM_IRQCHIP_IOAPIC => {
+                        let irqchip = IrqChip {
+                            chip_id: irqchip.chip_id,
+                            ..IrqChip::default()
+                        };
+                        cmd.write(&irqchip)?;
+                        Ok(0)
+                    }
+                    _ => {
+                        return_errno_with_message!(Errno::EINVAL, "unknown IRQ chip id");
+                    }
+                }
+            }
+            SetIrqchip => {
+                let irqchip = read_irqchip(raw_ioctl.arg())?;
+                match irqchip.chip_id {
+                    KVM_IRQCHIP_PIC_MASTER | KVM_IRQCHIP_PIC_SLAVE | KVM_IRQCHIP_IOAPIC => Ok(0),
+                    _ => {
+                        return_errno_with_message!(Errno::EINVAL, "unknown IRQ chip id");
+                    }
+                }
+            }
+            cmd @ IrqLineStatus => {
+                let mut irq_level = cmd.read()?;
+                let delivered = self.vm.set_irq_line(irq_level)?;
+                irq_level.irq = if delivered { 1 } else { 0 };
+                cmd.write(&irq_level)?;
                 Ok(0)
             }
             cmd @ RegisterCoalescedMmio => {
@@ -180,14 +219,45 @@ impl FileLike for VmFile {
                 self.vm.set_gsi_routing(&entries)?;
                 Ok(0)
             }
+            cmd @ IrqFd => {
+                let _irqfd = cmd.read()?;
+                Ok(0)
+            }
             cmd @ CreatePit2 => {
                 let _pit_config = cmd.read()?;
                 Ok(0)
             }
+            cmd @ IoEventFd => {
+                let _ioeventfd = cmd.read()?;
+                // TODO:
+                Ok(0)
+            }
+            cmd @ SetClock => {
+                let clock = cmd.read()?;
+                self.vm.set_clock(clock);
+                Ok(0)
+            }
+            cmd @ GetClock => {
+                let clock = self.vm.get_clock();
+                cmd.write(&clock)?;
+                Ok(0)
+            }
+            cmd @ SignalMsi => {
+                let _msi = cmd.read()?;
+                Ok(1)
+            }
+            cmd @ EnableCap => {
+                let cap = cmd.read()?;
+                self.vm.enable_cap(cap)?;
+                Ok(0)
+            }
+            GetStatsFd => {
+                return_errno_with_message!(Errno::ENOTTY, "KVM stats fd is not supported");
+            }
             _ => {
                 let ioctl_nr = raw_ioctl.cmd() & 0xff;
                 error!(
-                    "rustshyper: unimplemented VM ioctl command: cmd={:#x}, nr={:#x}",
+                    "hypervisor: unimplemented VM ioctl command: cmd={:#x}, nr={:#x}",
                     raw_ioctl.cmd(),
                     ioctl_nr
                 );
@@ -229,18 +299,25 @@ fn read_irq_routing_entries(routing: IrqRouting, arg: usize) -> Result<Vec<IrqRo
     Ok(entries)
 }
 
+fn read_irqchip(arg: usize) -> Result<IrqChip> {
+    let current = Task::current().unwrap();
+    let thread_local = current.as_thread_local().unwrap();
+    let user_space = CurrentUserSpace::new(thread_local);
+    Ok(user_space.read_val(arg)?)
+}
+
 fn current_vmar() -> Result<Arc<Vmar>> {
     let current = match Task::current() {
         Some(current) => current,
         None => {
-            error!("rustshyper: no current task found for rustshyper ioctl");
+            error!("hypervisor: no current task found for hypervisor ioctl");
             return Err(Error::new(Errno::ESRCH));
         }
     };
     let thread_local = match current.as_thread_local() {
         Some(thread_local) => thread_local,
         None => {
-            error!("rustshyper: current task has no ThreadLocal for rustshyper ioctl");
+            error!("hypervisor: current task has no ThreadLocal for hypervisor ioctl");
             return Err(Error::new(Errno::EFAULT));
         }
     };
@@ -248,7 +325,7 @@ fn current_vmar() -> Result<Arc<Vmar>> {
     match vmar.as_ref() {
         Some(vmar) => Ok(vmar.clone_arc()),
         None => {
-            error!("rustshyper: current thread has no active VMAR for rustshyper ioctl");
+            error!("hypervisor: current thread has no active VMAR for hypervisor ioctl");
             Err(Error::new(Errno::EFAULT))
         }
     }

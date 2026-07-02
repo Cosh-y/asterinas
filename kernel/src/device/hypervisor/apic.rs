@@ -23,6 +23,7 @@ const APIC_LINT_MASK: u32 = APIC_LVT_VECTOR_MASK
     | APIC_LVT_MASKED;
 const APIC_TIMER_MODE_ONESHOT: u32 = 0b00;
 const APIC_TIMER_MODE_PERIODIC: u32 = 0b01;
+const APIC_TIMER_MODE_TSC_DEADLINE: u32 = 0b10;
 
 /// Local APIC state.
 #[derive(Debug)]
@@ -72,10 +73,11 @@ impl Default for Lapic {
 pub struct ApicTimer {
     pub lvt_timer: u32, // LVT(Local Vector Table) Timer Register
     /// divide configuration register
-    /// timer freq = tsc freq / divide
+    /// timer count rate = virtual crystal frequency / divide.
     pub divide: u32,
     pub initial_count: u32,
     pub current_count: u32,
+    pub tsc_deadline_msr: u64,
     pub deadline_tsc: Option<u64>,
 }
 
@@ -86,7 +88,12 @@ impl ApicTimer {
     }
 
     pub fn count_to_tsc_cycles(&self, count: u64) -> u64 {
-        (count << self.divide_shift()) * (tsc_freq().saturating_add(500_000)) / 1_000_000
+        let divide = 1_u64 << self.divide_shift();
+        let cycles = u128::from(count)
+            .saturating_mul(u128::from(divide))
+            .saturating_mul(u128::from(tsc_freq()))
+            / u128::from(VIRTUAL_TSC_CRYSTAL_HZ);
+        cycles.min(u128::from(u64::MAX)) as u64
     }
 
     fn is_masked(&self) -> bool {
@@ -95,6 +102,29 @@ impl ApicTimer {
 
     fn mode(&self) -> u32 {
         (self.lvt_timer >> 17) & 0b11
+    }
+
+    fn write_lvt_timer(&mut self, value: u32) {
+        let old_mode = self.mode();
+        self.lvt_timer = value;
+        let new_mode = self.mode();
+
+        if new_mode == APIC_TIMER_MODE_TSC_DEADLINE {
+            self.deadline_tsc = (self.tsc_deadline_msr != 0).then_some(self.tsc_deadline_msr);
+        } else if old_mode == APIC_TIMER_MODE_TSC_DEADLINE {
+            self.deadline_tsc = None;
+        }
+    }
+
+    pub fn read_tsc_deadline_msr(&self) -> u64 {
+        self.tsc_deadline_msr
+    }
+
+    pub fn write_tsc_deadline_msr(&mut self, value: u64) {
+        self.tsc_deadline_msr = value;
+        if self.mode() == APIC_TIMER_MODE_TSC_DEADLINE {
+            self.deadline_tsc = (value != 0).then_some(value);
+        }
     }
 
     fn vector(&self) -> u8 {
@@ -114,6 +144,11 @@ impl ApicTimer {
     fn arm(&mut self, current_tsc: u64, initial_count: u64) {
         self.initial_count = initial_count as u32;
         self.current_count = self.initial_count;
+        if self.mode() == APIC_TIMER_MODE_TSC_DEADLINE {
+            self.deadline_tsc = (self.tsc_deadline_msr != 0).then_some(self.tsc_deadline_msr);
+            return;
+        }
+
         self.deadline_tsc = self
             .period_tsc_cycles()
             .map(|period| current_tsc.saturating_add(period));
@@ -125,6 +160,10 @@ impl ApicTimer {
     }
 
     fn current_count(&self, current_tsc: u64) -> u64 {
+        if self.mode() == APIC_TIMER_MODE_TSC_DEADLINE {
+            return 0;
+        }
+
         let Some(deadline_tsc) = self.deadline_tsc else {
             return 0;
         };
@@ -239,7 +278,8 @@ impl Lapic {
         self.ldr = read_apic_reg(&state.regs, XLAPIC_RW_LDR) & 0xFF00_0000;
         self.lvt_lint0 = sanitize_lvt_lint(read_apic_reg(&state.regs, XLAPIC_RW_LVT_LINT0));
         self.lvt_lint1 = sanitize_lvt_lint(read_apic_reg(&state.regs, XLAPIC_RW_LVT_LINT1));
-        self.timer.lvt_timer = read_apic_reg(&state.regs, XLAPIC_RW_LVT_TIMER);
+        self.timer
+            .write_lvt_timer(read_apic_reg(&state.regs, XLAPIC_RW_LVT_TIMER));
         self.timer.initial_count = read_apic_reg(&state.regs, XLAPIC_RW_TIMER_INIT);
         self.timer.current_count = read_apic_reg(&state.regs, XLAPIC_RO_TIMER_CURR);
         self.timer.divide = read_apic_reg(&state.regs, XLAPIC_RW_TIMER_DIVI);
@@ -262,6 +302,14 @@ impl Lapic {
         }
 
         self.update_ppr();
+    }
+
+    pub fn read_tsc_deadline_msr(&self) -> u64 {
+        self.timer.read_tsc_deadline_msr()
+    }
+
+    pub fn write_tsc_deadline_msr(&mut self, value: u64) {
+        self.timer.write_tsc_deadline_msr(value);
     }
 
     pub fn add_pending_interrupt(&mut self, vec: u8) {
@@ -325,7 +373,10 @@ fn write_apic_reg(regs: &mut [u8], offset: u64, value: u32) {
 }
 
 use ostd::{
-    arch::{tsc_freq, vm::GuestContext},
+    arch::{
+        tsc_freq,
+        vm::{GuestContext, VIRTUAL_TSC_CRYSTAL_HZ},
+    },
     mm::Gpaddr,
     vm::{GuestInterruptPort, GuestPhysMemSpace, GuestTimerPort},
 };
@@ -357,7 +408,6 @@ impl GuestInterruptPort for Lapic {
 
 impl GuestTimerPort for Lapic {
     fn check_deadline(&mut self, current_tsc: u64) -> Option<u64> {
-        // TODO: The handling of deadline mode, which should be similar to oneshot mode.
         let deadline_tsc = self.timer.deadline_tsc?;
         if current_tsc < deadline_tsc {
             return (!self.timer.is_masked()).then_some(deadline_tsc);
@@ -383,7 +433,7 @@ impl GuestTimerPort for Lapic {
                     .saturating_add(1);
                 Some(deadline_tsc.saturating_add(period.saturating_mul(elapsed_periods)))
             }
-            APIC_TIMER_MODE_ONESHOT => None,
+            APIC_TIMER_MODE_ONESHOT | APIC_TIMER_MODE_TSC_DEADLINE => None,
             _ => None,
         };
         self.timer.deadline_tsc = next_deadline;
@@ -843,7 +893,7 @@ pub fn emulate_lapic_write(vcpu: Arc<Vcpu>, offset: u64, value: u64) -> Option<L
             }
         }
         XLAPIC_RW_LVT_TIMER => {
-            lapic.timer.lvt_timer = value as u32;
+            lapic.timer.write_lvt_timer(value as u32);
         }
         XLAPIC_RW_TIMER_INIT => {
             let current_tsc = vcpu.guest_context().guest_tsc();

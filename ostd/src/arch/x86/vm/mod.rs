@@ -27,7 +27,7 @@ mod tests;
 
 pub use self::{
     context::GuestContext,
-    cpuid::{GuestCpuidEntry, default_cpuid_entries},
+    cpuid::{GuestCpuidEntry, VIRTUAL_TSC_CRYSTAL_HZ, default_cpuid_entries},
     exit::GuestExitInfo,
     types::{VcpuDtable, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::VmxExitReason,
