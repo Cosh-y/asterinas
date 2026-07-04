@@ -1,6 +1,4 @@
-use ostd::vm::GuestPhysMemSpace;
-
-use super::vm::{monotonic_nanos, realtime_nanos};
+use super::vm::{Vm, monotonic_nanos, realtime_nanos};
 use crate::prelude::*;
 
 pub(super) const MSR_KVM_WALL_CLOCK: u32 = 0x11;
@@ -68,7 +66,7 @@ impl KvmClock {
         &mut self,
         index: u32,
         value: u64,
-        guest_mem: &GuestPhysMemSpace,
+        vm: &Vm,
         guest_tsc: u64,
     ) -> Result<bool> {
         let Some(msr) = KvmClockMsr::from_index(index) else {
@@ -79,12 +77,12 @@ impl KvmClock {
         match msr {
             KvmClockMsr::OldWallClock | KvmClockMsr::NewWallClock => {
                 if value != 0 {
-                    self.write_wall_clock(guest_mem, value)?;
+                    self.write_wall_clock(vm, value)?;
                 }
             }
             KvmClockMsr::OldSystemTime | KvmClockMsr::NewSystemTime => {
                 if value & KVM_MSR_ENABLED != 0 {
-                    self.write_system_time(guest_mem, value & !KVM_MSR_ENABLED, guest_tsc)?;
+                    self.write_system_time(vm, value & !KVM_MSR_ENABLED, guest_tsc)?;
                 }
             }
         }
@@ -110,16 +108,11 @@ impl KvmClock {
         }
     }
 
-    fn write_system_time(
-        &mut self,
-        guest_mem: &GuestPhysMemSpace,
-        gpa: u64,
-        guest_tsc: u64,
-    ) -> Result<()> {
+    fn write_system_time(&mut self, vm: &Vm, gpa: u64, guest_tsc: u64) -> Result<()> {
         let (mul, shift) = tsc_to_system_scale()?;
         let odd_version = next_odd_version(self.system_time_version);
         let even_version = next_even_version(odd_version);
-        write_guest_val(guest_mem, gpa, &odd_version)?;
+        vm.write_guest_val(gpa as usize, &odd_version)?;
 
         let time_info = PvclockVcpuTimeInfo {
             version: even_version,
@@ -131,12 +124,12 @@ impl KvmClock {
             flags: PVCLOCK_FLAGS_NONE,
             pad: [0; 2],
         };
-        write_guest_val(guest_mem, gpa, &time_info)?;
+        vm.write_guest_val(gpa as usize, &time_info)?;
         self.system_time_version = even_version;
         Ok(())
     }
 
-    fn write_wall_clock(&mut self, guest_mem: &GuestPhysMemSpace, gpa: u64) -> Result<()> {
+    fn write_wall_clock(&mut self, vm: &Vm, gpa: u64) -> Result<()> {
         let monotonic = monotonic_nanos();
         let wall_clock_nanos = realtime_nanos()?.saturating_sub(monotonic);
         let sec = (wall_clock_nanos / NSEC_PER_SEC).min(u64::from(u32::MAX)) as u32;
@@ -144,14 +137,14 @@ impl KvmClock {
 
         let odd_version = next_odd_version(self.wall_clock_version);
         let even_version = next_even_version(odd_version);
-        write_guest_val(guest_mem, gpa, &odd_version)?;
+        vm.write_guest_val(gpa as usize, &odd_version)?;
 
         let wall_clock = PvclockWallClock {
             version: even_version,
             sec,
             nsec,
         };
-        write_guest_val(guest_mem, gpa, &wall_clock)?;
+        vm.write_guest_val(gpa as usize, &wall_clock)?;
         self.wall_clock_version = even_version;
         Ok(())
     }
@@ -175,13 +168,6 @@ pub(super) fn is_kvmclock_msr(index: u32) -> bool {
 
 pub(super) fn msr_indices() -> &'static [u32] {
     &KVM_CLOCK_MSR_INDEXES
-}
-
-fn write_guest_val<T: Pod>(guest_mem: &GuestPhysMemSpace, gpa: u64, value: &T) -> Result<()> {
-    let gpa = usize::try_from(gpa)?;
-    let mut writer = guest_mem.writer(gpa, size_of::<T>())?;
-    writer.write_val(value)?;
-    Ok(())
 }
 
 fn tsc_to_system_scale() -> Result<(u32, i8)> {

@@ -378,7 +378,7 @@ use ostd::{
         vm::{GuestContext, VIRTUAL_TSC_CRYSTAL_HZ},
     },
     mm::Gpaddr,
-    vm::{GuestInterruptPort, GuestPhysMemSpace, GuestTimerPort},
+    vm::{GuestInterruptPort, GuestTimerPort},
 };
 
 impl GuestInterruptPort for Lapic {
@@ -605,7 +605,7 @@ struct MmioInstruction {
     len: usize,
 }
 
-use super::vcpu::Vcpu;
+use super::{vcpu::Vcpu, vm::Vm};
 
 /// Emulate a guest access to APIC MMIO region.
 /// Returns `Ok(true)` if the access is successfully emulated.
@@ -620,12 +620,11 @@ pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool>
     }
 
     let vm_handle = vcpu.vm()?;
-    let guest_mem = vm_handle.guest_mem();
     let mut insn_bytes = [0_u8; MAX_INSN_LENGTH];
     let (guest_rip, guest_rip_gpa) = {
         let context = vcpu.guest_context();
         let guest_rip = context.rip() as usize;
-        let guest_rip_gpa = match translate_gva_to_gpa(&context, guest_mem, guest_rip) {
+        let guest_rip_gpa = match translate_gva_to_gpa(&context, &vm_handle, guest_rip) {
             Ok(gpa) => gpa,
             Err(err) => {
                 error!(
@@ -637,15 +636,12 @@ pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool>
         };
         (guest_rip, guest_rip_gpa)
     };
-    let mut reader = guest_mem.reader(guest_rip_gpa, insn_bytes.len())?;
-    if let Err((err, _)) =
-        reader.read_fallible(&mut VmWriter::from(insn_bytes.as_mut_slice()).to_fallible())
-    {
+    if let Err(err) = vm_handle.read_guest_bytes(guest_rip_gpa, &mut insn_bytes) {
         error!(
             "hypervisor: failed to read APIC MMIO instruction bytes: rip={:#x}, gpa={:#x}, err={:?}",
             guest_rip, guest_rip_gpa, err
         );
-        return Err(err.into());
+        return Err(err);
     }
 
     let Some(insn) = decode_mmio_instruction(&insn_bytes) else {
@@ -670,11 +666,7 @@ pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool>
     Ok(true)
 }
 
-fn translate_gva_to_gpa(
-    context: &GuestContext,
-    guest_mem: &GuestPhysMemSpace,
-    gva: usize,
-) -> core::result::Result<Gpaddr, ostd::Error> {
+fn translate_gva_to_gpa(context: &GuestContext, vm: &Vm, gva: usize) -> Result<Gpaddr> {
     const PTE_PRESENT: u64 = 1 << 0;
     const PTE_HUGE: u64 = 1 << 7;
     const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -687,22 +679,19 @@ fn translate_gva_to_gpa(
         return Ok(gva);
     }
 
-    let read_guest_pte = |gpa: Gpaddr| -> core::result::Result<u64, ostd::Error> {
-        let mut reader = guest_mem.reader(gpa, PTE_SIZE)?;
-        reader.read_val::<u64>()
-    };
+    let read_guest_pte = |gpa: Gpaddr| -> Result<u64> { vm.read_guest_val(gpa) };
     let pte_addr = |entry: u64| -> Gpaddr { (entry & PTE_ADDR_MASK) as Gpaddr };
 
     let cr3 = (sregs.cr3 as Gpaddr) & !0xfff;
     let pml4e_gpa = cr3 + (((gva >> 39) & 0x1ff) * PTE_SIZE);
     let pml4e = read_guest_pte(pml4e_gpa)?;
     if (pml4e & PTE_PRESENT) == 0 {
-        return Err(ostd::Error::PageFault);
+        return Err(Error::new(Errno::EFAULT));
     }
 
     let pdpte = read_guest_pte(pte_addr(pml4e) + (((gva >> 30) & 0x1ff) * PTE_SIZE))?;
     if (pdpte & PTE_PRESENT) == 0 {
-        return Err(ostd::Error::PageFault);
+        return Err(Error::new(Errno::EFAULT));
     }
     if (pdpte & PTE_HUGE) != 0 {
         return Ok(pte_addr(pdpte) | (gva & PAGE_1G_MASK));
@@ -710,7 +699,7 @@ fn translate_gva_to_gpa(
 
     let pde = read_guest_pte(pte_addr(pdpte) + (((gva >> 21) & 0x1ff) * PTE_SIZE))?;
     if (pde & PTE_PRESENT) == 0 {
-        return Err(ostd::Error::PageFault);
+        return Err(Error::new(Errno::EFAULT));
     }
     if (pde & PTE_HUGE) != 0 {
         return Ok(pte_addr(pde) | (gva & PAGE_2M_MASK));
@@ -718,7 +707,7 @@ fn translate_gva_to_gpa(
 
     let pte = read_guest_pte(pte_addr(pde) + (((gva >> 12) & 0x1ff) * PTE_SIZE))?;
     if (pte & PTE_PRESENT) == 0 {
-        return Err(ostd::Error::PageFault);
+        return Err(Error::new(Errno::EFAULT));
     }
 
     Ok(pte_addr(pte) | (gva & 0xfff))

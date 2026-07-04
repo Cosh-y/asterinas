@@ -3,19 +3,19 @@
 //! VM file descriptor implementation
 
 use ostd::{
-    mm::{vm_space::VmQueriedItem, CachePolicy, Gpaddr, PageFlags, PageProperty, VmIo},
+    mm::{CachePolicy, Gpaddr, PageFlags, PageProperty, VmIo, vm_space::VmQueriedItem},
     task::Task,
 };
 
 use super::{ioctl::*, vcpu_file::VcpuFile, vm::Vm};
 use crate::{
     fs::{
-        file::{file_table::FdFlags, AccessMode, FileLike},
+        file::{AccessMode, FileLike, file_table::FdFlags},
         pseudofs::AnonInodeFs,
         vfs::path::Path,
     },
     prelude::*,
-    util::ioctl::{dispatch_ioctl, RawIoctl},
+    util::ioctl::{RawIoctl, dispatch_ioctl},
     vm::vmar::{PageFaultInfo, Vmar},
 };
 
@@ -42,17 +42,13 @@ impl VmFile {
             return_errno_with_message!(Errno::EINVAL, "unsupported guest memory flags");
         }
         if memory_size == 0 {
-            self.vm
-                .guest_mem()
-                .set_memory_region(
-                    region.slot,
-                    0,
-                    0,
-                    0,
-                    Vec::new(),
-                    default_guest_mem_prop(false),
-                )
-                .map_err(Error::from)?;
+            self.vm.set_user_memory_region(
+                region.slot,
+                0,
+                0,
+                Vec::new(),
+                default_guest_mem_prop(false),
+            )?;
             return Ok(());
         }
 
@@ -73,16 +69,7 @@ impl VmFile {
 
         let prop = default_guest_mem_prop(region.flags & KVM_MEM_READONLY != 0);
         self.vm
-            .guest_mem()
-            .set_memory_region(
-                region.slot,
-                userspace_start,
-                guest_start,
-                memory_size,
-                frames,
-                prop,
-            )
-            .map_err(Error::from)?;
+            .set_user_memory_region(region.slot, guest_start, memory_size, frames, prop)?;
 
         Ok(())
     }

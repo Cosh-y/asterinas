@@ -233,9 +233,7 @@ impl Vcpu {
         }
         let vm = self.vm()?;
         let guest_tsc = self.guest_context.lock().guest_tsc();
-        self.kvmclock
-            .lock()
-            .write_msr(index, value, vm.guest_mem(), guest_tsc)
+        self.kvmclock.lock().write_msr(index, value, &vm, guest_tsc)
     }
 
     pub(super) fn read_tsc_deadline_msr(&self, index: u32) -> Option<u64> {
