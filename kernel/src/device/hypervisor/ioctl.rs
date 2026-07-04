@@ -1,7 +1,10 @@
 //! Ioctl api compatible with Linux KVM.
 //! KVM api: https://www.kernel.org/doc/html/latest/virt/kvm/api.html
 
-use ostd::arch::vm::GuestCpuidEntry;
+use ostd::arch::vm::{
+    GuestCpuidEntry, VcpuDtable as ArchVcpuDtable, VcpuRegs as ArchVcpuRegs, VcpuRunState,
+    VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
+};
 
 use crate::{
     prelude::*,
@@ -67,6 +70,7 @@ const KVM_IRQCHIP_PAYLOAD_SIZE: usize = 512;
 
 pub(super) const KVM_MP_STATE_RUNNABLE: u32 = 0;
 pub(super) const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
+pub(super) const KVM_MP_STATE_HALTED: u32 = 3;
 
 pub(super) const KVM_COALESCED_MMIO_PAGE_OFFSET: usize = 2;
 pub(super) const KVM_RUN_MMAP_SIZE: usize = (KVM_COALESCED_MMIO_PAGE_OFFSET + 1) * PAGE_SIZE;
@@ -392,6 +396,36 @@ pub(super) struct MpState {
     pub mp_state: u32,
 }
 
+impl From<VcpuRunState> for MpState {
+    fn from(state: VcpuRunState) -> Self {
+        Self {
+            mp_state: match state {
+                VcpuRunState::Runnable | VcpuRunState::Running => KVM_MP_STATE_RUNNABLE,
+                VcpuRunState::Uninitialized | VcpuRunState::WaitForSipi => {
+                    KVM_MP_STATE_UNINITIALIZED
+                }
+                VcpuRunState::Halted => KVM_MP_STATE_HALTED,
+            },
+        }
+    }
+}
+
+impl TryFrom<MpState> for VcpuRunState {
+    type Error = Error;
+
+    fn try_from(state: MpState) -> core::result::Result<Self, Self::Error> {
+        match state.mp_state {
+            KVM_MP_STATE_RUNNABLE => Ok(Self::Runnable),
+            KVM_MP_STATE_UNINITIALIZED => Ok(Self::WaitForSipi),
+            KVM_MP_STATE_HALTED => Ok(Self::Halted),
+            _ => Err(Error::with_message(
+                Errno::EINVAL,
+                "unsupported KVM MP state",
+            )),
+        }
+    }
+}
+
 /// The x86 `struct kvm_debugregs`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
@@ -524,6 +558,56 @@ pub(super) struct VcpuRegs {
     pub rflags: u64,
 }
 
+impl From<ArchVcpuRegs> for VcpuRegs {
+    fn from(regs: ArchVcpuRegs) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
+    }
+}
+
+impl From<VcpuRegs> for ArchVcpuRegs {
+    fn from(regs: VcpuRegs) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rbp: regs.rbp,
+            rsp: regs.rsp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
+    }
+}
+
 /// The x86 `struct kvm_segment`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
@@ -543,6 +627,46 @@ pub(super) struct VcpuSegment {
     pub padding: u8,
 }
 
+impl From<ArchVcpuSegment> for VcpuSegment {
+    fn from(segment: ArchVcpuSegment) -> Self {
+        Self {
+            base: segment.base,
+            limit: segment.limit,
+            selector: segment.selector,
+            type_: segment.type_,
+            present: segment.present,
+            dpl: segment.dpl,
+            db: segment.db,
+            s: segment.s,
+            l: segment.l,
+            g: segment.g,
+            avl: segment.avl,
+            unusable: segment.unusable,
+            padding: segment.padding,
+        }
+    }
+}
+
+impl From<VcpuSegment> for ArchVcpuSegment {
+    fn from(segment: VcpuSegment) -> Self {
+        Self {
+            base: segment.base,
+            limit: segment.limit,
+            selector: segment.selector,
+            type_: segment.type_,
+            present: segment.present,
+            dpl: segment.dpl,
+            db: segment.db,
+            s: segment.s,
+            l: segment.l,
+            g: segment.g,
+            avl: segment.avl,
+            unusable: segment.unusable,
+            padding: segment.padding,
+        }
+    }
+}
+
 /// The x86 `struct kvm_dtable`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
@@ -550,6 +674,26 @@ pub(super) struct VcpuDtable {
     pub base: u64,
     pub limit: u16,
     pub padding: [u16; 3],
+}
+
+impl From<ArchVcpuDtable> for VcpuDtable {
+    fn from(dtable: ArchVcpuDtable) -> Self {
+        Self {
+            base: dtable.base,
+            limit: dtable.limit,
+            padding: dtable.padding,
+        }
+    }
+}
+
+impl From<VcpuDtable> for ArchVcpuDtable {
+    fn from(dtable: VcpuDtable) -> Self {
+        Self {
+            base: dtable.base,
+            limit: dtable.limit,
+            padding: dtable.padding,
+        }
+    }
 }
 
 /// The x86 `struct kvm_sregs`.
@@ -574,6 +718,55 @@ pub(super) struct VcpuSregs {
     pub efer: u64,
     pub apic_base: u64,
     pub interrupt_bitmap: [u64; KVM_INTERRUPT_BITMAP_WORDS],
+}
+
+impl From<ArchVcpuSregs> for VcpuSregs {
+    fn from(sregs: ArchVcpuSregs) -> Self {
+        Self {
+            cs: sregs.cs.into(),
+            ds: sregs.ds.into(),
+            es: sregs.es.into(),
+            fs: sregs.fs.into(),
+            gs: sregs.gs.into(),
+            ss: sregs.ss.into(),
+            tr: sregs.tr.into(),
+            ldt: sregs.ldt.into(),
+            gdt: sregs.gdt.into(),
+            idt: sregs.idt.into(),
+            cr0: sregs.cr0,
+            cr2: sregs.cr2,
+            cr3: sregs.cr3,
+            cr4: sregs.cr4,
+            cr8: 0,
+            efer: sregs.efer,
+            apic_base: sregs.apic_base,
+            interrupt_bitmap: sregs.interrupt_bitmap,
+        }
+    }
+}
+
+impl From<VcpuSregs> for ArchVcpuSregs {
+    fn from(sregs: VcpuSregs) -> Self {
+        Self {
+            cs: sregs.cs.into(),
+            ds: sregs.ds.into(),
+            es: sregs.es.into(),
+            fs: sregs.fs.into(),
+            gs: sregs.gs.into(),
+            ss: sregs.ss.into(),
+            tr: sregs.tr.into(),
+            ldt: sregs.ldt.into(),
+            gdt: sregs.gdt.into(),
+            idt: sregs.idt.into(),
+            cr0: sregs.cr0,
+            cr2: sregs.cr2,
+            cr3: sregs.cr3,
+            cr4: sregs.cr4,
+            efer: sregs.efer,
+            apic_base: sregs.apic_base,
+            interrupt_bitmap: sregs.interrupt_bitmap,
+        }
+    }
 }
 
 /// The x86 `struct kvm_lapic_state`.

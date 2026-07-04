@@ -14,17 +14,15 @@ pub use self::{
 use crate::{
     Error,
     arch::vm::{
-        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
-        context::VcpuRunState,
+        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment, context::VcpuRunState,
         control_regs::{VcpuControlRegister, VcpuControlRegisters},
+        interrupt::resume_from_halted,
         vmx::{
             Msr, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
             VmcsGuest64, VmcsGuestNW, VmcsReadOnly32, exit_info,
         },
         x86::write_cr2_raw,
-    },
-    prelude::*,
-    sync::{Mutex, SpinLock},
+    }, prelude::*, sync::{Mutex, SpinLock},
 };
 
 /// Initializes guest virtualization support on this platform.
@@ -159,8 +157,14 @@ impl<'a> GuestMode<'a> {
 
         // Set running state in guest_context.
         let mut context = self.context.lock();
+
+        if context.run_state() == VcpuRunState::Halted {
+            resume_from_halted()?;
+            context.set_run_state(VcpuRunState::Runnable);
+        }
+
         if context.run_state() == VcpuRunState::Runnable {
-            context.set_running();
+            context.set_run_state(VcpuRunState::Running);
         } else {
             error!("unexpected run state.");
         }
@@ -237,12 +241,6 @@ impl<'a> GuestMode<'a> {
         // why?
         if vector < 32 {
             return Ok(None);
-        }
-
-        if self.context.lock().after_hlt {
-            clear_block_by_sti()?;
-            VmcsGuest32::ACTIVITY_STATE.write(0)?;
-            self.context.lock().after_hlt = false;
         }
 
         use crate::arch::vm::interrupt::*;
@@ -452,7 +450,10 @@ impl Drop for GuestRunGuard<'_> {
             error!("errno: {:?}", err);
             error!("unexpect condition: failed to quit vmcs")
         }
-        self.guest_context.lock().quit_running();
+        let mut context = self.guest_context.lock();
+        if context.run_state() == VcpuRunState::Running {
+            context.set_run_state(VcpuRunState::Runnable);
+        }
     }
 }
 

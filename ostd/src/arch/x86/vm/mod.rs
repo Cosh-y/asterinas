@@ -26,7 +26,7 @@ pub(crate) mod x86;
 mod tests;
 
 pub use self::{
-    context::GuestContext,
+    context::{GuestContext, VcpuRunState},
     cpuid::{GuestCpuidEntry, VIRTUAL_TSC_CRYSTAL_HZ, default_cpuid_entries},
     exit::GuestExitInfo,
     types::{VcpuDtable, VcpuRegs, VcpuSegment, VcpuSregs},

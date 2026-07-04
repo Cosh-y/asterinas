@@ -7,8 +7,14 @@ const RFLAGS_IF: usize = 1 << 9;
 pub(crate) const INTR_INFO_VALID_MASK: u32 = 0x8000_0000;
 pub(crate) const INTR_TYPE_EXT_INTR: u32 = 0;
 
+pub fn resume_from_halted() -> Result<()> {
+    clear_block_by_sti()?;
+    VmcsGuest32::ACTIVITY_STATE.write(0)?;
+    Ok(())
+}
+
 /// remove BLOCKING_BY_STI bit in the guest interruptibility state(VMCS)
-pub fn clear_block_by_sti() -> Result<()> {
+fn clear_block_by_sti() -> Result<()> {
     let interruptibility = VmcsGuest32::INTERRUPTIBILITY_STATE.read()?;
     VmcsGuest32::INTERRUPTIBILITY_STATE.write(interruptibility & !BLOCKING_BY_STI)
 }

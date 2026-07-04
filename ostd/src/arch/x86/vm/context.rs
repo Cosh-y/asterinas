@@ -39,12 +39,6 @@ pub struct GuestContext {
     pub(crate) vmcs: Vmcs,
 
     pub(crate) tsc_offset: i64,
-
-    /// The last VM exit was due to `HLT`.
-    /// After `HLT`, when an interrupt causes the vCPU to re-enter, the
-    /// block-by-`STI` bit in the interruptibility state should be cleared
-    /// first.
-    pub(crate) after_hlt: bool,
 }
 
 pub(crate) struct VcpuArchState {
@@ -81,7 +75,6 @@ impl GuestContext {
             },
             vmcs: Vmcs::new()?,
             tsc_offset: 0,
-            after_hlt: false,
         })
     }
 
@@ -168,6 +161,16 @@ impl GuestContext {
     /// Returns the guest instruction pointer.
     pub fn rip(&self) -> u64 {
         self.arch.rip()
+    }
+
+    /// Returns the vCPU execution state.
+    pub fn run_state(&self) -> VcpuRunState {
+        self.run
+    }
+
+    /// Sets the vCPU execution state.
+    pub fn set_run_state(&mut self, state: VcpuRunState) {
+        self.run = state;
     }
 
     /// Returns whether the guest vCPU is currently running.
@@ -266,18 +269,6 @@ impl GuestContext {
     pub(crate) fn arch(&self) -> &VcpuArchState {
         &self.arch
     }
-
-    pub(crate) fn run_state(&self) -> VcpuRunState {
-        self.run
-    }
-
-    pub(crate) fn set_running(&mut self) {
-        self.run = VcpuRunState::Running;
-    }
-
-    pub(crate) fn quit_running(&mut self) {
-        self.run = VcpuRunState::Runnable;
-    }
 }
 
 impl Default for VcpuArchState {
@@ -304,12 +295,20 @@ impl Default for GuestContext {
     }
 }
 
+/// Describes whether a guest vCPU may enter guest mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum VcpuRunState {
-    Running,
+pub enum VcpuRunState {
+    /// The vCPU is not initialized for execution.
+    Uninitialized,
+    /// The vCPU is waiting for a startup IPI.
+    WaitForSipi,
+    /// The vCPU is ready to enter guest mode.
     #[default]
     Runnable,
-    WaitForSipi,
+    /// The vCPU is currently executing in guest mode.
+    Running,
+    /// The vCPU exited because the guest executed `HLT`.
+    Halted,
 }
 
 pub(crate) fn sanitize_apic_base_for_vcpu(value: u64, vcpu_id: u32) -> u64 {

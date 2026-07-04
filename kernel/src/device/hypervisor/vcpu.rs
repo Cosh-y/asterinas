@@ -1,17 +1,13 @@
 use ostd::{
-    arch::vm::{
-        GuestContext, GuestCpuidEntry as ArchGuestCpuidEntry, VcpuDtable as ArchVcpuDtable,
-        VcpuRegs as ArchVcpuRegs, VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
-    },
+    arch::vm::{GuestContext, GuestCpuidEntry as ArchGuestCpuidEntry},
     vm::{GuestInterruptPort, GuestTimerPort},
 };
 
 use super::{
     apic::Lapic,
     ioctl::{
-        IA32_TSC_DEADLINE, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_UNINITIALIZED,
-        KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE, LapicState, MpState,
-        VcpuCpuidEntry2, VcpuDtable, VcpuMsrEntry, VcpuRegs, VcpuSegment, VcpuSregs,
+        IA32_TSC_DEADLINE, KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE,
+        LapicState, MpState, VcpuCpuidEntry2, VcpuMsrEntry, VcpuRegs, VcpuSregs,
     },
     kvmclock::{self, KvmClock},
     vm::Vm,
@@ -55,7 +51,6 @@ pub struct Vcpu {
     pub(super) lapic: SpinLock<Lapic>,
     run_page: Arc<Vmo>,
     pending_operation: Mutex<Option<PendingOperation>>,
-    mp_state: Mutex<MpState>,
     kvmclock: Mutex<KvmClock>,
 }
 
@@ -68,7 +63,6 @@ impl Vcpu {
             lapic: SpinLock::new(lapic),
             run_page,
             pending_operation: Mutex::new(None),
-            mp_state: Mutex::new(initial_mp_state(id)),
             kvmclock: Mutex::new(KvmClock::default()),
         }))
     }
@@ -139,7 +133,7 @@ impl Vcpu {
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get regs while vCPU is running");
         }
-        Ok(kvm_regs_from_arch(context.regs()))
+        Ok(context.regs().into())
     }
 
     pub fn set_regs(&self, regs: VcpuRegs) -> Result<()> {
@@ -147,7 +141,7 @@ impl Vcpu {
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot set regs while vCPU is running");
         }
-        context.set_regs(arch_regs_from_kvm(regs));
+        context.set_regs(regs.into());
         Ok(())
     }
 
@@ -156,7 +150,7 @@ impl Vcpu {
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get sregs while vCPU is running");
         }
-        Ok(kvm_sregs_from_arch(context.sregs()))
+        Ok(context.sregs().into())
     }
 
     pub fn set_sregs(&self, sregs: VcpuSregs) -> Result<()> {
@@ -164,7 +158,7 @@ impl Vcpu {
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot set sregs while vCPU is running");
         }
-        context.set_sregs(arch_sregs_from_kvm(sregs));
+        context.set_sregs(sregs.into());
         Ok(())
     }
 
@@ -293,23 +287,17 @@ impl Vcpu {
     }
 
     pub fn get_mp_state(&self) -> Result<MpState> {
-        // This is KVM-ABI compatibility state. `SET_MP_STATE` currently does
-        // not mutate OSTD's vCPU run state, but SIPI delivery updates it so
-        // userspace can still observe AP startup progress.
-        Ok(*self.mp_state.lock())
+        Ok(self.guest_context.lock().run_state().into())
     }
 
     pub fn set_mp_state(&self, state: MpState) -> Result<()> {
-        // See `get_mp_state`.
-        *self.mp_state.lock() = state;
+        let state = state.try_into()?;
+        self.guest_context.lock().set_run_state(state);
         Ok(())
     }
 
     pub fn receive_sipi(&self, vector: u8) {
         self.guest_context.lock().receive_sipi(vector);
-        *self.mp_state.lock() = MpState {
-            mp_state: KVM_MP_STATE_RUNNABLE,
-        };
     }
 
     pub(super) fn wait_for_hlt_wakeup(&self) -> bool {
@@ -337,163 +325,10 @@ impl Vcpu {
     }
 }
 
-fn initial_mp_state(id: u32) -> MpState {
-    MpState {
-        mp_state: if id == 0 {
-            KVM_MP_STATE_RUNNABLE
-        } else {
-            KVM_MP_STATE_UNINITIALIZED
-        },
-    }
-}
-
 fn current_tsc_khz() -> Result<u64> {
     let khz = ostd::arch::tsc_freq() / 1_000;
     if khz == 0 {
         return_errno_with_message!(Errno::EINVAL, "TSC frequency is not available");
     }
     Ok(khz)
-}
-
-fn kvm_regs_from_arch(regs: ArchVcpuRegs) -> VcpuRegs {
-    VcpuRegs {
-        rax: regs.rax,
-        rbx: regs.rbx,
-        rcx: regs.rcx,
-        rdx: regs.rdx,
-        rsi: regs.rsi,
-        rdi: regs.rdi,
-        rsp: regs.rsp,
-        rbp: regs.rbp,
-        r8: regs.r8,
-        r9: regs.r9,
-        r10: regs.r10,
-        r11: regs.r11,
-        r12: regs.r12,
-        r13: regs.r13,
-        r14: regs.r14,
-        r15: regs.r15,
-        rip: regs.rip,
-        rflags: regs.rflags,
-    }
-}
-
-fn arch_regs_from_kvm(regs: VcpuRegs) -> ArchVcpuRegs {
-    ArchVcpuRegs {
-        rax: regs.rax,
-        rbx: regs.rbx,
-        rcx: regs.rcx,
-        rdx: regs.rdx,
-        rsi: regs.rsi,
-        rdi: regs.rdi,
-        rbp: regs.rbp,
-        rsp: regs.rsp,
-        r8: regs.r8,
-        r9: regs.r9,
-        r10: regs.r10,
-        r11: regs.r11,
-        r12: regs.r12,
-        r13: regs.r13,
-        r14: regs.r14,
-        r15: regs.r15,
-        rip: regs.rip,
-        rflags: regs.rflags,
-    }
-}
-
-fn kvm_sregs_from_arch(sregs: ArchVcpuSregs) -> VcpuSregs {
-    VcpuSregs {
-        cs: kvm_segment_from_arch(sregs.cs),
-        ds: kvm_segment_from_arch(sregs.ds),
-        es: kvm_segment_from_arch(sregs.es),
-        fs: kvm_segment_from_arch(sregs.fs),
-        gs: kvm_segment_from_arch(sregs.gs),
-        ss: kvm_segment_from_arch(sregs.ss),
-        tr: kvm_segment_from_arch(sregs.tr),
-        ldt: kvm_segment_from_arch(sregs.ldt),
-        gdt: kvm_dtable_from_arch(sregs.gdt),
-        idt: kvm_dtable_from_arch(sregs.idt),
-        cr0: sregs.cr0,
-        cr2: sregs.cr2,
-        cr3: sregs.cr3,
-        cr4: sregs.cr4,
-        cr8: 0,
-        efer: sregs.efer,
-        apic_base: sregs.apic_base,
-        interrupt_bitmap: sregs.interrupt_bitmap,
-    }
-}
-
-fn arch_sregs_from_kvm(sregs: VcpuSregs) -> ArchVcpuSregs {
-    ArchVcpuSregs {
-        cs: arch_segment_from_kvm(sregs.cs),
-        ds: arch_segment_from_kvm(sregs.ds),
-        es: arch_segment_from_kvm(sregs.es),
-        fs: arch_segment_from_kvm(sregs.fs),
-        gs: arch_segment_from_kvm(sregs.gs),
-        ss: arch_segment_from_kvm(sregs.ss),
-        tr: arch_segment_from_kvm(sregs.tr),
-        ldt: arch_segment_from_kvm(sregs.ldt),
-        gdt: arch_dtable_from_kvm(sregs.gdt),
-        idt: arch_dtable_from_kvm(sregs.idt),
-        cr0: sregs.cr0,
-        cr2: sregs.cr2,
-        cr3: sregs.cr3,
-        cr4: sregs.cr4,
-        efer: sregs.efer,
-        apic_base: sregs.apic_base,
-        interrupt_bitmap: sregs.interrupt_bitmap,
-    }
-}
-
-fn kvm_segment_from_arch(segment: ArchVcpuSegment) -> VcpuSegment {
-    VcpuSegment {
-        base: segment.base,
-        limit: segment.limit,
-        selector: segment.selector,
-        type_: segment.type_,
-        present: segment.present,
-        dpl: segment.dpl,
-        db: segment.db,
-        s: segment.s,
-        l: segment.l,
-        g: segment.g,
-        avl: segment.avl,
-        unusable: segment.unusable,
-        padding: segment.padding,
-    }
-}
-
-fn arch_segment_from_kvm(segment: VcpuSegment) -> ArchVcpuSegment {
-    ArchVcpuSegment {
-        base: segment.base,
-        limit: segment.limit,
-        selector: segment.selector,
-        type_: segment.type_,
-        present: segment.present,
-        dpl: segment.dpl,
-        db: segment.db,
-        s: segment.s,
-        l: segment.l,
-        g: segment.g,
-        avl: segment.avl,
-        unusable: segment.unusable,
-        padding: segment.padding,
-    }
-}
-
-fn kvm_dtable_from_arch(dtable: ArchVcpuDtable) -> VcpuDtable {
-    VcpuDtable {
-        base: dtable.base,
-        limit: dtable.limit,
-        padding: dtable.padding,
-    }
-}
-
-fn arch_dtable_from_kvm(dtable: VcpuDtable) -> ArchVcpuDtable {
-    ArchVcpuDtable {
-        base: dtable.base,
-        limit: dtable.limit,
-        padding: dtable.padding,
-    }
 }

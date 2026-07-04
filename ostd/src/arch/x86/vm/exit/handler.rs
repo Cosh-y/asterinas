@@ -6,6 +6,7 @@ use super::super::emulate::{
 use crate::{
     Error,
     arch::vm::{
+        VcpuRunState,
         context::GuestContext,
         exit::GuestExitInfo,
         vmx::{
@@ -72,7 +73,7 @@ pub fn vmexit_handler(
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::HLT) => {
-            context.lock().after_hlt = true;
+            context.lock().set_run_state(VcpuRunState::Halted);
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::PREEMPTION_TIMER) => Ok(Some(GuestExitInfo::from(*exit_info))),
