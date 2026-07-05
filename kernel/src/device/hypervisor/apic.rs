@@ -381,7 +381,39 @@ use ostd::{
     vm::{GuestInterruptPort, GuestTimerPort},
 };
 
-impl GuestInterruptPort for Lapic {
+pub(super) struct LapicPort {
+    inner: SpinLock<Lapic>,
+}
+
+impl LapicPort {
+    pub fn new(lapic: Lapic) -> Self {
+        Self {
+            inner: SpinLock::new(lapic),
+        }
+    }
+
+    pub fn lock(&self) -> SpinLockGuard<'_, Lapic, ostd::sync::PreemptDisabled> {
+        self.inner.lock()
+    }
+}
+
+impl GuestInterruptPort for LapicPort {
+    fn check_pending_interrupt(&self) -> Option<u8> {
+        self.lock().check_pending_interrupt()
+    }
+
+    fn accept_interrupt(&self, vector: u8) {
+        self.lock().accept_interrupt(vector);
+    }
+}
+
+impl GuestTimerPort for LapicPort {
+    fn check_deadline(&self, current_tsc: u64) -> Option<u64> {
+        self.lock().check_deadline(current_tsc)
+    }
+}
+
+impl Lapic {
     fn check_pending_interrupt(&self) -> Option<u8> {
         let pending_vector = Self::find_highest(&self.irr)?;
 
@@ -404,9 +436,7 @@ impl GuestInterruptPort for Lapic {
         Self::clear_bit(&mut self.irr, vector);
         self.update_ppr();
     }
-}
 
-impl GuestTimerPort for Lapic {
     fn check_deadline(&mut self, current_tsc: u64) -> Option<u64> {
         let deadline_tsc = self.timer.deadline_tsc?;
         if current_tsc < deadline_tsc {

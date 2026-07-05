@@ -170,7 +170,7 @@ impl PerOpenFileOps for HypervisorDeviceFile {
                 let vm_id = self.alloc_vm_id();
 
                 // Create the VM
-                let vm = Vm::new(vm_id);
+                let vm = Vm::new(vm_id)?;
 
                 // Create a file descriptor for the VM
                 let vm_file = Arc::new(VmFile::new(vm));

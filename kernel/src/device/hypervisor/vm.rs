@@ -3,7 +3,7 @@ use core::cmp;
 use ostd::{
     mm::{Gpaddr, PageProperty, UFrame, io::util::HasVmReaderWriter},
     task::disable_preempt,
-    vm::GuestPhysMemSpace,
+    vm::{GuestPhysMemSpace, VmxGuard, acquire_vmx},
 };
 
 use super::{
@@ -79,11 +79,14 @@ pub(super) struct Vm {
     irqchip_created: Mutex<bool>,
     irq_routes: Mutex<BTreeMap<u32, Vec<IrqRoute>>>,
     clock: Mutex<ClockData>,
+    // Keep this field last so VMXOFF runs after VM resources have been dropped.
+    _vmx_guard: VmxGuard,
 }
 
 impl Vm {
-    pub fn new(id: u32) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(id: u32) -> Result<Arc<Self>> {
+        let vmx_guard = acquire_vmx()?;
+        Ok(Arc::new(Self {
             id,
             guest_mem: GuestPhysMemSpace::new(),
             memory_slots: Mutex::new(BTreeMap::new()),
@@ -92,7 +95,8 @@ impl Vm {
             irqchip_created: Mutex::new(false),
             irq_routes: Mutex::new(BTreeMap::new()),
             clock: Mutex::new(ClockData::default()),
-        })
+            _vmx_guard: vmx_guard,
+        }))
     }
 
     pub fn ioapic(&self) -> MutexGuard<'_, Ioapic> {

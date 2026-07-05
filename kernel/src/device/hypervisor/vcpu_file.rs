@@ -6,7 +6,7 @@ use ostd::{
     arch::vm::{GuestExitInfo, VmxExitReason},
     mm::VmIo,
     task::Task,
-    vm::GuestMode,
+    vm::{GuestMode, GuestRunResult},
 };
 
 use super::{
@@ -26,8 +26,6 @@ use crate::{
     util::ioctl::{RawIoctl, dispatch_ioctl},
 };
 
-// Periodically return timer exits so a busy vCPU cannot monopolize scheduling.
-const PREEMPTION_TIMER_USER_EXIT_INTERVAL: u64 = 16;
 const GPR_RAX: u8 = 0;
 const GPR_RCX: u8 = 2;
 const GPR_RDX: u8 = 3;
@@ -330,18 +328,34 @@ impl VcpuFile {
             return_errno_with_message!(Errno::EINTR, "KVM_RUN interrupted by immediate_exit");
         }
         self.vcpu.clear_run_output()?;
-
-        let mut guest_mode =
-            GuestMode::new(&self.vcpu.guest_context, &self.vcpu.lapic, &self.vcpu.lapic);
-        let mut consecutive_preemption_timer_exits = 0_u64;
+        let mut guest_mode = GuestMode::new();
 
         loop {
-            let exit_info = match guest_mode.execute(self.vm.guest_mem()) {
-                Ok(exit_info) => exit_info,
-                Err(err) => {
-                    error!("hypervisor: GuestMode::execute failed: {:?}", err);
-                    return Err(err.into());
+            let run_result = {
+                let mut context = self.vcpu.guest_context();
+                match guest_mode.execute(
+                    &mut context,
+                    self.vm.guest_mem(),
+                    &self.vcpu.lapic,
+                    &self.vcpu.lapic,
+                ) {
+                    Ok(exit_info) => exit_info,
+                    Err(err) => {
+                        error!("hypervisor: GuestMode::execute failed: {:?}", err);
+                        return Err(err.into());
+                    }
                 }
+            };
+            let GuestRunResult::VmExit(exit_info) = run_result else {
+                loop {
+                    if self.vcpu.wait_for_sipi_wakeup() {
+                        break;
+                    }
+
+                    // TODO: Use a more efficient wait mechanism instead of busy-waiting.
+                    Task::yield_now();
+                }
+                continue;
             };
             let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
                 Ok(VmxExitReason::IO_INSTRUCTION) => Some(exit_info),
@@ -360,27 +374,10 @@ impl VcpuFile {
                                     err
                                 );
                             })?;
-                    if handled {
-                        consecutive_preemption_timer_exits = 0;
-                        None
-                    } else {
-                        Some(exit_info)
-                    }
+                    if handled { None } else { Some(exit_info) }
                 }
-                Ok(VmxExitReason::PREEMPTION_TIMER) => {
-                    consecutive_preemption_timer_exits =
-                        consecutive_preemption_timer_exits.saturating_add(1);
-                    if consecutive_preemption_timer_exits >= PREEMPTION_TIMER_USER_EXIT_INTERVAL {
-                        return_errno_with_message!(
-                            Errno::EINTR,
-                            "KVM_RUN interrupted by preemption timer"
-                        );
-                    } else {
-                        None
-                    }
-                }
+                Ok(VmxExitReason::PREEMPTION_TIMER) => None,
                 Ok(VmxExitReason::HLT) => {
-                    consecutive_preemption_timer_exits = 0;
                     self.vcpu
                         .guest_context()
                         .advance_rip(exit_info.instruction_len as _);
@@ -393,12 +390,8 @@ impl VcpuFile {
                         Task::yield_now();
                     }
                 }
-                Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
-                    consecutive_preemption_timer_exits = 0;
-                    None
-                }
+                Ok(VmxExitReason::PAUSE_INSTRUCTION) => None,
                 Ok(VmxExitReason::MSR_READ) => {
-                    consecutive_preemption_timer_exits = 0;
                     if self.emulate_kernel_msr(&exit_info, MsrAccess::Read)? {
                         None
                     } else {
@@ -406,7 +399,6 @@ impl VcpuFile {
                     }
                 }
                 Ok(VmxExitReason::MSR_WRITE) => {
-                    consecutive_preemption_timer_exits = 0;
                     if self.emulate_kernel_msr(&exit_info, MsrAccess::Write)? {
                         None
                     } else {

@@ -1,6 +1,6 @@
 use x86::msr::IA32_TSC_DEADLINE;
 
-use crate::{arch::vm::context::GuestContext, prelude::*, sync::Mutex};
+use crate::{arch::vm::context::GuestContext, prelude::*};
 
 const GPR_RCX: u8 = 2;
 const MSR_KVM_WALL_CLOCK: u32 = 0x11;
@@ -8,13 +8,11 @@ const MSR_KVM_SYSTEM_TIME: u32 = 0x12;
 const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
 
-pub(crate) fn needs_kernel_msr_handler(context: &Mutex<GuestContext>) -> bool {
-    let context = context.lock();
+pub(crate) fn needs_kernel_msr_handler(context: &GuestContext) -> bool {
     needs_kernel_msr_policy(context.arch().gpr(GPR_RCX) as u32)
 }
 
-pub(crate) fn emulate_msrrw(context: &Mutex<GuestContext>, is_write: bool) -> Result<()> {
-    let mut context = context.lock();
+pub(crate) fn emulate_msrrw(context: &mut GuestContext, is_write: bool) -> Result<()> {
     let msr_index = context.arch().gpr(GPR_RCX) as u32;
 
     if is_write {

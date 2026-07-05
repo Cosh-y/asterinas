@@ -11,10 +11,12 @@ use x86::msr::*;
 pub use self::{
     gpm_space::GuestPhysMemSpace, interrupt::GuestInterruptPort, timer::GuestTimerPort,
 };
+pub use crate::arch::vm::vmx::{VmxGuard, acquire_vmx};
 use crate::{
     Error,
     arch::vm::{
-        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment, context::VcpuRunState,
+        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
+        context::VcpuRunState,
         control_regs::{VcpuControlRegister, VcpuControlRegisters},
         interrupt::resume_from_halted,
         vmx::{
@@ -22,36 +24,22 @@ use crate::{
             VmcsGuest64, VmcsGuestNW, VmcsReadOnly32, exit_info,
         },
         x86::write_cr2_raw,
-    }, prelude::*, sync::{Mutex, SpinLock},
+    },
+    prelude::*,
 };
 
+/*
 /// Initializes guest virtualization support on this platform.
 pub fn init() -> Result<()> {
     crate::arch::vm::vmx::init_vmx()
 }
+*/
 
 /// Runs guest vCPU code in an isolated guest execution mode.
 ///
-/// `GuestMode` is the OSTD-side execution object for a guest vCPU. It borrows
-/// the vCPU context and the kernel-provided interrupt and timer policy ports,
-/// then enters guest execution until a VM exit must be handled outside OSTD.
-///
-/// On x86, the implementation uses VMX to enter VMX non-root mode. The CPU
-/// executes the code described by [`GuestContext`] while memory accesses are
-/// translated through the EPT owned by the [`GuestPhysMemSpace`] passed to
-/// [`Self::execute`]. Provided that the EPT maps only guest-owned memory and
-/// selected device ranges, guest code cannot directly access host memory
-/// outside those mappings. This protects kernel memory safety from direct
-/// guest memory access.
-///
-/// VMCS controls force the CPU to leave VMX non-root mode on events that must
-/// be handled by the host, such as external interrupts, EPT violations, I/O
-/// instructions, or selected control-register and MSR accesses. OSTD handles
-/// exits that belong to the low-level CPU contract, such as CPUID, CR access,
-/// and MSR read/write emulation. Other exits are returned to the kernel as
-/// [`GuestExitInfo`] so the kernel can emulate devices, forward events to
-/// userspace, or stop the vCPU. This VM-exit boundary prevents guest code from
-/// escaping guest execution and running arbitrary host control flow.
+/// `GuestMode` is the OSTD-side execution object for a guest vCPU. It enters
+/// guest execution with the vCPU context and kernel-provided policy ports
+/// supplied to [`Self::execute`] until a VM exit must be handled outside OSTD.
 ///
 /// Here is a sample code on how to use `GuestMode`.
 ///
@@ -59,104 +47,113 @@ pub fn init() -> Result<()> {
 /// use ostd::{
 ///     arch::vm::GuestContext,
 ///     prelude::*,
-///     sync::{Mutex, SpinLock},
 ///     vm::{GuestInterruptPort, GuestMode, GuestPhysMemSpace, GuestTimerPort},
 /// };
 ///
 /// fn run_guest(
-///     context: &Mutex<GuestContext>,
-///     interrupt_port: &SpinLock<dyn GuestInterruptPort>,
-///     timer_port: &SpinLock<dyn GuestTimerPort>,
+///     context: &mut GuestContext,
+///     interrupt_port: &dyn GuestInterruptPort,
+///     timer_port: &dyn GuestTimerPort,
 ///     guest_mem: &GuestPhysMemSpace,
 /// ) -> Result<()> {
-///     let mut guest_mode =
-///         GuestMode::new(context, interrupt_port, timer_port);
+///     let mut guest_mode = GuestMode::new();
 ///
 ///     loop {
-///         let _exit_info = guest_mode.execute(guest_mem)?;
+///         let _run_result = guest_mode.execute(context, guest_mem, interrupt_port, timer_port)?;
 ///         todo!("handle the userspace-visible VM exit");
 ///     }
 /// }
 /// ```
-pub struct GuestMode<'a> {
-    context: &'a Mutex<GuestContext>,
-    interrupt_port: &'a SpinLock<dyn GuestInterruptPort>,
-    timer_port: &'a SpinLock<dyn GuestTimerPort>,
+pub struct GuestMode;
+
+/// Describes why a guest run returned to the kernel client.
+pub enum GuestRunResult {
+    /// The vCPU exited VMX non-root mode and needs higher-level handling.
+    VmExit(GuestExitInfo),
+    /// The vCPU is waiting for a startup IPI and was not entered.
+    WaitForSipi,
 }
 
-impl<'a> GuestMode<'a> {
+impl GuestMode {
     /// Creates a guest execution object.
     ///
-    /// The `context` contains the vCPU state to execute. The `interrupt_port`
-    /// and `timer_port` are kernel-provided policy objects consulted before VM
-    /// entry. Creating this value does not enter the guest; use
-    /// [`Self::execute`] to run the vCPU.
-    pub fn new(
-        context: &'a Mutex<GuestContext>,
-        interrupt_port: &'a SpinLock<dyn GuestInterruptPort>,
-        timer_port: &'a SpinLock<dyn GuestTimerPort>,
-    ) -> Self {
-        GuestMode {
-            context,
-            interrupt_port,
-            timer_port,
-        }
+    /// Creating this value does not enter the guest; use [`Self::execute`] to
+    /// run the vCPU with a guest context and kernel-provided policy ports.
+    pub fn new() -> Self {
+        GuestMode
     }
 
-    /// Runs the guest with the supplied guest physical memory space.
+    /// Runs the guest with the supplied
+    /// guest context and guest physical memory space.
     ///
-    /// Before VM entry, this method initializes or loads the VMCS, marks the
-    /// vCPU as running, prepares guest interrupts and timers, and loads the
-    /// current [`GuestContext`] state into hardware. After VM exit, it saves
-    /// the hardware vCPU state back into `GuestContext` and restores the host
-    /// CPU state before ordinary kernel execution resumes.
+    /// The `interrupt_port` and `timer_port` arguments provide kernel
+    /// policy for pending guest interrupts and guest timers
+    /// while the vCPU is running.
     ///
-    /// Some VM exits are part of OSTD's low-level CPU contract and are handled
-    /// internally. For example, OSTD handles CPUID, control-register access,
-    /// MSR read/write, interrupt-window, and external-interrupt exits without
-    /// returning them to the kernel. Exits that require higher-level policy or
-    /// device emulation are returned as [`GuestExitInfo`].
+    /// The method returns when guest execution needs handling by the kernel
+    /// client. [`GuestRunResult::VmExit`] carries the architecture-specific
+    /// exit information for policy or device emulation, and
+    /// [`GuestRunResult::WaitForSipi`] indicates that the vCPU is waiting for
+    /// its startup signal and was not entered.
     ///
-    /// The `guest_mem` argument defines the guest physical address space for
-    /// this run. This method obtains the EPT pointer from `guest_mem`
-    /// internally, so safe kernel code cannot supply an arbitrary EPT root.
-    ///
-    /// If the vCPU is waiting for SIPI, this method returns a synthetic
-    /// `HLT`-style exit without entering guest execution.
-    pub fn execute(&mut self, guest_mem: &GuestPhysMemSpace) -> Result<GuestExitInfo> {
-        if self.context.lock().run_state() == VcpuRunState::WaitForSipi {
-            return self.wait_for_sipi(self.context.lock().arch().rip() as _);
+    /// After handling the returned event and updating `context` or the guest
+    /// device model as needed, call this method again to resume guest
+    /// execution.
+    pub fn execute<I, T>(
+        &mut self,
+        context: &mut GuestContext,
+        guest_mem: &GuestPhysMemSpace,
+        interrupt_port: &I,
+        timer_port: &T,
+    ) -> Result<GuestRunResult>
+    where
+        I: GuestInterruptPort + ?Sized,
+        T: GuestTimerPort + ?Sized,
+    {
+        if context.run_state() == VcpuRunState::WaitForSipi {
+            return Ok(GuestRunResult::WaitForSipi);
         }
 
         // VMCS state is per-pCPU while loaded. Keep this run on one pCPU, then
         // clear the VMCS before returning so the next RSH_RUN may migrate safely.
         let _preempt_guard = crate::task::disable_preempt();
-        let _run_guard = self.enter_run(guest_mem)?;
+        self.enter_run(context, guest_mem)?;
+        let run_result = self.run_loop(context, interrupt_port, timer_port);
+        self.leave_run(context);
+        run_result
+    }
 
+    fn run_loop<I, T>(
+        &mut self,
+        context: &mut GuestContext,
+        interrupt_port: &I,
+        timer_port: &T,
+    ) -> Result<GuestRunResult>
+    where
+        I: GuestInterruptPort + ?Sized,
+        T: GuestTimerPort + ?Sized,
+    {
         loop {
             let irq_guard = crate::irq::disable_local();
 
-            let host_context = self.prepare_vmentry()?;
-            let run_result = self.vmlaunch_or_vmresume();
-            self.complete_vmexit(host_context, run_result)?;
+            let host_context = self.prepare_vmentry(context, interrupt_port, timer_port)?;
+            let run_result = self.vmlaunch_or_vmresume(context);
+            self.complete_vmexit(context, host_context, run_result)?;
 
             use crate::arch::vm::exit::vmexit_handler;
             let exit_info = exit_info()?;
-            let exit_info = vmexit_handler(self.context, &exit_info)?;
+            let exit_info = vmexit_handler(context, &exit_info)?;
             drop(irq_guard);
 
             // Deliver handling of vmexit to kernel client or userspace.
             if let Some(exit_info) = exit_info {
-                return Ok(exit_info);
+                return Ok(GuestRunResult::VmExit(exit_info));
             }
         }
     }
 
-    fn enter_run(&self, guest_mem: &GuestPhysMemSpace) -> Result<GuestRunGuard<'a>> {
-        self.init_vmcs(guest_mem)?;
-
-        // Set running state in guest_context.
-        let mut context = self.context.lock();
+    fn enter_run(&self, context: &mut GuestContext, guest_mem: &GuestPhysMemSpace) -> Result<()> {
+        self.init_vmcs(context, guest_mem)?;
 
         if context.run_state() == VcpuRunState::Halted {
             resume_from_halted()?;
@@ -168,45 +165,55 @@ impl<'a> GuestMode<'a> {
         } else {
             error!("unexpected run state.");
         }
-        Ok(GuestRunGuard {
-            guest_context: self.context,
-        })
+        Ok(())
     }
 
-    fn init_vmcs(&self, guest_mem: &GuestPhysMemSpace) -> Result<()> {
-        self.context.lock().vmcs.load()?;
-        if self.context.lock().vmcs.initialized() {
+    fn leave_run(&self, context: &mut GuestContext) {
+        if let Err(err) = context.vmcs.quit() {
+            error!("errno: {:?}", err);
+            error!("unexpect condition: failed to quit vmcs")
+        }
+        if context.run_state() == VcpuRunState::Running {
+            context.set_run_state(VcpuRunState::Runnable);
+        }
+    }
+
+    fn init_vmcs(&self, context: &mut GuestContext, guest_mem: &GuestPhysMemSpace) -> Result<()> {
+        context.vmcs.load()?;
+        if context.vmcs.initialized() {
             return Ok(());
         }
 
-        debug!("hypervisor: initializing vcpu vmcs");
-        let mut context = self.context.lock();
         let vmcs_guest_state = context.vmcs_guest_state();
         context.vmcs.init(vmcs_guest_state, guest_mem.eptp())?;
 
         Ok(())
     }
 
-    fn prepare_vmentry(&self) -> Result<HostContext> {
-        self.prepare_preemption_timer()?;
-        self.prepare_interrupt()?;
+    fn prepare_vmentry<I, T>(
+        &self,
+        context: &mut GuestContext,
+        interrupt_port: &I,
+        timer_port: &T,
+    ) -> Result<HostContext>
+    where
+        I: GuestInterruptPort + ?Sized,
+        T: GuestTimerPort + ?Sized,
+    {
+        self.prepare_preemption_timer(context, timer_port)?;
+        self.prepare_interrupt(interrupt_port)?;
         let host_context = HostContext::save();
-        if let Err(err) = self.load_guest_context() {
+        if let Err(err) = self.load_guest_context(context) {
             host_context.load();
             return Err(err);
         }
         Ok(host_context)
     }
 
-    fn vmlaunch_or_vmresume(&self) -> Result<()> {
-        let launched: u64 = if self.context.lock().vmcs.launched() {
-            1
-        } else {
-            0
-        };
+    fn vmlaunch_or_vmresume(&self, context: &mut GuestContext) -> Result<()> {
+        let launched: u64 = if context.vmcs.launched() { 1 } else { 0 };
 
         use crate::arch::vm::vmx::vcpu_run;
-        let mut context = self.context.lock();
         let ret = vcpu_run(context.arch_mut().regs_mut_ptr(), launched);
         if ret != 0 {
             log_vcpu_run_failure(launched);
@@ -217,22 +224,28 @@ impl<'a> GuestMode<'a> {
         Ok(())
     }
 
-    fn complete_vmexit(&self, host_context: HostContext, run_result: Result<()>) -> Result<()> {
-        let save_guest_context_result = self.save_guest_context();
+    fn complete_vmexit(
+        &self,
+        context: &mut GuestContext,
+        host_context: HostContext,
+        run_result: Result<()>,
+    ) -> Result<()> {
+        let save_guest_context_result = self.save_guest_context(context);
         host_context.load();
 
         run_result?;
         save_guest_context_result?;
 
-        // self.context.
-
         Ok(())
     }
 
-    fn prepare_interrupt(&self) -> Result<Option<u8>> {
+    fn prepare_interrupt<I: GuestInterruptPort + ?Sized>(
+        &self,
+        interrupt_port: &I,
+    ) -> Result<Option<u8>> {
         VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(0)?;
 
-        let pending_vector = self.interrupt_port.lock().check_pending_interrupt();
+        let pending_vector = interrupt_port.check_pending_interrupt();
 
         let Some(vector) = pending_vector else {
             return Ok(None);
@@ -255,14 +268,17 @@ impl<'a> GuestMode<'a> {
 
         // inject interrupt through VMCS
         VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(intr_info)?;
-        self.interrupt_port.lock().accept_interrupt(vector);
+        interrupt_port.accept_interrupt(vector);
         Ok(Some(vector))
     }
 
-    fn prepare_preemption_timer(&self) -> Result<()> {
-        let context = self.context.lock();
+    fn prepare_preemption_timer<T: GuestTimerPort + ?Sized>(
+        &self,
+        context: &GuestContext,
+        timer_port: &T,
+    ) -> Result<()> {
         let guest_tsc = context.guest_tsc();
-        let timer_deadline = self.timer_port.lock().check_deadline(guest_tsc);
+        let timer_deadline = timer_port.check_deadline(guest_tsc);
         let gap = timer_deadline
             .map(|deadline| deadline.saturating_sub(guest_tsc).max(1))
             .unwrap_or(500_000);
@@ -272,11 +288,10 @@ impl<'a> GuestMode<'a> {
         Ok(())
     }
 
-    fn load_guest_context(&self) -> Result<()> {
-        let mut context = self.context.lock();
+    fn load_guest_context(&self, context: &mut GuestContext) -> Result<()> {
         let cr2 = context.arch().cr2();
         write_cr2_raw(cr2);
-        self.load_guest_run_msrs(&context);
+        self.load_guest_run_msrs(context);
         context.arch_mut().load_fpu();
 
         VmcsGuestNW::RIP.write(context.arch().rip() as usize)?;
@@ -311,13 +326,12 @@ impl<'a> GuestMode<'a> {
         Ok(())
     }
 
-    fn save_guest_context(&self) -> Result<()> {
-        self.context.lock().arch_mut().save_fpu();
-        self.save_guest_run_msrs()?;
+    fn save_guest_context(&self, context: &mut GuestContext) -> Result<()> {
+        context.arch_mut().save_fpu();
+        self.save_guest_run_msrs(context)?;
         use x86_64::registers::control::Cr2;
-        self.context.lock().arch_mut().set_cr2(Cr2::read_raw());
+        context.arch_mut().set_cr2(Cr2::read_raw());
 
-        let mut context = self.context.lock();
         context.arch_mut().set_rip(VmcsGuestNW::RIP.read()? as u64);
         context
             .arch_mut()
@@ -406,7 +420,7 @@ impl<'a> GuestMode<'a> {
         Msr::IA32_KERNEL_GSBASE.write(context.arch().msr(IA32_KERNEL_GSBASE));
     }
 
-    fn save_guest_run_msrs(&self) -> Result<()> {
+    fn save_guest_run_msrs(&self, context: &mut GuestContext) -> Result<()> {
         let star = Msr::IA32_STAR.read();
         let lstar = Msr::IA32_LSTAR.read();
         let cstar = Msr::IA32_CSTAR.read();
@@ -415,7 +429,6 @@ impl<'a> GuestMode<'a> {
         let fs_base = VmcsGuestNW::FS_BASE.read()? as u64;
         let gs_base = VmcsGuestNW::GS_BASE.read()? as u64;
 
-        let mut context = self.context.lock();
         context.arch_mut().set_msr(IA32_STAR, star);
         context.arch_mut().set_msr(IA32_LSTAR, lstar);
         context.arch_mut().set_msr(IA32_CSTAR, cstar);
@@ -426,34 +439,6 @@ impl<'a> GuestMode<'a> {
         context.arch_mut().set_msr(IA32_FS_BASE, fs_base);
         context.arch_mut().set_msr(IA32_GS_BASE, gs_base);
         Ok(())
-    }
-
-    fn wait_for_sipi(&self, rip: Gpaddr) -> Result<GuestExitInfo> {
-        use crate::arch::vm::vmx::VmxExitReason;
-        Ok(GuestExitInfo {
-            exit_reason: VmxExitReason::HLT as _,
-            instruction_len: 0,
-            exit_qualification: 0,
-            guest_phys_addr: 0,
-            guest_rip: rip,
-        })
-    }
-}
-
-struct GuestRunGuard<'a> {
-    guest_context: &'a Mutex<GuestContext>,
-}
-
-impl Drop for GuestRunGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(err) = self.guest_context.lock().vmcs.quit() {
-            error!("errno: {:?}", err);
-            error!("unexpect condition: failed to quit vmcs")
-        }
-        let mut context = self.guest_context.lock();
-        if context.run_state() == VcpuRunState::Running {
-            context.set_run_state(VcpuRunState::Runnable);
-        }
     }
 }
 

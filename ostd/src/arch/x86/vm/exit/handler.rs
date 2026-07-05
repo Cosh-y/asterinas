@@ -15,13 +15,12 @@ use crate::{
         },
     },
     prelude::*,
-    sync::Mutex,
 };
 
 const PAUSE_INSN_LENGTH: u64 = 2;
 
 pub fn vmexit_handler(
-    context: &Mutex<GuestContext>,
+    context: &mut GuestContext,
     exit_info: &VmxExitInfo,
 ) -> Result<Option<GuestExitInfo>> {
     if exit_info.entry_failure {
@@ -69,11 +68,11 @@ pub fn vmexit_handler(
             Ok(None)
         }
         Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
-            context.lock().arch_mut().advance_rip(PAUSE_INSN_LENGTH);
+            context.arch_mut().advance_rip(PAUSE_INSN_LENGTH);
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::HLT) => {
-            context.lock().set_run_state(VcpuRunState::Halted);
+            context.set_run_state(VcpuRunState::Halted);
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::PREEMPTION_TIMER) => Ok(Some(GuestExitInfo::from(*exit_info))),
@@ -104,9 +103,9 @@ fn instruction_len() -> Result<u32> {
     VmcsReadOnly32::VMEXIT_INSTRUCTION_LEN.read()
 }
 
-fn advance_guest_rip(context: &Mutex<GuestContext>) -> Result<()> {
+fn advance_guest_rip(context: &mut GuestContext) -> Result<()> {
     let len = instruction_len()? as usize;
-    context.lock().arch_mut().advance_rip(len as u64);
+    context.arch_mut().advance_rip(len as u64);
     Ok(())
 }
 

@@ -8,8 +8,8 @@ use crate::{
         vmx::flush_ept_all_contexts_sync,
     },
     mm::{
-        page_table::{self, PageTable, PageTableFrag},
         PageProperty, UFrame,
+        page_table::{self, PageTable, PageTableFrag},
     },
     prelude::*,
     task::atomic_mode::AsAtomicModeGuard,
@@ -38,7 +38,7 @@ impl GuestPhysMemSpace {
         }
     }
 
-    /// Gets an immutable cursor in the virtual address range.
+    /// Gets an immutable cursor over a guest physical address range.
     ///
     /// The cursor behaves like a lock guard, exclusively owning a sub-tree of
     /// the page table, preventing others from creating a cursor in it. So be
@@ -54,7 +54,7 @@ impl GuestPhysMemSpace {
         Ok(Cursor(self.pt.cursor(guard, gpa)?))
     }
 
-    /// Gets an mutable cursor in the virtual address range.
+    /// Gets a mutable cursor over a guest physical address range.
     ///
     /// The same as [`Self::cursor`], the cursor behaves like a lock guard,
     /// exclusively owning a sub-tree of the page table, preventing others
@@ -119,30 +119,35 @@ fn flush_and_drop(frags: Vec<PageTableFrag<EptPtConfig>>) {
     drop(frags);
 }
 
+/// A queried EPT mapping item.
+///
+/// The address is the host physical address backing the current guest physical
+/// range, together with the EPT page properties used for that mapping.
 pub type QueriedItem = (Paddr, PageProperty);
 
 /// The cursor for querying over the guest physical memory space without modifying it.
 ///
 /// It exclusively owns a sub-tree of the page table, preventing others from
 /// reading or modifying the same sub-tree. Two read-only cursors can not be
-/// created from the same virtual address range either.
+/// created from the same guest physical address range either.
 pub struct Cursor<'a>(page_table::Cursor<'a, EptPtConfig>);
 
 impl Cursor<'_> {
-    /// Queries the mapping at the current virtual address.
+    /// Queries the mapping at the current guest physical address.
     ///
-    /// If the cursor is pointing to a valid virtual address that is locked,
-    /// it will return the virtual address range and the mapped item.
-    pub fn query(&mut self) -> Result<(Range<Vaddr>, Option<QueriedItem>)> {
+    /// If the cursor is pointing to a valid guest physical address that is
+    /// locked, it will return the guest physical address range and the mapped
+    /// host physical address item.
+    pub fn query(&mut self) -> Result<(Range<Gpaddr>, Option<QueriedItem>)> {
         let (range, item) = self.0.query()?;
         Ok((range, item.map(|(frame, prop)| (frame.paddr(), prop))))
     }
 
-    /// Moves the cursor forward to the next mapped virtual address.
+    /// Moves the cursor forward to the next mapped guest physical address.
     ///
-    /// If there is mapped virtual address following the current address within
-    /// next `len` bytes, it will return that mapped address. In this case,
-    /// the cursor will stop at the mapped address.
+    /// If there is a mapped guest physical address following the current
+    /// address within next `len` bytes, it will return that mapped address. In
+    /// this case, the cursor will stop at the mapped address.
     ///
     /// Otherwise, it will return `None`. And the cursor may stop at any
     /// address after `len` bytes.
@@ -154,7 +159,7 @@ impl Cursor<'_> {
         self.0.find_next(len)
     }
 
-    /// Jumps to the virtual address.
+    /// Jumps to the guest physical address.
     pub fn jump(&mut self, gpa: Gpaddr) -> Result<()> {
         self.0.jump(gpa)?;
         Ok(())
@@ -175,18 +180,19 @@ pub struct CursorMut<'a> {
 }
 
 impl<'a> CursorMut<'a> {
-    /// Queries the mapping at the current virtual address.
+    /// Queries the mapping at the current guest physical address.
     ///
     /// This is the same as [`Cursor::query`].
     ///
-    /// If the cursor is pointing to a valid virtual address that is locked,
-    /// it will return the virtual address range and the mapped item.
-    pub fn query(&mut self) -> Result<(Range<Vaddr>, Option<QueriedItem>)> {
+    /// If the cursor is pointing to a valid guest physical address that is
+    /// locked, it will return the guest physical address range and the mapped
+    /// host physical address item.
+    pub fn query(&mut self) -> Result<(Range<Gpaddr>, Option<QueriedItem>)> {
         let (range, item) = self.pt_cursor.query()?;
         Ok((range, item.map(|(frame, prop)| (frame.paddr(), prop))))
     }
 
-    /// Moves the cursor forward to the next mapped virtual address.
+    /// Moves the cursor forward to the next mapped guest physical address.
     ///
     /// This is the same as [`Cursor::find_next`].
     pub fn find_next(&mut self, len: usize) -> Option<Gpaddr> {
@@ -220,6 +226,16 @@ impl<'a> CursorMut<'a> {
         unsafe { self.pt_cursor.map(item) };
     }
 
+    /// Unmaps mappings from the current guest physical address.
+    ///
+    /// The method removes mapped pages or page-table subtrees up to `len`
+    /// bytes from the current guest physical address, flushes EPT translations,
+    /// and returns the number of unmapped frames or page-table frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is longer than the remaining range of the cursor or is
+    /// not page-aligned.
     pub fn unmap(&mut self, len: usize) -> usize {
         let end_gpa = self.guest_physical_addr() + len;
         let mut num_unmapped: usize = 0;

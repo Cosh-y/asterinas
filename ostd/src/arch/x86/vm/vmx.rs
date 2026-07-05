@@ -7,23 +7,37 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::{
-    arch::vm::types::VcpuRegs, error, error::Error, info, mm::Frame, prelude::*, sync::SpinLock,
+    arch::vm::types::VcpuRegs,
+    error,
+    error::Error,
+    info,
+    mm::Frame,
+    prelude::*,
+    sync::{Mutex, SpinLock},
 };
 
 type GuestPhysAddr = Gpaddr;
 type PhysAddr = Paddr;
 
-/// VMCS revision identifier read from `IA32_VMX_BASIC`.
-static VMCS_REVISION: AtomicU32 = AtomicU32::new(0);
-
 static EPT_FLUSH_LOCK: SpinLock<()> = SpinLock::new(());
 static EPT_FLUSH_ACKS: AtomicUsize = AtomicUsize::new(0);
 static EPT_FLUSH_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static VMX_LIFECYCLE_ACKS: AtomicUsize = AtomicUsize::new(0);
+static VMX_LIFECYCLE_ERRORS: AtomicUsize = AtomicUsize::new(0);
+static VMX_GUARD_STATE: Mutex<VmxGuardState> = Mutex::new(VmxGuardState {
+    active_guards: 0,
+    enabled: false,
+});
 static VMXON_REGIONS: SpinLock<BTreeMap<usize, Frame<()>>> = SpinLock::new(BTreeMap::new());
 
 const INVEPT_ALL_CONTEXTS: u64 = 2;
 const EPT_VPID_CAP_INVEPT: u64 = 1 << 20;
 const EPT_VPID_CAP_INVEPT_ALL_CONTEXTS: u64 = 1 << 26;
+
+struct VmxGuardState {
+    active_guards: usize,
+    enabled: bool,
+}
 
 /*
  * This file contains code derived from the RVM-Tutorial project.
@@ -861,6 +875,74 @@ pub(crate) fn exit_info() -> Result<VmxExitInfo> {
     })
 }
 
+/// Keeps VMX operation enabled while at least one VM exists.
+pub struct VmxGuard {
+    _private: (),
+}
+
+/// Acquires a VMX lifecycle guard.
+pub fn acquire_vmx() -> Result<VmxGuard> {
+    let mut state = VMX_GUARD_STATE.lock();
+    if state.active_guards == usize::MAX {
+        return Err(Error::NotEnoughResources);
+    }
+
+    if !state.enabled {
+        enable_vmx_on_all_cpus()?;
+        state.enabled = true;
+    }
+
+    state.active_guards += 1;
+    Ok(VmxGuard { _private: () })
+}
+
+impl Drop for VmxGuard {
+    fn drop(&mut self) {
+        let mut state = VMX_GUARD_STATE.lock();
+        if state.active_guards == 0 {
+            error!("hypervisor: VMX guard state underflow");
+            return;
+        }
+
+        state.active_guards -= 1;
+        if state.active_guards != 0 || !state.enabled {
+            return;
+        }
+
+        match vmxoff_all_cpus() {
+            Ok(()) => state.enabled = false,
+            Err(err) => {
+                state.enabled = false;
+                error!("hypervisor: failed to disable VMX on all CPUs: {:?}", err);
+            }
+        }
+    }
+}
+
+fn enable_vmx_on_all_cpus() -> Result<()> {
+    // Check CPUID for VMX support
+    let cpuid_result = core::arch::x86_64::__cpuid(1);
+    if (cpuid_result.ecx & (1 << 5)) == 0 {
+        error!("VMX not supported by CPU");
+        return Err(Error::NotEnoughResources);
+    }
+
+    if let Err(err) = vmxon_all_cpus() {
+        error!("hypervisor: failed to enable VMX on all CPUs: {:?}", err);
+        if let Err(rollback_err) = vmxoff_all_cpus() {
+            error!(
+                "hypervisor: failed to roll back partial VMX enablement: {:?}",
+                rollback_err
+            );
+        }
+        return Err(err);
+    }
+
+    info!("VMX initialized successfully");
+    Ok(())
+}
+
+/*
 /// Initializes VMX support on every CPU.
 pub(crate) fn init_vmx() -> Result<()> {
     // Check CPUID for VMX support
@@ -898,16 +980,125 @@ pub(crate) fn init_vmx() -> Result<()> {
     info!("VMX initialized successfully");
     Ok(())
 }
+*/
 
-fn init_vmcs_revision() -> u32 {
-    let msr_value = Msr::IA32_VMX_BASIC.read();
-    let vmcs_revision = (msr_value & 0x7FFF_FFFF) as u32;
-    VMCS_REVISION.store(vmcs_revision, Ordering::Release);
-    vmcs_revision
+fn vmxon_all_cpus() -> Result<()> {
+    run_vmx_lifecycle_on_all_cpus(vmxon_lifecycle_current_cpu)
 }
 
-fn vmcs_revision() -> u32 {
-    VMCS_REVISION.load(Ordering::Acquire)
+fn vmxoff_all_cpus() -> Result<()> {
+    run_vmx_lifecycle_on_all_cpus(vmxoff_lifecycle_current_cpu)
+}
+
+fn run_vmx_lifecycle_on_all_cpus(operation: fn()) -> Result<()> {
+    VMX_LIFECYCLE_ACKS.store(0, Ordering::Release);
+    VMX_LIFECYCLE_ERRORS.store(0, Ordering::Release);
+
+    let targets = crate::cpu::CpuSet::new_full();
+    let cpu_count = crate::cpu::num_cpus();
+    crate::smp::inter_processor_call(&targets, operation);
+
+    while VMX_LIFECYCLE_ACKS.load(Ordering::Acquire) < cpu_count {
+        core::hint::spin_loop();
+    }
+
+    if VMX_LIFECYCLE_ERRORS.load(Ordering::Acquire) != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    Ok(())
+}
+
+fn vmxon_lifecycle_current_cpu() {
+    enable_vmx_in_cr4();
+    if vmxon_current_cpu().is_err() {
+        VMX_LIFECYCLE_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
+    VMX_LIFECYCLE_ACKS.fetch_add(1, Ordering::AcqRel);
+}
+
+fn vmxoff_lifecycle_current_cpu() {
+    if vmxoff_current_cpu().is_err() {
+        VMX_LIFECYCLE_ERRORS.fetch_add(1, Ordering::AcqRel);
+    }
+    VMX_LIFECYCLE_ACKS.fetch_add(1, Ordering::AcqRel);
+}
+
+fn enable_vmx_in_cr4() {
+    const CR4_VMXE: u64 = 1 << 13;
+
+    // SAFETY: VMXON requires CR4.VMXE on the current CPU. This only sets that
+    // architectural enable bit and preserves all other CR4 bits.
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!(
+            "mov {}, cr4",
+            out(reg) cr4,
+            options(nomem, nostack)
+        );
+        cr4 |= CR4_VMXE;
+        core::arch::asm!(
+            "mov cr4, {}",
+            in(reg) cr4,
+            options(nostack)
+        );
+    }
+}
+
+// #[cfg_attr(
+//     not(ktest),
+//     expect(
+//         dead_code,
+//         reason = "Strict VMXON is used by tests and kept for comparison with the guard path."
+//     )
+// )]
+// fn vmxon_current_cpu() -> Result<()> {
+//     let preempt_guard = crate::task::disable_preempt();
+//     let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
+//     if VMXON_REGIONS.lock().contains_key(&cpu) {
+//         return Err(Error::InvalidArgs);
+//     }
+
+//     let vmxon_region = alloc_vmx_revision_region()?;
+//     let vmxon_region_paddr = vmxon_region.paddr();
+//     // SAFETY: The VMXON region is page-sized, aligned, initialized with the
+//     // current VMCS revision ID, and kept alive in `VMXON_REGIONS` until VMXOFF.
+//     unsafe {
+//         vmxon(vmxon_region_paddr)?;
+//     }
+
+//     let old_region = VMXON_REGIONS.lock().insert(cpu, vmxon_region);
+//     debug_assert!(old_region.is_none());
+//     Ok(())
+// }
+
+fn vmxon_current_cpu() -> Result<()> {
+    let preempt_guard = crate::task::disable_preempt();
+    let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
+    if VMXON_REGIONS.lock().contains_key(&cpu) {
+        return Ok(());
+    }
+
+    let vmxon_region = alloc_vmcs()?;
+    let vmxon_region_paddr = vmxon_region.paddr();
+    // SAFETY: The VMXON region is page-sized, aligned, initialized with the
+    // current VMCS revision ID, and kept alive in `VMXON_REGIONS` until VMXOFF.
+    unsafe {
+        vmxon(vmxon_region_paddr)?;
+    }
+
+    let old_region = VMXON_REGIONS.lock().insert(cpu, vmxon_region);
+    debug_assert!(old_region.is_none());
+    Ok(())
+}
+
+fn vmxoff_current_cpu() -> Result<()> {
+    let preempt_guard = crate::task::disable_preempt();
+    let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
+    if !VMXON_REGIONS.lock().contains_key(&cpu) {
+        return Ok(());
+    }
+
+    vmxoff()
 }
 
 /// Enters VMX operation using the supplied VMXON region.
@@ -942,35 +1133,8 @@ unsafe fn vmxon(vmxon_region: PhysAddr) -> Result<()> {
     Ok(())
 }
 
-fn vmxon_current_cpu() -> Result<()> {
-    let preempt_guard = crate::task::disable_preempt();
-    let cpu = u32::from(crate::cpu::PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
-    if VMXON_REGIONS.lock().contains_key(&cpu) {
-        return Err(Error::InvalidArgs);
-    }
-
-    let vmxon_region = alloc_vmx_revision_region()?;
-    let vmxon_region_paddr = vmxon_region.paddr();
-    // SAFETY: The VMXON region is page-sized, aligned, initialized with the
-    // current VMCS revision ID, and kept alive in `VMXON_REGIONS` until VMXOFF.
-    unsafe {
-        vmxon(vmxon_region_paddr)?;
-    }
-
-    let old_region = VMXON_REGIONS.lock().insert(cpu, vmxon_region);
-    debug_assert!(old_region.is_none());
-    Ok(())
-}
-
 /// Leaves VMX operation on the current CPU.
 #[inline]
-#[cfg_attr(
-    not(ktest),
-    expect(
-        dead_code,
-        reason = "VMX shutdown is used by tests and future CPU teardown."
-    )
-)]
 pub(super) fn vmxoff() -> Result<()> {
     let cpu = {
         let preempt_guard = crate::task::disable_preempt();
@@ -1136,10 +1300,6 @@ pub(super) fn vmptrld(vmcs: u64) -> Result<()> {
 
 /// Allocates a zeroed VMCS region with the current VMCS revision ID.
 pub(super) fn alloc_vmcs() -> Result<Frame<()>> {
-    alloc_vmx_revision_region()
-}
-
-fn alloc_vmx_revision_region() -> Result<Frame<()>> {
     use crate::mm::{FrameAllocOptions, paddr_to_vaddr};
 
     let frame = FrameAllocOptions::new()
@@ -1158,6 +1318,10 @@ fn alloc_vmx_revision_region() -> Result<Frame<()>> {
     }
 
     Ok(frame)
+}
+
+fn vmcs_revision() -> u32 {
+    (Msr::IA32_VMX_BASIC.read() & 0x7FFF_FFFF) as u32
 }
 
 /// Enters or resumes the guest and returns after a VM exit.

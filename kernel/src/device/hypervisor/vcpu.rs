@@ -1,10 +1,10 @@
 use ostd::{
-    arch::vm::{GuestContext, GuestCpuidEntry as ArchGuestCpuidEntry},
+    arch::vm::{GuestContext, GuestCpuidEntry as ArchGuestCpuidEntry, VcpuRunState},
     vm::{GuestInterruptPort, GuestTimerPort},
 };
 
 use super::{
-    apic::Lapic,
+    apic::{Lapic, LapicPort},
     ioctl::{
         IA32_TSC_DEADLINE, KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE,
         LapicState, MpState, VcpuCpuidEntry2, VcpuMsrEntry, VcpuRegs, VcpuSregs,
@@ -48,7 +48,7 @@ pub(super) enum PendingOperation {
 pub struct Vcpu {
     pub(super) vm: Weak<Vm>,
     pub(super) guest_context: Mutex<GuestContext>,
-    pub(super) lapic: SpinLock<Lapic>,
+    pub(super) lapic: LapicPort,
     run_page: Arc<Vmo>,
     pending_operation: Mutex<Option<PendingOperation>>,
     kvmclock: Mutex<KvmClock>,
@@ -60,7 +60,7 @@ impl Vcpu {
         Ok(Arc::new(Self {
             vm: Arc::downgrade(vm),
             guest_context: Mutex::new(GuestContext::new(id)?),
-            lapic: SpinLock::new(lapic),
+            lapic: LapicPort::new(lapic),
             run_page,
             pending_operation: Mutex::new(None),
             kvmclock: Mutex::new(KvmClock::default()),
@@ -237,7 +237,7 @@ impl Vcpu {
     }
 
     pub(super) fn read_tsc_deadline_msr(&self, index: u32) -> Option<u64> {
-        (index == IA32_TSC_DEADLINE).then(|| self.lapic.lock().read_tsc_deadline_msr())
+        (index == IA32_TSC_DEADLINE).then(|| self.lapic().read_tsc_deadline_msr())
     }
 
     pub(super) fn write_tsc_deadline_msr(&self, index: u32, value: u64) -> bool {
@@ -245,7 +245,7 @@ impl Vcpu {
             return false;
         }
 
-        self.lapic.lock().write_tsc_deadline_msr(value);
+        self.lapic().write_tsc_deadline_msr(value);
         true
     }
 
@@ -269,7 +269,7 @@ impl Vcpu {
             }
         }
 
-        Ok(self.lapic.lock().to_kvm_state())
+        Ok(self.lapic().to_kvm_state())
     }
 
     pub fn set_lapic(&self, state: &LapicState) -> Result<()> {
@@ -280,7 +280,7 @@ impl Vcpu {
             }
         }
 
-        self.lapic.lock().set_from_kvm_state(state);
+        self.lapic().set_from_kvm_state(state);
         Ok(())
     }
 
@@ -298,6 +298,10 @@ impl Vcpu {
         self.guest_context.lock().receive_sipi(vector);
     }
 
+    pub(super) fn wait_for_sipi_wakeup(&self) -> bool {
+        self.guest_context.lock().run_state() != VcpuRunState::WaitForSipi
+    }
+
     pub(super) fn wait_for_hlt_wakeup(&self) -> bool {
         use ostd::arch::{read_tsc, tsc_freq};
         let wait_max_ticks = match tsc_freq() {
@@ -307,9 +311,9 @@ impl Vcpu {
         let start_tsc = read_tsc();
         loop {
             let guest_tsc = self.guest_context().guest_tsc();
-            self.lapic.lock().check_deadline(guest_tsc);
+            self.lapic.check_deadline(guest_tsc);
 
-            if self.lapic.lock().check_pending_interrupt().is_some() {
+            if self.lapic.check_pending_interrupt().is_some() {
                 return true;
             }
 

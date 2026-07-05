@@ -1,7 +1,6 @@
-use crate::{arch::vm::context::GuestContext, prelude::*, sync::Mutex};
+use crate::{arch::vm::context::GuestContext, prelude::*};
 
-pub(crate) fn emulate_cpuid(context: &Mutex<GuestContext>) -> Result<()> {
-    let mut context = context.lock();
+pub(crate) fn emulate_cpuid(context: &mut GuestContext) -> Result<()> {
     let function = context.arch().gpr(0) as u32;
     let index = context.arch().gpr(2) as u32;
     let entry = context.cpuid_result(function, index);

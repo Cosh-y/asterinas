@@ -9,6 +9,10 @@
 /// The implementation is supplied by the kernel. It may model a virtual
 /// interrupt controller, such as a local APIC, or it may be a policy object
 /// that never offers interrupts.
+///
+/// These methods may be called while guest entry preparation has disabled
+/// preemption or local interrupts. Implementations must not sleep, yield, or
+/// wait on synchronization primitives that can block the current task.
 pub trait GuestInterruptPort {
     /// Returns the next external interrupt vector to offer for injection.
     ///
@@ -32,5 +36,5 @@ pub trait GuestInterruptPort {
     /// update their state accordingly. For a virtual APIC, this usually means
     /// moving the vector from a pending state to an in-service state and
     /// refreshing any priority bookkeeping.
-    fn accept_interrupt(&mut self, vector: u8);
+    fn accept_interrupt(&self, vector: u8);
 }

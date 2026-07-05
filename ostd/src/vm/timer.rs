@@ -2,6 +2,10 @@
 ///
 /// `GuestMode` uses this port before VM entry to ask when a VM exit should
 /// happen so the kernel can publish a virtual timer interrupt in time.
+///
+/// This method may be called while guest entry preparation has disabled
+/// preemption or local interrupts. Implementations must not sleep, yield, or
+/// wait on synchronization primitives that can block the current task.
 pub trait GuestTimerPort {
     /// Returns the next guest timer deadline after `current_tsc`.
     ///
@@ -19,5 +23,5 @@ pub trait GuestTimerPort {
     /// should update its timer state before returning. This usually means
     /// queuing a pending timer interrupt, advancing or clearing its internal
     /// next deadline, and returning the next active deadline if one remains.
-    fn check_deadline(&mut self, current_tsc: u64) -> Option<u64>;
+    fn check_deadline(&self, current_tsc: u64) -> Option<u64>;
 }
