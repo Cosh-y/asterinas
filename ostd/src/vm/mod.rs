@@ -15,7 +15,7 @@ pub use crate::arch::vm::vmx::{VmxGuard, acquire_vmx};
 use crate::{
     Error,
     arch::vm::{
-        GuestContext, GuestExitInfo, VcpuDtable, VcpuSegment,
+        GuestContext, GuestExitInfo, VcpuDtable, X86GprIndex, VcpuSegment,
         context::VcpuRunState,
         control_regs::{VcpuControlRegister, VcpuControlRegisters},
         interrupt::resume_from_halted,
@@ -295,7 +295,7 @@ impl GuestMode {
         context.arch_mut().load_fpu();
 
         VmcsGuestNW::RIP.write(context.arch().rip() as usize)?;
-        VmcsGuestNW::RSP.write(context.arch().gpr(7) as usize)?;
+        VmcsGuestNW::RSP.write(context.arch().gpr(X86GprIndex::Rsp) as usize)?;
         // TODO: why | 0x2 ?
         VmcsGuestNW::RFLAGS.write((context.arch().rflags() | 0x2) as usize)?;
 
@@ -335,7 +335,7 @@ impl GuestMode {
         context.arch_mut().set_rip(VmcsGuestNW::RIP.read()? as u64);
         context
             .arch_mut()
-            .set_gpr(7, 8, VmcsGuestNW::RSP.read()? as u64);
+            .set_gpr(X86GprIndex::Rsp, 8, VmcsGuestNW::RSP.read()? as u64);
         context
             .arch_mut()
             .set_rflags(VmcsGuestNW::RFLAGS.read()? as u64);

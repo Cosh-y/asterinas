@@ -208,6 +208,7 @@ impl FileLike for VmFile {
             }
             cmd @ IrqFd => {
                 let _irqfd = cmd.read()?;
+                // TODO: Implement IRQFD handling
                 Ok(0)
             }
             cmd @ CreatePit2 => {
@@ -216,12 +217,13 @@ impl FileLike for VmFile {
             }
             cmd @ IoEventFd => {
                 let _ioeventfd = cmd.read()?;
-                // TODO:
+                // TODO: Implement IOEventFD handling
                 Ok(0)
             }
             cmd @ SetClock => {
                 let clock = cmd.read()?;
                 self.vm.set_clock(clock);
+                // TODO: Make it work with kvmclock.rs.
                 Ok(0)
             }
             cmd @ GetClock => {
@@ -231,6 +233,7 @@ impl FileLike for VmFile {
             }
             cmd @ SignalMsi => {
                 let _msi = cmd.read()?;
+                // TODO: Implement MSI signaling
                 Ok(1)
             }
             cmd @ EnableCap => {

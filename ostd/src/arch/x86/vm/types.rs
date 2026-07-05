@@ -2,6 +2,11 @@
 
 //! Provide the basic types used to represent the context on an Intel x86 CPU
 
+use crate::{
+    error::Error,
+    prelude::*
+};
+
 /// Guest general-purpose registers.
 ///
 /// This structure represents the guest CPU's general-purpose registers.
@@ -30,6 +35,59 @@ pub struct VcpuRegs {
     pub r15: u64,
     pub rip: u64,
     pub rflags: u64,
+}
+
+/// A guest general-purpose register.
+#[expect(
+    missing_docs,
+    reason = "X86 general-purpose register names are self-describing."
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum X86GprIndex {
+    Rax,
+    Rbx,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+    Rbp,
+    Rsp,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+}
+
+impl X86GprIndex {
+    /// Converts an x86 instruction or VM-exit GPR encoding into a register.
+    ///
+    /// This encoding is used by fields such as `ModRM.reg` and the VMX
+    /// control-register access exit qualification.
+    pub fn from_x86_reg_encoding(index: u8) -> Result<Self> {
+        Ok(match index {
+            0 => Self::Rax,
+            1 => Self::Rcx,
+            2 => Self::Rdx,
+            3 => Self::Rbx,
+            4 => Self::Rsp,
+            5 => Self::Rbp,
+            6 => Self::Rsi,
+            7 => Self::Rdi,
+            8 => Self::R8,
+            9 => Self::R9,
+            10 => Self::R10,
+            11 => Self::R11,
+            12 => Self::R12,
+            13 => Self::R13,
+            14 => Self::R14,
+            15 => Self::R15,
+            _ => return Err(Error::InvalidArgs),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

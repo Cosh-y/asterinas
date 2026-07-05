@@ -3,7 +3,7 @@
 //! VCPU file descriptor implementation
 
 use ostd::{
-    arch::vm::{GuestExitInfo, VmxExitReason},
+    arch::vm::{GuestExitInfo, X86GprIndex, VmxExitReason},
     mm::VmIo,
     task::Task,
     vm::{GuestMode, GuestRunResult},
@@ -25,10 +25,6 @@ use crate::{
     prelude::*,
     util::ioctl::{RawIoctl, dispatch_ioctl},
 };
-
-const GPR_RAX: u8 = 0;
-const GPR_RCX: u8 = 2;
-const GPR_RDX: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 enum MsrAccess {
@@ -444,7 +440,7 @@ impl VcpuFile {
             let value = u64::from_le_bytes(bytes);
             self.vcpu
                 .guest_context()
-                .set_gpr(GPR_RAX, operation.size, value);
+                .set_gpr(X86GprIndex::Rax, operation.size, value);
         }
 
         self.vcpu
@@ -470,9 +466,9 @@ impl VcpuFile {
     fn emulate_kernel_msr(&self, exit_info: &GuestExitInfo, access: MsrAccess) -> Result<bool> {
         let (msr_index, msr_value) = {
             let context = self.vcpu.guest_context();
-            let msr_index = context.gpr(GPR_RCX) as u32;
-            let msr_value =
-                (context.gpr(GPR_RAX) as u32 as u64) | ((context.gpr(GPR_RDX) as u32 as u64) << 32);
+            let msr_index = context.gpr(X86GprIndex::Rcx) as u32;
+            let msr_value = (context.gpr(X86GprIndex::Rax) as u32 as u64)
+                | ((context.gpr(X86GprIndex::Rdx) as u32 as u64) << 32);
             (msr_index, msr_value)
         };
         if !kvmclock::is_kvmclock_msr(msr_index) && msr_index != IA32_TSC_DEADLINE {
@@ -487,8 +483,8 @@ impl VcpuFile {
                     .or_else(|| self.vcpu.read_tsc_deadline_msr(msr_index))
                     .unwrap_or(0);
                 let mut context = self.vcpu.guest_context();
-                context.set_gpr(GPR_RAX, 8, value as u32 as u64);
-                context.set_gpr(GPR_RDX, 8, value >> 32);
+                context.set_gpr(X86GprIndex::Rax, 8, value as u32 as u64);
+                context.set_gpr(X86GprIndex::Rdx, 8, value >> 32);
                 context.advance_rip(u64::from(exit_info.instruction_len));
             }
             MsrAccess::Write => {
@@ -576,7 +572,7 @@ impl VcpuFile {
             .write_run_val(KVM_RUN_IO_DATA_OFFSET_OFFSET, &data_offset)?;
 
         if direction == PioDirection::Out {
-            let rax = self.vcpu.guest_context().gpr(GPR_RAX);
+            let rax = self.vcpu.guest_context().gpr(X86GprIndex::Rax);
             let bytes = rax.to_le_bytes();
             self.vcpu
                 .write_run_bytes(KVM_RUN_IO_DATA_OFFSET, &bytes[..size as usize])?;

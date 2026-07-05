@@ -1,6 +1,8 @@
 //! Emulated LAPIC and IOAPIC device for guest VMs.
 //!
 //! Use pure software emulate for now.
+use ostd::arch::vm::X86GprIndex;
+
 use super::ioctl::LapicState;
 use crate::prelude::*;
 
@@ -654,25 +656,10 @@ pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool>
     let (guest_rip, guest_rip_gpa) = {
         let context = vcpu.guest_context();
         let guest_rip = context.rip() as usize;
-        let guest_rip_gpa = match translate_gva_to_gpa(&context, &vm_handle, guest_rip) {
-            Ok(gpa) => gpa,
-            Err(err) => {
-                error!(
-                    "hypervisor: failed to translate APIC MMIO instruction RIP {:#x}: {:?}",
-                    guest_rip, err
-                );
-                return Err(err.into());
-            }
-        };
+        let guest_rip_gpa = translate_gva_to_gpa(&context, &vm_handle, guest_rip)?;
         (guest_rip, guest_rip_gpa)
     };
-    if let Err(err) = vm_handle.read_guest_bytes(guest_rip_gpa, &mut insn_bytes) {
-        error!(
-            "hypervisor: failed to read APIC MMIO instruction bytes: rip={:#x}, gpa={:#x}, err={:?}",
-            guest_rip, guest_rip_gpa, err
-        );
-        return Err(err);
-    }
+    vm_handle.read_guest_bytes(guest_rip_gpa, &mut insn_bytes)?;
 
     let Some(insn) = decode_mmio_instruction(&insn_bytes) else {
         error!(
@@ -753,8 +740,8 @@ fn emulate_lapic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64, insn: MmioInstruction) ->
             return Ok(false);
         }
 
-        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
-        vcpu.guest_context().set_gpr(gpr_index, insn.size, value);
+        let gpr = X86GprIndex::from_x86_reg_encoding(insn.reg)?;
+        vcpu.guest_context().set_gpr(gpr, insn.size, value);
 
         return Ok(true);
     }
@@ -764,8 +751,8 @@ fn emulate_lapic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64, insn: MmioInstruction) ->
         if let Some(value) = insn.imm {
             value
         } else {
-            let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
-            vcpu.guest_context().gpr(gpr_index)
+            let gpr = X86GprIndex::from_x86_reg_encoding(insn.reg)?;
+            vcpu.guest_context().gpr(gpr)
         }
     };
 
@@ -796,8 +783,8 @@ fn emulate_ioapic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64, insn: MmioInstruction) -
         if !ok {
             return Ok(false);
         }
-        let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
-        vcpu.guest_context().set_gpr(gpr_index, insn.size, value);
+        let gpr = X86GprIndex::from_x86_reg_encoding(insn.reg)?;
+        vcpu.guest_context().set_gpr(gpr, insn.size, value);
 
         return Ok(true);
     }
@@ -807,8 +794,8 @@ fn emulate_ioapic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64, insn: MmioInstruction) -
         if let Some(value) = insn.imm {
             value
         } else {
-            let gpr_index = map_instruction_gpr_index_to_common_gpr_index(insn.reg);
-            vcpu.guest_context().gpr(gpr_index)
+            let gpr = X86GprIndex::from_x86_reg_encoding(insn.reg)?;
+            vcpu.guest_context().gpr(gpr)
         }
     };
     if !emulate_ioapic_write(&mut ioapic, offset, value) {
@@ -1186,20 +1173,4 @@ fn read_le_immediate(bytes: &[u8; MAX_INSN_LENGTH], offset: usize, size: usize) 
         value |= u64::from(*byte) << (index * 8);
     }
     Some(value)
-}
-
-fn map_instruction_gpr_index_to_common_gpr_index(index: u8) -> u8 {
-    // The encode method of gpr index in ModRM:
-    // ???
-    match index {
-        0 => 0,
-        1 => 2,
-        2 => 3,
-        3 => 1,
-        4 => 7,
-        5 => 6,
-        6 => 4,
-        7 => 5,
-        other => other,
-    }
 }

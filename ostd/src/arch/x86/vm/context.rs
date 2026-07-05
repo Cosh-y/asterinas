@@ -3,7 +3,7 @@ use x86_64::registers::{control::Cr0Flags, model_specific::EferFlags};
 use super::{
     control_regs::VcpuControlRegisters,
     cpuid::{GuestCpuidEntry, default_cpuid_entries},
-    types::{VcpuDtable, VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
+    types::{VcpuDtable, X86GprIndex, VcpuMsrs, VcpuRegs, VcpuSegment, VcpuSregs},
     vmcs::{Vmcs, VmcsGuestState},
 };
 use crate::{arch::cpu::context::FpuContext, prelude::*};
@@ -133,21 +133,18 @@ impl GuestContext {
         self.arch.set_sregs(sregs);
     }
 
-    /// Returns a guest general-purpose register by VMX register index.
-    ///
-    /// Invalid register indexes return zero.
-    pub fn gpr(&self, index: u8) -> u64 {
-        self.arch.gpr(index)
+    /// Returns a guest general-purpose register.
+    pub fn gpr(&self, reg: X86GprIndex) -> u64 {
+        self.arch.gpr(reg)
     }
 
-    /// Updates a guest general-purpose register by VMX register index.
+    /// Updates a guest general-purpose register.
     ///
     /// The `width_byte` argument controls whether the low 1, 2, 4, or 8 bytes
-    /// are updated. Invalid register indexes are ignored. The caller is
-    /// responsible for using an index and width that match the emulated guest
-    /// instruction.
-    pub fn set_gpr(&mut self, index: u8, width_byte: u8, value: u64) {
-        self.arch.set_gpr(index, width_byte, value);
+    /// are updated. The caller is responsible for using a register and width
+    /// that match the emulated guest instruction.
+    pub fn set_gpr(&mut self, reg: X86GprIndex, width_byte: u8, value: u64) {
+        self.arch.set_gpr(reg, width_byte, value);
     }
 
     /// Advances the guest instruction pointer.
@@ -354,50 +351,45 @@ impl VcpuArchState {
             .find(|entry| entry.matches(function, index))
     }
 
-    pub fn gpr(&self, index: u8) -> u64 {
-        match index {
-            // the order comes from
-            // Intel® 64 and IA-32 Architectures Software Developer’s Manual
-            // 3.4.1 General-Purpose Registers
-            0 => self.regs.rax,
-            1 => self.regs.rbx,
-            2 => self.regs.rcx,
-            3 => self.regs.rdx,
-            4 => self.regs.rsi,
-            5 => self.regs.rdi,
-            6 => self.regs.rbp,
-            7 => self.regs.rsp,
-            8 => self.regs.r8,
-            9 => self.regs.r9,
-            10 => self.regs.r10,
-            11 => self.regs.r11,
-            12 => self.regs.r12,
-            13 => self.regs.r13,
-            14 => self.regs.r14,
-            15 => self.regs.r15,
-            _ => 0,
+    pub fn gpr(&self, reg: X86GprIndex) -> u64 {
+        match reg {
+            X86GprIndex::Rax => self.regs.rax,
+            X86GprIndex::Rbx => self.regs.rbx,
+            X86GprIndex::Rcx => self.regs.rcx,
+            X86GprIndex::Rdx => self.regs.rdx,
+            X86GprIndex::Rsi => self.regs.rsi,
+            X86GprIndex::Rdi => self.regs.rdi,
+            X86GprIndex::Rbp => self.regs.rbp,
+            X86GprIndex::Rsp => self.regs.rsp,
+            X86GprIndex::R8 => self.regs.r8,
+            X86GprIndex::R9 => self.regs.r9,
+            X86GprIndex::R10 => self.regs.r10,
+            X86GprIndex::R11 => self.regs.r11,
+            X86GprIndex::R12 => self.regs.r12,
+            X86GprIndex::R13 => self.regs.r13,
+            X86GprIndex::R14 => self.regs.r14,
+            X86GprIndex::R15 => self.regs.r15,
         }
     }
 
-    pub fn set_gpr(&mut self, index: u8, width_byte: u8, value: u64) {
-        let slot = match index {
-            0 => &mut self.regs.rax,
-            1 => &mut self.regs.rbx,
-            2 => &mut self.regs.rcx,
-            3 => &mut self.regs.rdx,
-            4 => &mut self.regs.rsi,
-            5 => &mut self.regs.rdi,
-            6 => &mut self.regs.rbp,
-            7 => &mut self.regs.rsp,
-            8 => &mut self.regs.r8,
-            9 => &mut self.regs.r9,
-            10 => &mut self.regs.r10,
-            11 => &mut self.regs.r11,
-            12 => &mut self.regs.r12,
-            13 => &mut self.regs.r13,
-            14 => &mut self.regs.r14,
-            15 => &mut self.regs.r15,
-            _ => return,
+    pub fn set_gpr(&mut self, reg: X86GprIndex, width_byte: u8, value: u64) {
+        let slot = match reg {
+            X86GprIndex::Rax => &mut self.regs.rax,
+            X86GprIndex::Rbx => &mut self.regs.rbx,
+            X86GprIndex::Rcx => &mut self.regs.rcx,
+            X86GprIndex::Rdx => &mut self.regs.rdx,
+            X86GprIndex::Rsi => &mut self.regs.rsi,
+            X86GprIndex::Rdi => &mut self.regs.rdi,
+            X86GprIndex::Rbp => &mut self.regs.rbp,
+            X86GprIndex::Rsp => &mut self.regs.rsp,
+            X86GprIndex::R8 => &mut self.regs.r8,
+            X86GprIndex::R9 => &mut self.regs.r9,
+            X86GprIndex::R10 => &mut self.regs.r10,
+            X86GprIndex::R11 => &mut self.regs.r11,
+            X86GprIndex::R12 => &mut self.regs.r12,
+            X86GprIndex::R13 => &mut self.regs.r13,
+            X86GprIndex::R14 => &mut self.regs.r14,
+            X86GprIndex::R15 => &mut self.regs.r15,
         };
 
         *slot = match width_byte {

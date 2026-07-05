@@ -29,6 +29,6 @@ pub use self::{
     context::{GuestContext, VcpuRunState},
     cpuid::{GuestCpuidEntry, VIRTUAL_TSC_CRYSTAL_HZ, default_cpuid_entries},
     exit::GuestExitInfo,
-    types::{VcpuDtable, VcpuRegs, VcpuSegment, VcpuSregs},
+    types::{VcpuDtable, X86GprIndex, VcpuRegs, VcpuSegment, VcpuSregs},
     vmx::VmxExitReason,
 };
