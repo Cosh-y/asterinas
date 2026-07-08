@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6ef2cb5e.js";
+            window.path_to_searchindex_js = "searchindex-ce81f7d5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-be22b629.js"></script>
+        <script src="toc-edf01086.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -10319,702 +10319,6 @@ the CI will automatically publish the new crate versions.</p>
 <p>The Asterinas RFC process is intended to provide a consistent, transparent, structured path for the community to make “big” decisions. For example, the RFC process can be used to evolve the project roadmap and the system architecture.</p>
 <p>For more details, see the <a href="#rfc-0001-rfc-process">RFC-0001 RFC process</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="rfc-0000-hypervisor-module"><a class="header" href="#rfc-0000-hypervisor-module">RFC-0000: Hypervisor Module</a></h1>
-<ul>
-<li>Status: Draft</li>
-<li>Pull request: https://github.com/asterinas/asterinas/pull/3417</li>
-<li>Date submitted: 2026-06-21</li>
-<li>Date approved: YYYY-MM-DD</li>
-</ul>
-<h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
-<p>This RFC proposes extending OSTD with hypervisor support. These OSTD facilities allow <code>kernel/</code> to safely implement a complete hypervisor, including a KVM-compatible control plane, while keeping privileged virtualization mechanisms inside OSTD. The initial implementation targets Intel VMX with EPT on x86.</p>
-<h2 id="motivation"><a class="header" href="#motivation">Motivation</a></h2>
-<p>Asterinas aims to be Linux-compatible, and Linux exposes hardware virtualization through KVM. To match that host capability, Asterinas needs first-class virtualization support for existing KVM-oriented VMMs and unmodified guest kernels.</p>
-<p>Supporting virtualization requires extending the framekernel boundary with care. Taking x86 as an example, a malformed VMCS, a bad EPT mapping, or an incorrectly restored host register can break the soundness semantics of the host kernel. Therefore, this RFC focuses on what kind of OSTD hypervisor layer Asterinas needs: it must provide soundness by encapsulating privileged virtualization mechanisms, minimality by keeping the trusted surface small, and expressiveness by giving <code>kernel/</code> enough safe operations to build a complete hypervisor above it.</p>
-<h2 id="design"><a class="header" href="#design">Design</a></h2>
-<h3 id="layering"><a class="header" href="#layering">Layering</a></h3>
-<p>The hypervisor stack is split into three layers.</p>
-<p>The userspace VMM owns VM policy and device models that do not need to be in the kernel: loading a Linux image, choosing the guest memory layout, handling PIO or MMIO exits such as UART, and integrating with higher-level container runtimes.</p>
-<p>The Asterinas kernel owns the KVM-compatible file-descriptor ABI and kernel policy. It implements <code>/dev/kvm</code>, VM file descriptors, vCPU file descriptors, the <code>kvm_run</code> shared page, memory-slot registration, register ioctls, basic inkernel irqchip emulation, and conversion between KVM structs and OSTD types.</p>
-<p>OSTD owns the virtualization mechanism. It manages hardware virtualization state, second-stage address translation, and guest-host context switching, and returns <code>GuestRunResult</code> events to the kernel. The VM-exit case carries a small <code>GuestExitInfo</code> record.</p>
-<p>This split mirrors the existing user-mode design in Asterinas. The kernel can decide what to run and how to handle exits, but the transition that could affect host CPU state is mediated by OSTD.</p>
-<h3 id="ostd-interface-design"><a class="header" href="#ostd-interface-design">OSTD Interface Design</a></h3>
-<p>The OSTD hypervisor interface is centered on three safe abstractions. <code>GuestPhysMemSpace</code> represents guest physical memory and owns second-stage translation from guest physical addresses to host frames. <code>GuestContext</code> represents the per-vCPU architectural state that must survive across guest exits. <code>GuestMode</code> is the execution object that enters guest mode, handles the guest-host state transition, and returns exits to the kernel. Together, these types expose the mechanisms needed by the safe kernel hypervisor layer while keeping hardware virtualization internals inside OSTD.</p>
-<p>The following diagram shows the core object ownership and the upper-lower relationship between the kernel hypervisor layer and the OSTD VM API.</p>
-<pre class="mermaid">flowchart TB
-    subgraph KF["kernel fd objects"]
-        direction LR
-        VmFile["VmFile&lt;br/&gt;VM fd"]
-        VcpuFile["VcpuFile&lt;br/&gt;vCPU fd"]
-    end
-
-    subgraph KS["kernel VM/vCPU state"]
-        direction LR
-        Vm["Vm&lt;br/&gt;memory slots"]
-        Vcpu["Vcpu&lt;br/&gt;per-vCPU state"]
-        Policy["interrupt and timer policy"]
-    end
-
-    subgraph O["ostd safe public API"]
-        direction LR
-        Gpm["GuestPhysMemSpace&lt;br/&gt;guest physical memory&lt;br/&gt;2-stage translation page table"]
-        Context["GuestContext&lt;br/&gt;guest vCPU state"]
-        Mode["GuestMode::execute&lt;br/&gt;enter guest mode&lt;br/&gt;run vCPU and return exit reason"]
-        Ports["GuestInterruptPort&lt;br/&gt;GuestTimerPort"]
-    end
-
-    VmFile -- "own (Arc)" --&gt; Vm
-    VmFile -- "KVM_CREATE_VCPU" --&gt; VcpuFile
-    VcpuFile -- "own (Arc)" --&gt; Vm
-    VcpuFile -- "own (Arc)" --&gt; Vcpu
-
-    Vm -- "own (by value)" --&gt; Gpm
-    Vm -- "own vCPU table (Arc)" --&gt; Vcpu
-
-    Vcpu -- "borrow (Weak)" --&gt; Vm
-    Vcpu -- "own (Mutex)" --&gt; Context
-    Vcpu -- "own" --&gt; Policy
-
-    VcpuFile -- "KVM_RUN creates temporary" --&gt; Mode
-    Policy -. "implements" .-&gt; Ports
-    Mode -- "borrow" --&gt; Ports
-    Mode -- "borrow" --&gt; Gpm
-    Mode -- "mutable borrow" --&gt; Context
-</pre>
-
-<h4 id="guestphysmemspace"><a class="header" href="#guestphysmemspace">GuestPhysMemSpace</a></h4>
-<p><code>GuestPhysMemSpace</code> represents a guest physical address space backed by second-stage translation page table.</p>
-<p>Its public interface is:</p>
-<pre><code class="language-rust">// ostd/src/vm/gpm_space.rs
-
-/// Manages the guest physical memory space of a VM.
-///
-/// This type owns the page table that maps guest physical addresses to
-/// host physical frames. One `GuestPhysMemSpace` can be reused by multiple
-/// vCPUs in the same VM by passing a reference to
-/// [`super::GuestMode::execute`].
-pub struct GuestPhysMemSpace;
-
-impl GuestPhysMemSpace {
-    /// Creates a new guest physical memory space.
-    /// 
-    /// # Errors
-    /// Returns an error if the CPU does not support second-stage address
-    /// translation.
-    pub fn new() -&gt; Result&lt;Self&gt;;
-
-    /// Gets an immutable cursor over a guest physical address range.
-    ///
-    /// The cursor behaves like a lock guard, exclusively owning a sub-tree of
-    /// the page table, preventing others from creating a cursor in it. So be
-    /// sure to drop the cursor as soon as possible.
-    ///
-    /// The creation of the cursor may block if another cursor having an
-    /// overlapping range is alive.
-    pub fn cursor&lt;'a, G: AsAtomicModeGuard&gt;(
-        &amp;'a self,
-        guard: &amp;'a G,
-        gpa: &amp;Range&lt;Gpaddr&gt;,
-    ) -&gt; Result&lt;Cursor&lt;'a&gt;&gt;;
-
-    /// Gets a mutable cursor over a guest physical address range.
-    ///
-    /// The same as [`Self::cursor`], the cursor behaves like a lock guard,
-    /// exclusively owning a sub-tree of the page table, preventing others
-    /// from creating a cursor in it. So be sure to drop the cursor as soon as
-    /// possible.
-    ///
-    /// The creation of the cursor may block if another cursor having an
-    /// overlapping range is alive. The modification to the mapping by the
-    /// cursor may also block or be overridden the mapping of another cursor.
-    pub fn cursor_mut&lt;'a, G: AsAtomicModeGuard&gt;(
-        &amp;'a self,
-        guard: &amp;'a G,
-        gpa: &amp;Range&lt;Gpaddr&gt;,
-    ) -&gt; Result&lt;CursorMut&lt;'a&gt;&gt;;
-}
-
-impl Default for GuestPhysMemSpace;
-
-/// A queried mapping item.
-///
-/// The address is the host physical address backing the current guest physical
-/// range, together with the page properties used for that mapping.
-pub type QueriedItem = (Paddr, PageProperty);
-
-/// The cursor for querying over the guest physical memory space without modifying it.
-///
-/// It exclusively owns a sub-tree of the page table, preventing others from
-/// reading or modifying the same sub-tree. Two read-only cursors can not be
-/// created from the same guest physical address range either.
-pub struct Cursor&lt;'a&gt;;
-
-impl Cursor&lt;'_&gt; {
-    /// Queries the mapping at the current guest physical address.
-    ///
-    /// If the cursor is pointing to a valid guest physical address that is
-    /// locked, it will return the guest physical address range and the mapped
-    /// host physical address item.
-    pub fn query(&amp;mut self) -&gt; Result&lt;(Range&lt;Gpaddr&gt;, Option&lt;QueriedItem&gt;)&gt;;
-
-    /// Moves the cursor forward to the next mapped guest physical address.
-    ///
-    /// If there is a mapped guest physical address following the current
-    /// address within next `len` bytes, it will return that mapped address. In
-    /// this case, the cursor will stop at the mapped address.
-    ///
-    /// Otherwise, it will return `None`. And the cursor may stop at any
-    /// address after `len` bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the length is longer than the remaining range of the cursor.
-    pub fn find_next(&amp;mut self, len: usize) -&gt; Option&lt;Gpaddr&gt;;
-
-    /// Jumps to the guest physical address.
-    pub fn jump(&amp;mut self, gpa: Gpaddr) -&gt; Result&lt;()&gt;;
-
-    /// Gets the guest physical address of the current slot.
-    pub fn guest_physical_addr(&amp;self) -&gt; Gpaddr;
-}
-
-/// The cursor for modifying the mappings in guest physical memory space.
-///
-/// It exclusively owns a sub-tree of the page table, preventing others from
-/// reading or modifying the same sub-tree.
-pub struct CursorMut&lt;'a&gt;;
-
-impl&lt;'a&gt; CursorMut&lt;'a&gt; {
-    /// Queries the mapping at the current guest physical address.
-    ///
-    /// This is the same as [`Cursor::query`].
-    ///
-    /// If the cursor is pointing to a valid guest physical address that is
-    /// locked, it will return the guest physical address range and the mapped
-    /// host physical address item.
-    pub fn query(&amp;mut self) -&gt; Result&lt;(Range&lt;Gpaddr&gt;, Option&lt;QueriedItem&gt;)&gt;;
-
-    /// Moves the cursor forward to the next mapped guest physical address.
-    ///
-    /// This is the same as [`Cursor::find_next`].
-    pub fn find_next(&amp;mut self, len: usize) -&gt; Option&lt;Gpaddr&gt;;
-
-    /// Jumps to the guest physical address.
-    ///
-    /// This is the same as [`Cursor::jump`].
-    pub fn jump(&amp;mut self, gpa: Gpaddr) -&gt; Result&lt;()&gt;;
-
-    /// Gets the guest physical address of the current slot.
-    pub fn guest_physical_addr(&amp;self) -&gt; Gpaddr;
-
-    /// Maps a frame into the current slot.
-    ///
-    /// This method will bring the cursor to the next slot after the modification.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the current guest physical address is already mapped.
-    pub fn map(&amp;mut self, frame: UFrame, prop: PageProperty);
-
-    /// Unmaps mappings from the current guest physical address.
-    ///
-    /// The method removes mapped pages or page-table subtrees up to `len`
-    /// bytes from the current guest physical address, flushes TLB,
-    /// and returns the number of unmapped frames or page-table frames.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `len` is longer than the remaining range of the cursor or is
-    /// not page-aligned.
-    pub fn unmap(&amp;mut self, len: usize) -&gt; usize;
-}</code></pre>
-<p><strong>Soundness.</strong></p>
-<p>The most important design choice is that the mappings are installed through a <code>CursorMut</code> that accepts <code>UFrame</code>s. A bad mapping from guest to host physical address could let the guest overwrite kernel code, page tables, heap objects, or frame metadata. Requiring <code>UFrame</code> means guest memory can only be backed by untyped frames, which do not host Rust objects.</p>
-<p><code>GuestPhysMemSpace</code> keeps the page table inside OSTD. The safe kernel creates cursors over guest physical ranges and passes the <code>GuestPhysMemSpace</code> to <code>GuestMode::execute</code>. It does not receive raw page table pointers, entries, or page-table pages.</p>
-<p><strong>Minimality.</strong></p>
-<p><code>GuestPhysMemSpace</code> only encapsulates the sensitive page table state and cursor discipline. The upper layer decides which guest physical ranges should be mapped to which backing frames; OSTD only owns the mechanism for installing, querying, and protecting the mappings.</p>
-<p><strong>Expressiveness.</strong></p>
-<p>The cursor API is expressive enough to map guest physical ranges to host physical frames, query mappings, scan to the next mapped GPA, and remove mappings when a slot is no longer valid. This lets the kernel implement memory-slot policy and guest-memory access above OSTD without exposing internals page table.</p>
-<h4 id="guestcontext"><a class="header" href="#guestcontext">GuestContext</a></h4>
-<p><code>GuestContext</code> is the per-vCPU state object. It stores the guest-visible register state, the vCPU run state, and the hardware virtualization owned by OSTD.</p>
-<p>Its public interface is(takes x86 arch as an example):</p>
-<pre><code class="language-rust">// ostd/src/arch/x86/vm/context.rs
-
-/// Stores the execution context and run state of a guest vCPU.
-///
-/// The kernel uses it to configure the vCPU-visible context, including
-/// general-purpose registers, special registers, MSRs, and CPUID leaves.
-///
-/// OSTD uses it to emulate guest instructions and to provide
-/// [`crate::vm::GuestMode`] with the state needed to run the vCPU. Before
-/// entering the vCPU, `GuestMode` loads the context into hardware. After a
-/// VM exit, `GuestMode` synchronizes the hardware vCPU state back into this
-/// context.
-pub struct GuestContext;
-
-impl GuestContext {
-    /// Creates a guest vCPU context.
-    ///
-    /// The bootstrap vCPU, whose ID is zero, starts in the runnable state.
-    /// Other vCPUs start in wait-for-SIPI state and become runnable after
-    /// [`Self::receive_sipi`] accepts a startup vector.
-    ///
-    /// Returns an error if the VMX virtualization environment is not ready.
-    pub fn new(id: u32) -&gt; Result&lt;Self&gt;;
-
-    /// Moves an AP vCPU from wait-for-SIPI state to runnable state.
-    ///
-    /// The startup vector is used to rebuild the vCPU's real-mode startup
-    /// state. Calling this method for a vCPU that is not waiting for SIPI has
-    /// no effect.
-    pub fn receive_sipi(&amp;mut self, vector: u8);
-
-    /// Returns the guest general-purpose register state.
-    pub fn regs(&amp;self) -&gt; VcpuRegs;
-
-    /// Replaces the guest general-purpose register state.
-    ///
-    /// This method stores the values as guest-visible state. The caller is
-    /// responsible for choosing register values that make sense for the guest
-    /// execution mode and entry point.
-    pub fn set_regs(&amp;mut self, regs: VcpuRegs);
-
-    /// Returns the guest special-register state.
-    ///
-    /// The returned state contains the guest-visible control-register values,
-    /// not the VMX-adjusted hardware values used internally for VM entry.
-    pub fn sregs(&amp;self) -&gt; VcpuSregs;
-
-    /// Replaces the guest special-register state.
-    ///
-    /// This method keeps derived context fields consistent with the supplied
-    /// special registers. It updates VMX control-register shadows, synchronizes
-    /// EFER state, mirrors FS/GS bases into the corresponding MSR state, and
-    /// sanitizes the APIC base for this vCPU. The caller remains responsible
-    /// for providing architecturally valid guest state.
-    pub fn set_sregs(&amp;mut self, sregs: VcpuSregs);
-
-    /// Returns a guest general-purpose register.
-    pub fn gpr(&amp;self, reg: X86GprIndex) -&gt; u64;
-
-    /// Updates a guest general-purpose register.
-    ///
-    /// The `width_byte` argument controls whether the low 1, 2, 4, or 8 bytes
-    /// are updated. The caller is responsible for using a register and width
-    /// that match the emulated guest instruction.
-    pub fn set_gpr(&amp;mut self, reg: X86GprIndex, width_byte: u8, value: u64);
-
-    /// Advances the guest instruction pointer.
-    ///
-    /// The caller is responsible for passing the length of the instruction
-    /// that has actually been consumed or emulated.
-    pub fn advance_rip(&amp;mut self, len: u64);
-
-    /// Returns the guest instruction pointer.
-    pub fn rip(&amp;self) -&gt; u64;
-
-    /// Returns the vCPU execution state.
-    pub fn run_state(&amp;self) -&gt; VcpuRunState;
-
-    /// Sets the vCPU execution state.
-    pub fn set_run_state(&amp;mut self, state: VcpuRunState);
-
-    /// Returns the guest-visible TSC value.
-    pub fn guest_tsc(&amp;self) -&gt; u64;
-
-    /// Returns the guest-visible value of an OSTD-owned MSR.
-    ///
-    /// Unsupported MSR indexes return `None`.
-    pub fn read_msr(&amp;self, index: u32) -&gt; Option&lt;u64&gt;;
-
-    /// Sets the guest-visible value of an OSTD-owned MSR.
-    ///
-    /// Returns `false` if the MSR index is not supported by this context.
-    pub fn write_msr(&amp;mut self, index: u32, value: u64) -&gt; bool;
-
-    /// Sets the CPUID entries visible to this vCPU.
-    ///
-    /// The caller remains responsible for choosing CPUID values that are
-    /// meaningful for the guest.
-    pub fn set_cpuid_entries(&amp;mut self, entries: Vec&lt;GuestCpuidEntry&gt;);
-
-    /// Returns the CPUID result visible to this vCPU.
-    ///
-    /// If no configured entry matches the requested function and index, this
-    /// method returns a zeroed CPUID entry.
-    pub fn cpuid_result(&amp;self, function: u32, index: u32) -&gt; GuestCpuidEntry;
-}
-
-impl Default for GuestContext;
-
-/// Describes whether a guest vCPU may enter guest mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum VcpuRunState {
-    /// The vCPU is not initialized for execution.
-    Uninitialized,
-    /// The vCPU is waiting for a startup IPI.
-    WaitForSipi,
-    /// The vCPU is ready to enter guest mode.
-    #[default]
-    Runnable,
-    /// The vCPU is currently executing in guest mode.
-    Running,
-    /// The vCPU Halted.
-    Halted,
-}
-
-/// Guest general-purpose registers.
-///
-/// This structure represents the guest CPU's general-purpose registers.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod)]
-pub struct VcpuRegs {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub rsp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rip: u64,
-    pub rflags: u64,
-}
-
-/// Guest special register state.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod)]
-pub struct VcpuSregs {
-    pub cs: VcpuSegment,
-    pub ds: VcpuSegment,
-    pub es: VcpuSegment,
-    pub fs: VcpuSegment,
-    pub gs: VcpuSegment,
-    pub ss: VcpuSegment,
-    pub tr: VcpuSegment,
-    pub ldt: VcpuSegment,
-    pub gdt: VcpuDtable,
-    pub idt: VcpuDtable,
-    pub cr0: u64,
-    pub cr2: u64,
-    pub cr3: u64,
-    pub cr4: u64,
-    pub efer: u64,
-    pub apic_base: u64,
-    pub interrupt_bitmap: [u64; 4],
-}
-
-/// Guest segment register state.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod)]
-pub struct VcpuSegment {
-    pub base: u64,
-    pub limit: u32,
-    pub selector: u16,
-    pub type_: u8,
-    pub present: u8,
-    pub dpl: u8,
-    pub db: u8,
-    pub s: u8,
-    pub l: u8,
-    pub g: u8,
-    pub avl: u8,
-    pub unusable: u8,
-    pub padding: u8,
-}
-
-/// Guest descriptor table state.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod)]
-pub struct VcpuDtable {
-    pub base: u64,
-    pub limit: u16,
-    pub padding: [u16; 3],
-}
-
-/// A CPUID result entry visible to a guest vCPU.
-#[derive(Clone, Copy, Debug)]
-pub struct GuestCpuidEntry {
-    /// CPUID function, i.e., input `EAX`.
-    pub function: u32,
-    /// CPUID index/subleaf, i.e., input `ECX`.
-    pub index: u32,
-    /// KVM-compatible flags describing how the entry should be matched.
-    pub flags: u32,
-    /// Output `EAX`.
-    pub eax: u32,
-    /// Output `EBX`.
-    pub ebx: u32,
-    /// Output `ECX`.
-    pub ecx: u32,
-    /// Output `EDX`.
-    pub edx: u32,
-}</code></pre>
-<p>Its role is broader than a plain KVM register dump. It contains:</p>
-<ul>
-<li>general-purpose registers in <code>VcpuRegs</code>;</li>
-<li>special registers, segment state, descriptor tables, EFER, APIC base, and interrupt bitmap in <code>VcpuSregs</code>;</li>
-<li>emulated guest-visible MSRs in <code>VcpuMsrs</code>;</li>
-<li>FPU/SIMD state in <code>FpuContext</code>;</li>
-<li>vCPU lifecycle state such as <code>WaitForSipi</code>, <code>Runnable</code>, <code>Running</code>, and <code>Halted</code>;</li>
-<li>VMX control-register state in <code>VcpuControlRegisters</code>;</li>
-<li>the OSTD-owned <code>Vmcs</code>.</li>
-</ul>
-<p><strong>Soundness.</strong></p>
-<p>The register setters accept guest-provided values and perform a small amount of consistency maintenance for guest system registers. For example, EFER.LMA is synchronized from EFER.LME and CR0.PG, and CR0/CR4 values are adjusted against VMX fixed-bit MSRs before they are used for VM entry. These operations help the kernel construct a valid guest state, but they do not guarantee that every guest-supplied state is architecturally valid.</p>
-<p>The soundness risk is not that a guest may receive bad register state. Bad guest state can make the guest crash, triple-fault, or fail VM entry. The real risk is confusing guest state with host state in VMX root mode. <code>GuestContext</code> does not expose interfaces for setting host-sensitive registers or host-only VMCS fields.</p>
-<p><strong>Minimality.</strong></p>
-<p><code>GuestContext</code> centralizes the vCPU data that OSTD must understand when switching into VMX non-root mode. To the kernel, it is a minimal vCPU state interface for configuring and running a guest. Additional device-level vCPU state, such as local APIC state, remains in the kernel or userspace VMM layer.</p>
-<p><strong>Expressiveness.</strong></p>
-<p><code>GuestContext</code> exposes enough structure for the kernel to configure key guest registers such as RIP, control registers, and MSRs. This lets the kernel build vCPUs in real mode, protected mode, or long mode, and update guest state while emulating exits such as MMIO accesses.</p>
-<h4 id="guestmode"><a class="header" href="#guestmode">GuestMode</a></h4>
-<p><code>GuestMode</code> is the OSTD execution object that performs VM entry and returns VM exits. The public interfaces are:</p>
-<pre><code class="language-rust">// ostd/src/vm/mod.rs
-
-/// Runs guest vCPU code in an isolated guest execution mode.
-///
-/// `GuestMode` is the OSTD-side execution object for a guest vCPU. It enters
-/// guest execution with the vCPU context and kernel-provided policy ports
-/// supplied to [`Self::execute`] until a VM exit must be handled outside OSTD.
-///
-/// Here is a sample code on how to use `GuestMode`.
-///
-/// ```no_run
-/// use ostd::{
-///     arch::vm::GuestContext,
-///     prelude::*,
-///     vm::{GuestInterruptPort, GuestMode, GuestPhysMemSpace, GuestTimerPort},
-/// };
-///
-/// fn run_guest(
-///     context: &amp;mut GuestContext,
-///     interrupt_port: &amp;dyn GuestInterruptPort,
-///     timer_port: &amp;dyn GuestTimerPort,
-///     guest_mem: &amp;GuestPhysMemSpace,
-/// ) -&gt; Result&lt;()&gt; {
-///     let mut guest_mode = GuestMode::new()?;
-///
-///     loop {
-///         let _run_result = guest_mode.execute(context, guest_mem, interrupt_port, timer_port)?;
-///         todo!("handle the userspace-visible VM exit");
-///     }
-/// }
-/// ```
-pub struct GuestMode;
-
-/// Describes why a guest run returned to the kernel client.
-pub enum GuestRunResult {
-    /// The vCPU exited and needs higher-level handling.
-    VmExit(GuestExitInfo),
-    /// The vCPU is waiting for a startup IPI and was not entered(x86 only).
-    WaitForSipi,
-}
-
-impl GuestMode {
-    /// Creates a guest execution object.
-    ///
-    /// Creating this value does not enter the guest; use [`Self::execute`] to
-    /// run the vCPU with a guest context and kernel-provided policy ports.
-    /// 
-    /// # Errors
-    ///
-    /// Returns an error if the platform does not support virtualization.
-    pub fn new() -&gt; Result&lt;Self&gt;;
-
-    /// Runs the guest with the supplied
-    /// guest context and guest physical memory space.
-    ///
-    /// The `interrupt_port` and `timer_port` arguments provide kernel
-    /// policy for pending guest interrupts and guest timers
-    /// while the vCPU is running.
-    ///
-    /// The method returns when guest execution needs handling by the kernel
-    /// client. [`GuestRunResult::VmExit`] carries the architecture-specific
-    /// vmexit information.
-    ///
-    /// After handling the returned event and updating `context` or the guest
-    /// device model as needed, call this method again to resume guest
-    /// execution.
-    pub fn execute&lt;I, T&gt;(
-        &amp;mut self,
-        context: &amp;mut GuestContext,
-        guest_mem: &amp;GuestPhysMemSpace,
-        interrupt_port: &amp;I,
-        timer_port: &amp;T,
-    ) -&gt; Result&lt;GuestRunResult&gt;
-    where
-        I: GuestInterruptPort + ?Sized,
-        T: GuestTimerPort + ?Sized;
-}
-
-// ostd/src/vm/interrupt.rs
-
-use crate::arch::vm::GuestInterrupt;
-
-/// Provides guest interrupt injection policy to [`super::GuestMode`].
-///
-/// `GuestMode` uses this port before guest entry to choose whether a pending
-/// interrupt should be injected into the guest. If it commits an interrupt for
-/// the next entry, it calls [`GuestInterruptPort::accept_interrupt`] so the
-/// kernel-side interrupt model can synchronize its state.
-///
-/// The implementation is supplied by the kernel. It may model a virtual
-/// interrupt controller, or it may be a policy object that never offers
-/// interrupts.
-///
-/// These methods may be called while guest entry preparation has disabled
-/// preemption or local interrupts. Implementations must not sleep, yield, or
-/// wait on synchronization primitives that can block the current task.
-pub trait GuestInterruptPort {
-    /// Returns the next guest interrupt to offer for injection.
-    ///
-    /// This method is a query. It should not consume the interrupt because
-    /// `GuestMode` may find that the guest cannot accept it yet.
-    /// Returning `None` means that no interrupt should be offered for this
-    /// guest entry.
-    ///
-    /// An implementation that does not inject guest interrupts can always
-    /// return `None`.
-    fn check_pending_interrupt(&amp;self) -&gt; Option&lt;GuestInterrupt&gt;;
-
-    /// Marks a guest interrupt as accepted for injection.
-    ///
-    /// `GuestMode` calls this method only after it has committed the interrupt
-    /// for the next guest entry. Implementations should update their state
-    /// accordingly.
-    fn accept_interrupt(&amp;self, interrupt: GuestInterrupt);
-}
-
-// ostd/src/vm/timer.rs
-
-use crate::arch::vm::GuestTimerInstant;
-
-/// Provides guest timer interrupt policy to [`super::GuestMode`].
-///
-/// `GuestMode` uses this port before vm entry to ask when a vm exit should
-/// happen so the kernel can publish a virtual timer interrupt in time.
-///
-/// This method may be called while guest entry preparation has disabled
-/// preemption or local interrupts. Implementations must not sleep, yield, or
-/// wait on synchronization primitives that can block the current task.
-pub trait GuestTimerPort {
-    /// Returns the next guest timer deadline after `current`.
-    ///
-    /// The `current` argument is the current guest-visible timer instant. The
-    /// returned deadline is expressed on the same guest-visible timeline.
-    ///
-    /// Returning `Some(deadline)` asks OSTD to arrange a guest exit when that
-    /// deadline is reached.
-    fn poll_deadline(&amp;self, current: GuestTimerInstant) -&gt; Option&lt;GuestTimerInstant&gt;;
-}
-
-// ostd/src/arch/x86/vm/exit/mod.rs
-
-/// Describes a VM exit that should be handled outside OSTD.
-pub struct GuestExitInfo {
-    /// The VMX exit reason.
-    pub exit_reason: u32,
-    /// The length of the instruction that caused the exit.
-    pub instruction_len: u32,
-    /// VMX exit qualification.
-    pub exit_qualification: u64,
-    /// Guest physical address associated with the exit, if any.
-    pub guest_phys_addr: Gpaddr,
-    /// Guest instruction pointer at the exit.
-    pub guest_rip: Gpaddr,
-}</code></pre>
-<p><strong>Soundness.</strong></p>
-<p><code>GuestMode::execute</code> wraps the hardware virtualization transition and the sensitive CPU-state updates around it. After guest state is loaded and before host state is restored, OSTD prevents the run from migrating away from the current physical CPU or being interleaved with ordinary kernel execution. The kernel receives only <code>GuestRunResult</code>, whose VM-exit case carries <code>GuestExitInfo</code>; it cannot directly issue hardware virtualization instructions, or corrupt host state through this API.</p>
-<p>The interrupt and timer ports are safe policy traits. A buggy kernel-side implementation may inject the wrong virtual interrupt or choose a poor timer deadline, but this can only affect guest behavior or latency. It must not corrupt host CPU state or host memory.</p>
-<p><strong>Minimality.</strong></p>
-<p>The type is deliberately small. It does not own the vCPU context, guest memory, or policy ports; those are supplied to each <code>execute</code> call. The kernel decides what interrupt or timer model to provide, but OSTD decides how and when those policy decisions are reflected in hardware.</p>
-<p><strong>Expressiveness.</strong></p>
-<p><code>GuestMode</code> performs VMX operations according to the contents of <code>GuestContext</code>, so its expressiveness mostly follows from the expressiveness of <code>GuestContext</code> described above. It adds two ports for interrupt and timer state, which are intentionally kept out of <code>GuestContext</code>. Together, the context and ports let the kernel run a guest while providing virtual interrupts and timer events. <code>GuestRunResult::WaitForSipi</code> also gives the kernel a direct way to model AP startup without entering VMX non-root mode prematurely.</p>
-<h4 id="vmxguardx86-specific"><a class="header" href="#vmxguardx86-specific">VmxGuard(x86 specific)</a></h4>
-<p>VMX lifecycle is controlled by a separate guard:</p>
-<pre><code class="language-rust">// ostd/src/arch/x86/vm/vmx.rs
-
-/// Keeps VMX operation enabled while at least one VM exists.
-pub struct VmxGuard;
-
-/// Acquires a VMX lifecycle guard.
-pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
-<p><code>acquire_vmx</code> enables VMX operation when the first guard is created and <code>VmxGuard</code> disables it after the last guard is dropped. The kernel stores this guard in the VM object, keeping VMX availability tied to VM lifetime.</p>
-<h3 id="building-a-hypervisor-with-the-ostd-apis"><a class="header" href="#building-a-hypervisor-with-the-ostd-apis">Building a Hypervisor With the OSTD APIs</a></h3>
-<p>The kernel can build a complete hypervisor by composing the OSTD objects above with kernel-owned policy and device state. A minimal Rust-like pseudo-code flow looks like this:</p>
-<pre><code class="language-rust">fn create_and_run_guest(image: GuestImage, userspace_mem: UserRange) -&gt; Result&lt;()&gt; {
-    // Keep VMX enabled for the lifetime of this VM.
-    let _vmx_guard = acquire_vmx()?;
-
-    // Create the VM and install userspace-backed guest RAM into the GPA space.
-    let guest_mem = GuestPhysMemSpace::new();
-    let frames: Vec&lt;UFrame&gt; = pin_userspace_frames(&amp;userspace_mem)?;
-    let guest_range = image.ram_gpa..image.ram_gpa + userspace_mem.len;
-    let preempt_guard = disable_preempt();
-    let mut cursor = guest_mem.cursor_mut(&amp;preempt_guard, &amp;guest_range)?;
-    for frame in &amp;frames {
-        cursor.map(frame.clone(), guest_mem_prop());
-    }
-    drop(cursor);
-    record_memory_slot(0, &amp;userspace_mem, guest_range, frames)?;
-
-    // Create a vCPU context and let the kernel choose the guest boot state.
-    let mut context = GuestContext::new(0)?;
-    context.set_regs(image.boot_regs());
-    context.set_sregs(image.boot_sregs());
-
-    // Kernel-owned policy ports provide virtual interrupts and timers.
-    let lapic = KernelLapicPort::new();
-    let mut guest_mode = GuestMode::new();
-
-    loop {
-        match guest_mode.execute(&amp;mut context, &amp;guest_mem, &amp;lapic, &amp;lapic)? {
-            GuestRunResult::WaitForSipi =&gt; wait_for_startup_ipi()?,
-            GuestRunResult::VmExit(exit) =&gt; match decode_exit(exit) {
-                Exit::Mmio(access) =&gt; emulate_mmio(access)?,
-                Exit::Io(access) =&gt; forward_to_userspace_vmm(access)?,
-                Exit::Hlt | Exit::Shutdown =&gt; return Ok(()),
-                Exit::Other(exit) =&gt; reflect_exit_to_userspace(exit)?,
-            },
-        }
-    }
-}</code></pre>
-<p>This example shows the intended split. OSTD owns the mechanisms needed to enter and leave guest mode safely. The kernel owns VM lifecycle, memory-slot policy, vCPU file semantics, interrupt-chip state, device emulation, and userspace handoff.</p>
-<h3 id="reference-for-managing-vm-and-vcpu-lifecycles-in-the-kernel-x86-specific"><a class="header" href="#reference-for-managing-vm-and-vcpu-lifecycles-in-the-kernel-x86-specific">Reference for Managing VM and vCPU Lifecycles in the Kernel (x86 Specific)</a></h3>
-<p><label class="checkbox-label"><input class="checkbox-img" type="checkbox"><img src="images/vm-lifecycle.svg" alt="VM and VMX lifecycle"><span class="img-wrapper"><img src="images/vm-lifecycle.svg" alt="VM and VMX lifecycle"></span></label></p>
-<p>A feasible x86 lifecycle is to make the kernel VM object own hardware virtualization availability. <code>VmFile</code> holds an <code>Arc&lt;Vm&gt;</code>, while each <code>VcpuFile</code> holds both an <code>Arc&lt;Vm&gt;</code> and an <code>Arc&lt;Vcpu&gt;</code>. The VM therefore remains alive while any related VM or vCPU file descriptor is open, and it is released automatically after the VMM closes the last one.</p>
-<p>Each VM owns one <code>VmxGuard</code>. Creating the first VM acquires the first guard and initializes VMX operation. The guard stays alive for the whole VM lifetime. When the final VM is dropped, the final <code>VmxGuard</code> is dropped as well, and OSTD runs <code>vmxoff</code> to leave VMX operation. This ties VMX state to ordinary kernel object lifetime instead of requiring a separate userspace shutdown path.</p>
-<h3 id="architecture-agnostic-design"><a class="header" href="#architecture-agnostic-design">Architecture-agnostic design</a></h3>
-<p>The current API split should be able to support ARM and RISC-V.</p>
-<p>GuestMode and GuestPhysMemSpace are intended to be architecture-agnostic APIs. GuestTimerPort and GuestInterruptPort should also be architecture-agnostic.</p>
-<p>GuestContext and GuestExitInfo are intentionally architecture-specific. It is both reasonable and necessary to provide one GuestContext API and one GuestExitInfo type per architecture, since register state, system registers, exit reasons, and exit metadata are fundamentally different across x86, ARM, and RISC-V.</p>
-<p>VmxGuard is also obviously architecture-specific. It exists to manage the x86 VMX lifecycle around vmxon and vmxoff. ARM and RISC-V do not need the same API shape for that detail, so it doesn’t affects the overall design.</p>
-<p>The hypervisor implementation model exposed by the OSTD APIs is reusable for ARM and RISC-V. Both architectures provide hardware-assisted second-stage translation. GuestPhysMemSpace is exactly the abstraction for that second stage page table: it provides generic mapping, unmapping, and query operations, while the internal implementation can use different PageTableConfigs for x86 EPT, ARM stage-2 translation, or RISC-V G-stage translation.</p>
-<p>GuestMode also maps naturally to ARM and RISC-V. All three architectures need an OSTD-controlled path that saves host state, loads guest vCPU state, installs the guest physical memory space, enters the guest execution environment, and returns to the kernel on a guest exit. The mechanism differs by architecture, but the API boundary is the same.</p>
-<p>The two port traits express policy rather than hardware details. A guest interrupt port means “the kernel-side virtual interrupt controller has an interrupt that may be injected before guest entry.” On x86 this maps to VMCS interrupt injection, on ARM to VGIC/list-register state, and on RISC-V to VS-level interrupt state such as hvip or AIA/IMSIC state. A guest timer port means “the kernel-side timer model has a guest-visible deadline and OSTD should arrange a timely exit.” On x86 this may use the VMX preemption timer and TSC offset, on ARM the generic timer/virtual timer model, and on RISC-V the time counter, timer delta, Sstc, or SBI timer path. These are different mechanisms, but the scheduling and injection semantics are common.</p>
-<h2 id="drawbacks-alternatives-and-unknowns"><a class="header" href="#drawbacks-alternatives-and-unknowns">Drawbacks, Alternatives, and Unknowns</a></h2>
-<h3 id="unresolved-questions"><a class="header" href="#unresolved-questions">Unresolved Questions</a></h3>
-<ul>
-<li>Can the kernel fully decide guest MSR and control-register values and set them into <code>GuestContext</code> without risking host-state corruption?</li>
-<li>Is the current OSTD hypervisor interface stable enough for future acceleration features such as vAPIC acceleration? If those features require exposing additional VMCS controls, interrupt virtualization state, or APIC backing pages, the <code>GuestContext</code>, <code>GuestMode</code>, and <code>GuestPhysMemSpace</code> boundaries may need to evolve.</li>
-</ul>
-<h2 id="prior-art-and-references"><a class="header" href="#prior-art-and-references">Prior Art and References</a></h2>
-<ul>
-<li><a href="ostd/soundness/README.html">Asterinas OSTD soundness analysis</a></li>
-<li><a href="https://www.kernel.org/doc/html/latest/virt/kvm/api.html">Linux KVM API documentation</a></li>
-<li><a href="https://github.com/dpw/kvm-hello-world"><code>kvm-hello-world</code></a></li>
-<li><a href="https://github.com/kvmtool/kvmtool"><code>kvmtool</code></a></li>
-<li><a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel 64 and IA-32 Architectures Software Developer Manuals</a></li>
-</ul>
-<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="rfc-0001-rfc-process"><a class="header" href="#rfc-0001-rfc-process">RFC-0001: RFC process</a></h1>
 <ul>
 <li>Status: Implemented</li>
@@ -11022,9 +10326,9 @@ pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
 <li>Date submitted: 2025-08-24</li>
 <li>Date approved: 2025-09-05</li>
 </ul>
-<h2 id="summary-1"><a class="header" href="#summary-1">Summary</a></h2>
+<h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
 <p>The “RFC” (request for comments) process is intended to provide a consistent, transparent, structured path for the community to make “big” decisions. For example, the RFC process can be used to evolve the project roadmap and the system architecture.</p>
-<h2 id="motivation-1"><a class="header" href="#motivation-1">Motivation</a></h2>
+<h2 id="motivation"><a class="header" href="#motivation">Motivation</a></h2>
 <p>As the Asterinas project grows in scale and community size, an informal decision-making process becomes insufficient. A formalized process is crucial for maintaining the quality and coherence of the project. Several highly successful open-source projects have demonstrated the value of such a process, including Rust (<a href="https://rust-lang.github.io/rfcs/introduction.html">RFCs</a>), Fuchsia (<a href="https://fuchsia.dev/fuchsia-src/contribute/governance/rfcs">RFCs</a>), Python (<a href="https://peps.python.org/">Python Enhancement Proposals</a> or PEPs), and Kubernetes (<a href="https://www.kubernetes.dev/resources/keps/">Kubernetes Enhancement Proposals</a> or KEPs).</p>
 <p>Adopting a formal RFC process will:</p>
 <ul>
@@ -11033,7 +10337,7 @@ pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
 <li><strong>Create design records</strong>: Approved RFCs will serve as a historical archive, documenting the design choices made and the reasoning behind them. This is invaluable for new contributors and for future reference.</li>
 </ul>
 <p>By introducing this process, we aim to support the healthy and sustainable growth of the Asterinas project.</p>
-<h2 id="design-1"><a class="header" href="#design-1">Design</a></h2>
+<h2 id="design"><a class="header" href="#design">Design</a></h2>
 <h3 id="when-to-follow-the-rfc-process"><a class="header" href="#when-to-follow-the-rfc-process">When to follow the RFC process</a></h3>
 <p>The RFC process should be used for any “substantial” change to Asterinas. Examples of changes that <strong>require</strong> an RFC include:</p>
 <ul>
@@ -11095,7 +10399,7 @@ pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
 <p>All RFCs submitted to the Asterinas project are licensed under <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>. This license is more permissive than <a href="https://www.mozilla.org/en-US/MPL/">the MPL license</a> used for the Asterinas code.</p>
 <h2 id="drawbacks"><a class="header" href="#drawbacks">Drawbacks</a></h2>
 <p>Introducing a formal RFC process can increase the overhead for making changes to the project. The process is intentionally deliberate, which may slow down the pace of development for major features. There is also a risk that the process could become overly bureaucratic if not managed carefully. For contributors, the effort required to write a high-quality RFC and see it through the review process can be significant.</p>
-<h2 id="prior-art-and-references-1"><a class="header" href="#prior-art-and-references-1">Prior Art and References</a></h2>
+<h2 id="prior-art-and-references"><a class="header" href="#prior-art-and-references">Prior Art and References</a></h2>
 <p>The Asterinas RFC process is heavily inspired by the well-established processes of the following two open-source projects:</p>
 <ul>
 <li><a href="https://rust-lang.github.io/rfcs/0002-rfc-process.html">Rust RFC Process</a>: The overall structure and philosophy are closely modeled on Rust’s RFC process.</li>
@@ -11109,7 +10413,7 @@ pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
 <li>Date submitted: 2025-11-14</li>
 <li>Date approved: 2025-12-01</li>
 </ul>
-<h2 id="summary-2"><a class="header" href="#summary-2">Summary</a></h2>
+<h2 id="summary-1"><a class="header" href="#summary-1">Summary</a></h2>
 <p>This RFC formally proposes the establishment of an Asterinas distribution as a new, top-level sub-project of Asterinas. We intend for this distribution to leverage <a href="https://nixos.org/">NixOS</a> due to its unparalleled customizability and rich package ecosystem. Accordingly, we propose naming this new sub-project <strong>Asterinas NixOS (AsterNixOS)</strong>.</p>
 <h2 id="motivations"><a class="header" href="#motivations">Motivations</a></h2>
 <h3 id="what-is-a-distro"><a class="header" href="#what-is-a-distro">What is a “distro”?</a></h3>
@@ -11124,7 +10428,7 @@ pub fn acquire_vmx() -&gt; Result&lt;VmxGuard&gt;;</code></pre>
 <p>Secondly, Asterinas will eventually provide features and value propositions that Linux simply does not have—for example, new system calls, file systems, and device drivers. These benefits only become real when applications can detect and leverage them.</p>
 <p>An Asterinas distro is the natural vehicle for this. It can ship new packages written specifically for Asterinas and carry patches to existing packages to make them “Asterinas-aware”, ensuring that userspace can meaningfully take advantage of the kernel’s unique capabilities.</p>
 <p>In essence, establishing Asterinas distros is paramount for Asterinas’s long-term success and differentiation. This RFC lays the groundwork for that future by proposing our foundational distro.</p>
-<h2 id="design-2"><a class="header" href="#design-2">Design</a></h2>
+<h2 id="design-1"><a class="header" href="#design-1">Design</a></h2>
 <h3 id="why-nixos-as-the-base-distro"><a class="header" href="#why-nixos-as-the-base-distro">Why NixOS as the base distro?</a></h3>
 <p>Building the first Asterinas distro from scratch would be an immense undertaking, diverting focus from core kernel development. Therefore, basing it on an existing Linux distro is the most rational path forward. This leads to the crucial question: which Linux distro should serve as our foundation?</p>
 <p>The landscape of Linux distros is vast, featuring prominent names such as <a href="https://archlinux.org/">Arch</a>, <a href="https://www.centos.org/">CentOS</a>, <a href="https://www.debian.org/">Debian</a>, and <a href="https://www.gentoo.org/">Gentoo</a>. While theoretically, any of these could serve, we have identified <a href="https://nixos.org/">NixOS</a> as a particularly attractive and uniquely suited option.</p>
@@ -11186,7 +10490,7 @@ in (pkgs.nixos configuration).config.system.build.isoImage
 <h3 id="the-new-top-level-sub-project"><a class="header" href="#the-new-top-level-sub-project">The New Top-Level Sub-Project</a></h3>
 <p>Given these compelling rationales, we propose the creation of a new top-level sub-project named <em>Asterinas NixOS (AsterNixOS)</em>. This sub-project will reside in a new <code>distro/</code> directory at the project root.</p>
 <p>Initially, AsterNixOS will share version numbers with the Asterinas kernel, emphasizing its early development stage and close coupling. Every kernel release will be accompanied by a compatible distro release. In the long term, once both the kernel and the distro achieve maturity and stability, AsterNixOS will adopt its own independent versioning scheme, likely following a “YY.MM” format (e.g., 25.12).</p>
-<h2 id="drawbacks-alternatives-and-unknowns-1"><a class="header" href="#drawbacks-alternatives-and-unknowns-1">Drawbacks, Alternatives, and Unknowns</a></h2>
+<h2 id="drawbacks-alternatives-and-unknowns"><a class="header" href="#drawbacks-alternatives-and-unknowns">Drawbacks, Alternatives, and Unknowns</a></h2>
 <h3 id="drawbacks-1"><a class="header" href="#drawbacks-1">Drawbacks</a></h3>
 <ul>
 <li><strong>Learning curve for Nix/NixOS:</strong> This is arguably the most significant hurdle. While exceptionally powerful, the Nix ecosystem, including the Nix language and its functional paradigm, presents a steeper learning curve compared to conventional package managers and build systems. This could pose an initial barrier for new contributors and existing Asterinas developers unfamiliar with Nix. Investing in clear documentation and onboarding resources will be critical.</li>
@@ -11205,8 +10509,422 @@ in (pkgs.nixos configuration).config.system.build.isoImage
 </ul>
 </li>
 </ul>
-<h2 id="prior-art-and-references-2"><a class="header" href="#prior-art-and-references-2">Prior Art and References</a></h2>
+<h2 id="prior-art-and-references-1"><a class="header" href="#prior-art-and-references-1">Prior Art and References</a></h2>
 <p>The NixOS project itself serves as the most prominent piece of prior art, demonstrating the viability and advantages of a purely functional approach to OS configuration and package management. Its design principles, particularly around atomic upgrades, rollbacks, and reproducible builds, have been thoroughly proven since its inception in 2003. Other projects, like <a href="https://guix.gnu.org/">GNU Guix</a>, also follow a similar functional package management paradigm.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="rfc-0003-hypervisor-support"><a class="header" href="#rfc-0003-hypervisor-support">RFC-0003: Hypervisor Support</a></h1>
+<ul>
+<li>Status: Approved</li>
+<li>Pull request: https://github.com/asterinas/asterinas/pull/3418</li>
+<li>Date submitted: 2026-06-21</li>
+<li>Date approved: 2026-08-05</li>
+</ul>
+<h2 id="summary-2"><a class="header" href="#summary-2">Summary</a></h2>
+<p>This RFC proposes extending OSTD with hypervisor support. These OSTD facilities allow the Asterinas kernel to safely implement a complete hypervisor, including a KVM-compatible control plane, while keeping privileged virtualization mechanisms inside OSTD.</p>
+<h2 id="motivation-1"><a class="header" href="#motivation-1">Motivation</a></h2>
+<p>Asterinas needs virtualization support for existing Linux KVM-based VMMs and unmodified guest kernels.</p>
+<p>Supporting virtualization requires extending the framekernel boundary with care. Taking x86 as an example, a malformed VMCS, a bad EPT mapping, or an incorrectly restored host register can break the soundness semantics of the host kernel. Therefore, this RFC focuses on what kind of OSTD hypervisor layer Asterinas needs: it must provide soundness by encapsulating privileged virtualization mechanisms, minimality by keeping the trusted surface small, and expressiveness by giving the Asterinas kernel enough safe operations to build a complete hypervisor above it.</p>
+<h2 id="design-2"><a class="header" href="#design-2">Design</a></h2>
+<h3 id="layering"><a class="header" href="#layering">Layering</a></h3>
+<p>This split of the virtualization mechanism and the policy mirrors the existing user-mode design in Asterinas. The kernel can decide what to run and how to handle exits, but the transition that could affect host CPU state is mediated by OSTD.</p>
+<p>The Asterinas kernel owns the KVM-compatible file-descriptor ABI and kernel policy. It implements <code>/dev/kvm</code>, VM file descriptors, vCPU file descriptors, the <code>kvm_run</code> shared page, memory-slot registration, register ioctls, basic in-kernel irqchip emulation, and conversion between KVM structs and OSTD types.</p>
+<p>OSTD owns the virtualization mechanism. It manages hardware virtualization state, second-stage address translation, and guest-host context switching, and returns <code>GuestRunResult</code> events to the kernel. The VM-exit case carries a small <code>GuestExitInfo</code> record.</p>
+<h3 id="ostd-interface-design"><a class="header" href="#ostd-interface-design">OSTD Interface Design</a></h3>
+<p>OSTD provides three new abstractions. <code>GuestPhysMemSpace</code> represents guest physical memory and owns second-stage translation from guest physical addresses to host frames. <code>GuestContext</code> represents the per-vCPU architectural state that must survive across guest exits. <code>GuestMode</code> is the execution object that enters guest mode, handles the guest-host state transition, and returns exits to the kernel.</p>
+<p>The following diagram shows the core object ownership and the upper-lower relationship between the kernel hypervisor layer and the OSTD VM API.</p>
+<pre class="mermaid">flowchart TB
+    subgraph KF["kernel fd objects"]
+        direction LR
+        VmFile["VmFile&lt;br/&gt;VM fd"]
+        VcpuFile["VcpuFile&lt;br/&gt;vCPU fd"]
+    end
+
+    subgraph KS["kernel VM/vCPU state"]
+        direction LR
+        Vm["Vm&lt;br/&gt;memory slots"]
+        Vcpu["Vcpu&lt;br/&gt;per-vCPU state"]
+        Policy["interrupt and timer policy"]
+    end
+
+    subgraph O["ostd safe public API"]
+        direction LR
+        Gpm["GuestPhysMemSpace"]
+        Context["GuestContext"]
+        Mode["GuestMode::execute"]
+        Ports["GuestInterruptPort&lt;br/&gt;GuestTimerPort"]
+    end
+
+    VmFile -- "own (Arc)" --&gt; Vm
+    VmFile -- "KVM_CREATE_VCPU" --&gt; VcpuFile
+    VcpuFile -- "own (Arc)" --&gt; Vm
+    VcpuFile -- "own (Arc)" --&gt; Vcpu
+
+    Vm -- "own (by value)" --&gt; Gpm
+    Vm -- "own vCPU table (Arc)" --&gt; Vcpu
+
+    Vcpu -- "borrow (Weak)" --&gt; Vm
+    Vcpu -- "own (Mutex)" --&gt; Context
+    Vcpu -- "own" --&gt; Mode
+    Vcpu -- "own" --&gt; Policy
+
+    Policy -. "implements" .-&gt; Ports
+    Mode -- "borrow" --&gt; Ports
+    Mode -- "borrow" --&gt; Gpm
+    Mode -- "mutable borrow" --&gt; Context
+</pre>
+
+<h4 id="guestphysmemspace"><a class="header" href="#guestphysmemspace">GuestPhysMemSpace</a></h4>
+<p><code>GuestPhysMemSpace</code> represents a guest physical address space backed by a second-stage translation page table.</p>
+<p>Its public interface is similar to <code>VmSpace</code>, which exposes the cursor to operate on the page table:</p>
+<pre><code class="language-rust">// ostd/src/vm/gpm_space.rs
+
+/// Manages the guest physical memory space of a VM.
+///
+/// This type owns the page table that maps guest physical addresses to
+/// host physical frames. One `GuestPhysMemSpace` can be reused by multiple
+/// vCPUs in the same VM by passing a reference to
+/// [`super::GuestMode::execute`].
+pub struct GuestPhysMemSpace;
+
+impl GuestPhysMemSpace {
+    /// Creates a new guest physical memory space.
+    pub fn new() -&gt; Result&lt;Self&gt;;
+
+    /// Gets an immutable cursor over a guest physical address range.
+    pub fn cursor&lt;'a, G: AsAtomicModeGuard&gt;(
+        &amp;'a self,
+        guard: &amp;'a G,
+        gpa: &amp;Range&lt;Gpaddr&gt;,
+    ) -&gt; Result&lt;Cursor&lt;'a&gt;&gt;;
+
+    /// Gets a mutable cursor over a guest physical address range.
+    pub fn cursor_mut&lt;'a, G: AsAtomicModeGuard&gt;(
+        &amp;'a self,
+        guard: &amp;'a G,
+        gpa: &amp;Range&lt;Gpaddr&gt;,
+    ) -&gt; Result&lt;CursorMut&lt;'a&gt;&gt;;
+}
+
+/// The cursor for querying over the guest physical memory space without modifying it.
+pub struct Cursor&lt;'a&gt;;
+
+impl Cursor&lt;'_&gt; {
+    /// Gets the guest physical address of the current slot.
+    pub fn gpa(&amp;self) -&gt; Gpaddr;
+
+    // Query and navigation interfaces are the same as `vm_space::Cursor`.
+    // ...
+}
+
+/// The cursor for modifying the mappings in guest physical memory space.
+pub struct CursorMut&lt;'a&gt;;
+
+impl&lt;'a&gt; CursorMut&lt;'a&gt; {
+    /// Gets the guest physical address of the current slot.
+    pub fn gpa(&amp;self) -&gt; Gpaddr;
+
+    // Query, navigation, map, and unmap interfaces are the same as `vm_space::CursorMut`.
+    // ...
+}</code></pre>
+<p><strong>Soundness, minimality and expressiveness.</strong></p>
+<p>Since the key interfaces provided by <code>GuestPhysMemSpace</code> are exactly the same as those of <code>VmSpace</code>, they can also ensure soundness, minimality, and expressiveness.</p>
+<h4 id="guestcontext"><a class="header" href="#guestcontext">GuestContext</a></h4>
+<p><code>GuestContext</code> is the per-vCPU state object. It stores the guest-visible register state, the vCPU run state, and the hardware virtualization state owned by OSTD.</p>
+<p>Its public interface is (using the x86 architecture as an example):</p>
+<pre><code class="language-rust">// ostd/src/arch/x86/vm/context.rs
+
+/// Stores the execution context and run state of a guest vCPU.
+///
+/// The kernel uses it to configure the vCPU-visible context, including
+/// general-purpose registers, special registers, and MSRs.
+///
+/// OSTD uses it to emulate guest instructions and to provide
+/// [`crate::vm::GuestMode`] with the state needed to run the vCPU. Before
+/// entering the vCPU, `GuestMode` loads the context into hardware. After a
+/// VM exit, `GuestMode` synchronizes the hardware vCPU state back into this
+/// context.
+pub struct GuestContext {
+    /// The guest architectural state.
+    arch: VcpuArchState,
+
+    /// The vCPU run state.
+    run: VcpuRunState,
+
+    /// The VMCS owned by this vCPU.
+    pub(crate) vmcs: Vmcs,
+
+    // Other fields.
+}
+
+impl GuestContext {
+    /// Creates a guest vCPU context.
+    pub fn new(vcpu_id: u32) -&gt; Result&lt;Self&gt;;
+
+    /// Returns the guest general-purpose register state.
+    pub fn regs(&amp;self) -&gt; VcpuRegs;
+
+    /// Replaces the guest general-purpose register state.
+    pub fn set_regs(&amp;mut self, regs: VcpuRegs);
+
+    // `GuestContext` provides numerous get/set APIs for the guest vCPU state.
+    // The accessible guest vCPU state includes general-purpose registers,
+    // system registers, model-specific registers, and vCPU state, among others.
+    // ...
+}
+
+/// Guest general-purpose registers.
+///
+/// This type represents the guest CPU's general-purpose registers.
+pub type VcpuRegs = GeneralRegs;
+
+// More structures for the guest vCPU state.
+// ...</code></pre>
+<p><strong>Soundness.</strong></p>
+<p><code>GuestContext</code> merely wraps the vCPU state and provides interfaces for reading and setting the vCPU state. Through these interfaces, it does not affect the host state, nor does it impact the memory safety of the host kernel.</p>
+<p><strong>Minimality.</strong></p>
+<p><code>GuestContext</code> centralizes the vCPU data that OSTD must understand when switching into guest mode. To the kernel, it is a minimal vCPU state interface for configuring and running a guest. Additional device-level vCPU state, such as irqchip state, remains in the kernel or userspace VMM layer.</p>
+<p><strong>Expressiveness.</strong></p>
+<p><code>GuestContext</code> exposes enough interfaces for the kernel to configure key guest registers such as general-purpose registers, system registers and so on. This lets the kernel build vCPUs in various states, and update guest state while emulating exits such as MMIO accesses.</p>
+<h4 id="guestmode"><a class="header" href="#guestmode">GuestMode</a></h4>
+<p><code>GuestMode</code> is the OSTD execution object that performs VM entry and returns VM exits. The public interfaces are:</p>
+<pre><code class="language-rust">// ostd/src/vm/mod.rs
+
+/// Runs guest vCPU code in an isolated guest execution mode.
+///
+/// `GuestMode` is the OSTD-side execution object for a guest vCPU. It enters
+/// guest execution with the vCPU context and kernel-provided policy ports
+/// supplied to [`Self::execute`] until a VM exit must be handled outside OSTD.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn handle_vm_exit(guest_result: ostd::vm::GuestRunResult) {}
+/// #
+/// use ostd::{
+///     arch::vm::GuestContext,
+///     prelude::*,
+///     vm::{GuestInterruptPort, GuestMode, GuestPhysMemSpace, GuestTimerPort},
+/// };
+///
+/// fn run_guest(
+///     context: &amp;mut GuestContext,
+///     interrupt_port: &amp;dyn GuestInterruptPort,
+///     timer_port: &amp;dyn GuestTimerPort,
+///     guest_mem: &amp;GuestPhysMemSpace,
+/// ) -&gt; Result&lt;()&gt; {
+///     let guest_mode = GuestMode::new()?;
+///
+///     loop {
+///         let run_result = guest_mode.execute(context, guest_mem, interrupt_port, timer_port)?;
+///         // Handle VM exit according to the exit reason recorded in `run_result`.
+///         handle_vm_exit(run_result);
+///     }
+/// }
+/// ```
+pub struct GuestMode;
+
+/// Describes why a guest run returned to the kernel client.
+pub enum GuestRunResult {
+    /// The vCPU exited and needs higher-level handling.
+    VmExit(GuestExitInfo),
+    /// The vCPU is waiting for a startup IPI and was not entered (x86 only).
+    #[cfg(target_arch = "x86_64")]
+    WaitForSipi,
+}
+
+impl GuestMode {
+    /// Creates a guest execution object.
+    ///
+    /// Creating this value does not enter the guest; use [`Self::execute`] to
+    /// run the vCPU with a guest context and kernel-provided policy ports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform does not support virtualization.
+    pub fn new() -&gt; Result&lt;Self&gt;;
+
+    /// Runs the guest with the supplied
+    /// guest context and guest physical memory space.
+    ///
+    /// The `interrupt_port` and `timer_port` arguments provide kernel
+    /// policy for pending guest interrupts and guest timers
+    /// while the vCPU is running.
+    ///
+    /// The method returns when guest execution needs handling by the kernel
+    /// client. [`GuestRunResult::VmExit`] carries the architecture-specific
+    /// VM-exit information.
+    ///
+    /// After handling the returned event and updating `context` or the guest
+    /// device model as needed, call this method again to resume guest
+    /// execution.
+    pub fn execute&lt;I, T&gt;(
+        &amp;self,
+        context: &amp;mut GuestContext,
+        guest_mem: &amp;GuestPhysMemSpace,
+        interrupt_port: &amp;I,
+        timer_port: &amp;T,
+    ) -&gt; Result&lt;GuestRunResult&gt;
+    where
+        I: GuestInterruptPort + ?Sized,
+        T: GuestTimerPort + ?Sized;
+}
+
+// ostd/src/vm/interrupt.rs
+
+use crate::arch::vm::GuestInterrupt;
+
+/// Provides guest interrupt injection policy to [`super::GuestMode`].
+///
+/// `GuestMode` uses this port before guest entry to choose whether a pending
+/// interrupt should be injected into the guest. If it commits an interrupt for
+/// the next entry, it calls [`GuestInterruptPort::accept_interrupt`] so the
+/// kernel-side interrupt model can synchronize its state.
+///
+/// The implementation is supplied by the kernel. It may model a virtual
+/// interrupt controller, or it may be a policy object that never offers
+/// interrupts.
+///
+/// These methods may be called while guest entry preparation has disabled
+/// preemption or local interrupts. Implementations must not sleep, yield, or
+/// wait on synchronization primitives that can block the current task.
+pub trait GuestInterruptPort {
+    /// Returns the next guest interrupt to offer for injection.
+    ///
+    /// This method is a query. It should not consume the interrupt because
+    /// `GuestMode` may find that the guest cannot accept it yet.
+    /// Returning `None` means that no interrupt should be offered for this
+    /// guest entry.
+    ///
+    /// An implementation that does not inject guest interrupts can always
+    /// return `None`.
+    fn query_pending_interrupt(&amp;self) -&gt; Option&lt;GuestInterrupt&gt;;
+
+    /// Marks a guest interrupt as accepted for injection.
+    ///
+    /// `GuestMode` calls this method only after it has committed the interrupt
+    /// for the next guest entry. Implementations should update their state
+    /// accordingly.
+    fn accept_interrupt(&amp;self, interrupt: GuestInterrupt);
+}
+
+// ostd/src/vm/timer.rs
+
+use crate::arch::vm::GuestTimerInstant;
+
+/// Provides guest timer interrupt policy to [`super::GuestMode`].
+///
+/// `GuestMode` uses this port before VM entry to ask when a VM exit should
+/// happen so the kernel can publish a virtual timer interrupt in time.
+///
+/// This method may be called while guest entry preparation has disabled
+/// preemption or local interrupts. Implementations must not sleep, yield, or
+/// wait on synchronization primitives that can block the current task.
+pub trait GuestTimerPort {
+    /// Returns the next guest timer deadline after `current`.
+    ///
+    /// The `current` argument is the current guest-visible timer instant. The
+    /// returned deadline is expressed on the same guest-visible timeline.
+    ///
+    /// Returning `Some(deadline)` asks OSTD to arrange a guest exit when that
+    /// deadline is reached.
+    fn poll_deadline(&amp;self, current: GuestTimerInstant) -&gt; Option&lt;GuestTimerInstant&gt;;
+}
+
+// ostd/src/arch/x86/vm/exit/mod.rs
+
+/// Describes a VM exit that should be handled outside OSTD.
+pub struct GuestExitInfo {
+    /// The VMX exit reason.
+    pub exit_reason: u32,
+    /// The length of the instruction that caused the exit.
+    pub instruction_len: u32,
+    /// VMX exit qualification.
+    pub exit_qualification: u64,
+    /// Guest physical address associated with the exit.
+    pub guest_phys_addr: Gpaddr,
+    /// Guest instruction pointer at the exit.
+    pub guest_rip: Gvaddr,
+}</code></pre>
+<p><strong>Soundness.</strong></p>
+<p><code>GuestMode::execute</code> wraps the hardware virtualization transition and the sensitive CPU-state updates around it. After guest state is loaded and before host state is restored, OSTD prevents the run from migrating away from the current physical CPU or being interleaved with ordinary kernel execution. The kernel receives only <code>GuestRunResult</code>, whose VM-exit case carries <code>GuestExitInfo</code>; it cannot directly issue hardware virtualization instructions, or corrupt host state through this API.</p>
+<p>The interrupt and timer ports are safe policy traits. A buggy kernel-side implementation may inject the wrong virtual interrupt or choose a poor timer deadline, but this can only affect guest behavior or latency. It must not corrupt host CPU state or host memory.</p>
+<p><strong>Minimality.</strong></p>
+<p>The type is deliberately small. It does not own the vCPU context, guest memory, or policy ports; those are supplied to each <code>execute</code> call. The kernel decides what interrupt or timer model to provide, but OSTD decides how and when those policy decisions are reflected in hardware.</p>
+<p><strong>Expressiveness.</strong></p>
+<p><code>GuestMode</code> performs hardware virtualization operations according to the contents of <code>GuestContext</code>, so its expressiveness mostly follows from the expressiveness of <code>GuestContext</code> described above. It adds two ports for interrupt and timer state, which are intentionally kept out of <code>GuestContext</code>. Together, the context and ports let the kernel run a guest while providing virtual interrupts and timer events. <code>GuestRunResult</code> also gives the kernel a direct way to handle other exit conditions besides VM exit.</p>
+<h4 id="vmx-and-vmcs-lifecycle-on-x86"><a class="header" href="#vmx-and-vmcs-lifecycle-on-x86">VMX and VMCS Lifecycle on x86</a></h4>
+<p>Safe and efficient VMX and VMCS lifecycle management can be implemented under the <code>GuestMode</code> and <code>GuestContext</code> API design. Following <a href="https://elixir.bootlin.com/linux/v7.1.4/source/arch/x86/kvm/vmx/vmx.c#L586">Linux’s state-tracking approach</a>, OSTD can map these APIs to VMX operations as follows.</p>
+<p><code>GuestMode::new</code> creates an internal VMX lifecycle guard that is privately owned by the returned <code>GuestMode</code>. OSTD maintains a global reference count of live guards. Access to this count is protected by a lock, which serializes guard construction and destruction. When the first guard is created, OSTD executes <code>VMXON</code> on every CPU. When the final guard is dropped, OSTD performs coordinated teardown on every CPU: it first executes <code>VMCLEAR</code> for every VMCS region that is still active on that CPU, and then executes <code>VMXOFF</code>.</p>
+<p><code>GuestContext::new</code> allocates a VMCS region, which is privately owned by the returned <code>GuestContext</code>. OSTD uses statically allocated per-CPU data to record the current VMCS region and the set of active VMCS regions on each CPU. Each <code>GuestContext</code> also tracks the CPU on which its VMCS region was most recently loaded and whether its launch state is clear or launched.</p>
+<p><code>GuestMode::execute</code> disables preemption while operating on the per-CPU VMX state, thereby pinning the execution to the current CPU. The exclusive <code>&amp;mut GuestContext</code> argument serializes operations on the corresponding VMCS region, so the same VMCS region cannot be migrated or entered concurrently from two CPUs.</p>
+<p>Let <code>A</code> be the VMCS region owned by the supplied <code>GuestContext</code>, and let <code>C</code> be the current CPU:</p>
+<ol>
+<li>If <code>A</code> is already active and current on <code>C</code>, OSTD proceeds directly to VM entry without executing <code>VMPTRLD</code> or <code>VMCLEAR</code>.</li>
+<li>If <code>A</code> is active on <code>C</code> but is not current, OSTD executes only <code>VMPTRLD(A)</code>. It preserves the existing launch state and does not execute <code>VMCLEAR</code>.</li>
+<li>If <code>A</code> is active on another CPU, OSTD sends a synchronous IPI to that CPU to execute <code>VMCLEAR(A)</code>. The old CPU then removes <code>A</code> from its active set and clears its current-VMCS record if necessary. After the IPI completes, OSTD executes <code>VMPTRLD(A)</code> on <code>C</code> and adds <code>A</code> to the active set of <code>C</code>.</li>
+<li>If <code>A</code> is not active on any CPU, OSTD first executes <code>VMCLEAR(A)</code> to establish a well-defined clear state, then executes <code>VMPTRLD(A)</code> on <code>C</code> and adds <code>A</code> to the active set of <code>C</code>.</li>
+</ol>
+<p>OSTD chooses <code>VMLAUNCH</code> or <code>VMRESUME</code> according to the recorded launch state. After a VM exit, <code>GuestMode::execute</code> leaves the VMCS region active and does not execute <code>VMCLEAR</code> before returning. Therefore, subsequent executions on the same CPU can reuse the current or active VMCS region and benefit from the CPU’s VMCS cache.</p>
+<p>When a <code>GuestContext</code> is dropped, OSTD first ensures that its VMCS region is no longer active. If necessary, it synchronously executes <code>VMCLEAR</code> on the CPU where the region is active before deallocating it. Similarly, when the final VMX lifecycle guard is dropped, every CPU clears all VMCS regions in its local active set before executing <code>VMXOFF</code>.</p>
+<p>All VMX instructions and lifecycle state remain internal to OSTD. The kernel manages guest policy through the safe <code>GuestMode</code> and <code>GuestContext</code> APIs without directly accessing VMCS residency state or issuing VMX instructions.</p>
+<h3 id="building-a-hypervisor-with-the-ostd-apis"><a class="header" href="#building-a-hypervisor-with-the-ostd-apis">Building a Hypervisor With the OSTD APIs</a></h3>
+<p>The kernel can build a complete hypervisor by composing the OSTD objects above with kernel-owned policy and device state. A minimal pseudo-code flow looks like this:</p>
+<pre><code class="language-rust">fn create_and_run_guest(image: GuestImage, userspace_mem: UserRange) -&gt; Result&lt;()&gt; {
+    // Create the VM and install userspace-backed guest RAM into the GPA space.
+    let guest_mem = GuestPhysMemSpace::new()?;
+    let frames: Vec&lt;UFrame&gt; = query_userspace_frames(&amp;userspace_mem)?;
+    let guest_end = image.ram_gpa.checked_add(userspace_mem.len)
+        .ok_or(Error::new(Errno::EOVERFLOW))?;
+    let guest_range = image.ram_gpa..guest_end;
+    {
+        let preempt_guard = disable_preempt();
+        let mut cursor = guest_mem.cursor_mut(&amp;preempt_guard, &amp;guest_range)?;
+        for frame in &amp;frames {
+            cursor.map(frame.clone(), guest_mem_prop());
+        }
+    }
+    record_memory_slot(0, &amp;userspace_mem, guest_range, frames)?;
+
+    // Create a vCPU context and let the kernel set the guest boot state.
+    let mut context = GuestContext::new(0)?;
+    context.set_regs(image.boot_regs());
+    context.set_sregs(image.boot_sregs());
+
+    // Kernel-owned policy ports provide virtual interrupts and timers.
+    let lapic = KernelLapicPort::new();
+    let guest_mode = GuestMode::new()?;
+
+    loop {
+        match guest_mode.execute(&amp;mut context, &amp;guest_mem, &amp;lapic, &amp;lapic)? {
+            GuestRunResult::WaitForSipi =&gt; wait_for_startup_ipi()?,
+            GuestRunResult::VmExit(exit) =&gt; match decode_exit(exit) {
+                Exit::Mmio(access) =&gt; emulate_mmio(access)?,
+                Exit::Io(access) =&gt; forward_to_userspace_vmm(access)?,
+                Exit::Hlt | Exit::Shutdown =&gt; return Ok(()),
+                Exit::Other(exit) =&gt; reflect_exit_to_userspace(exit)?,
+            },
+        }
+    }
+}</code></pre>
+<p>This example shows the intended split. OSTD owns the mechanisms needed to enter and leave guest mode safely. The kernel owns VM lifecycle, memory-slot policy, vCPU file semantics, interrupt-chip state, device emulation, and userspace handoff.</p>
+<h3 id="architecture-agnostic-design"><a class="header" href="#architecture-agnostic-design">Architecture-agnostic Design</a></h3>
+<p>Although the examples above are based on Intel CPUs, the current API split should also support AMD CPUs and the ARM and RISC-V architectures.</p>
+<p><code>GuestMode</code> and <code>GuestPhysMemSpace</code> are intended to be architecture-agnostic APIs. <code>GuestTimerPort</code> and <code>GuestInterruptPort</code> should also be architecture-agnostic.</p>
+<p><code>GuestContext</code> and <code>GuestExitInfo</code> are intentionally architecture-specific. It is both reasonable and necessary to provide one <code>GuestContext</code> API and one <code>GuestExitInfo</code> type per architecture and, where necessary, per hardware virtualization backend, since register state, system registers, exit reasons, and exit metadata are fundamentally different across x86, ARM, and RISC-V.</p>
+<p>The hypervisor implementation model exposed by the OSTD APIs is reusable for ARM and RISC-V. Both architectures provide hardware-assisted second-stage translation. <code>GuestPhysMemSpace</code> is exactly the abstraction for that second-stage page table: it provides generic mapping, unmapping, and query operations, while the internal implementation can use different <code>PageTableConfig</code>s for Intel x86 <a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html" title="Vol. 3C. 30.3 EPT">EPT</a>, AMD x86 <a href="https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2" title="15.25 Nested Paging">nested paging</a>, ARM <a href="https://developer.arm.com/documentation/102142/0100/Stage-2-translation">stage-2 translation</a>, or <a href="https://docs.riscv.org/reference/isa/v20260120/priv/hypervisor.html#two-stage-translation">RISC-V G-stage translation</a>.</p>
+<p><code>GuestMode</code> also maps naturally to ARM and RISC-V. All three architectures need an OSTD-controlled path that saves host state, loads guest vCPU state, installs the guest physical memory space, enters the guest execution environment, and returns to the kernel on a guest exit.</p>
+<p>The two port traits express policy rather than hardware details. <code>GuestInterruptPort</code> provides guest interrupt injection policy to <code>GuestMode::execute</code>. On x86, the port may be backed by virtual <a href="https://wiki.osdev.org/APIC">APIC</a> state; on ARM, by virtual <a href="https://developer.arm.com/documentation/198123/0302/What-is-a-Generic-Interrupt-Controller-">GIC</a> state; and on RISC-V, by virtual interrupt-controller state such as a virtual <a href="https://wiki.osdev.org/PLIC">PLIC</a> or virtual <a href="https://docs.riscv.org/reference/aia/v1.0/intro.html">AIA interrupt-controller</a> state. <code>GuestTimerPort</code> provides guest timer interrupt policy to <code>GuestMode::execute</code>. On x86, the port may be backed by virtual <a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html" title="Vol. 3A. 12.5.4 APIC Timer">APIC timer or TSC-deadline timer</a> state; on ARM, by <a href="https://developer.arm.com/documentation/ddi0487/mb/-Part-D-The-AArch64-System-Level-Architecture/-Chapter-D12-The-Generic-Timer-in-AArch64-state/-D12-1-About-the-Generic-Timer/-D12-1-1-The-full-set-of-Generic-Timer-components?lang=en">generic timer</a>; and on RISC-V, by virtual timer state exposed through an <a href="https://docs.riscv.org/reference/sbi/v3.0/ext-time.html">SBI timer interface</a> or the <a href="https://docs.riscv.org/reference/isa/v20260120/priv/sstc.html">Sstc</a> virtual-supervisor timer facility.</p>
+<h2 id="drawbacks-alternatives-and-unknowns-1"><a class="header" href="#drawbacks-alternatives-and-unknowns-1">Drawbacks, Alternatives, and Unknowns</a></h2>
+<h3 id="unresolved-questions"><a class="header" href="#unresolved-questions">Unresolved Questions</a></h3>
+<ul>
+<li>Is the current OSTD hypervisor interface stable enough for future acceleration features such as vAPIC acceleration? If those features require exposing additional architecture-specific controls, interrupt virtualization state, or APIC backing pages, the <code>GuestContext</code>, <code>GuestMode</code>, and <code>GuestPhysMemSpace</code> boundaries may need to evolve.</li>
+</ul>
+<h2 id="prior-art-and-references-2"><a class="header" href="#prior-art-and-references-2">Prior Art and References</a></h2>
+<ul>
+<li><a href="ostd/soundness/README.html">Asterinas OSTD soundness analysis</a></li>
+<li><a href="https://www.kernel.org/doc/html/v7.1/virt/kvm/api.html">Linux KVM API documentation</a></li>
+<li><a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel 64 and IA-32 Architectures Software Developer Manuals</a></li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="rfc-0000-your-short-descriptive-title"><a class="header" href="#rfc-0000-your-short-descriptive-title">RFC-0000: Your short, descriptive title</a></h1>
 <ul>
