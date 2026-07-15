@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! KVM-compatible hypervisor device implementation.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use device_id::{DeviceId, MajorId, MinorId};
+use ostd::{mm::VmIo, task::Task};
+
+use super::{KVM_MAJOR, KVM_MINOR, cpuid, ioctl::*, msr, vm::Vm, vm_file::VmFile};
+use crate::{
+    context::current_userspace,
+    device::{Device, DeviceType, DevtmpfsInodeMeta},
+    events::IoEvents,
+    fs::{
+        file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
+        vfs::inode::FileOps,
+    },
+    prelude::*,
+    process::signal::{PollHandle, Pollable},
+    util::ioctl::{RawIoctl, dispatch_ioctl},
+};
+
+/// The main KVM-compatible hypervisor device (`/dev/kvm`).
+pub struct HypervisorDevice {
+    /// Next VM ID to allocate
+    next_vm_id: Arc<AtomicU32>,
+}
+
+impl HypervisorDevice {
+    /// Creates a new KVM-compatible hypervisor device.
+    pub fn new() -> Self {
+        Self {
+            next_vm_id: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl Device for HypervisorDevice {
+    fn type_(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    fn id(&self) -> DeviceId {
+        DeviceId::new(MajorId::new(KVM_MAJOR), MinorId::new(u32::from(KVM_MINOR)))
+    }
+
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+        Some(DevtmpfsInodeMeta::new("kvm"))
+    }
+
+    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        Ok(Box::new(HypervisorDeviceFile {
+            next_vm_id: self.next_vm_id.clone(),
+        }))
+    }
+}
+
+/// File handle for the KVM-compatible hypervisor device.
+struct HypervisorDeviceFile {
+    next_vm_id: Arc<AtomicU32>,
+}
+
+impl HypervisorDeviceFile {
+    fn alloc_vm_id(&self) -> u32 {
+        self.next_vm_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn get_supported_cpuid(&self, mut cpuid_data: VcpuCpuid2, arg: usize) -> Result<i32> {
+        let entries = cpuid::default_cpuid_entries();
+        let needed = u32::try_from(entries.len())?;
+        let requested = usize::try_from(cpuid_data.nent)?;
+        cpuid_data.nent = needed;
+
+        if requested < entries.len() {
+            current_userspace!().write_val(arg, &cpuid_data)?;
+            return_errno_with_message!(Errno::E2BIG, "the userspace CPUID buffer is too small");
+        }
+
+        current_userspace!().write_val(arg, &cpuid_data)?;
+        let entries_addr = arg
+            .checked_add(size_of::<VcpuCpuid2>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let entries_len = entries
+            .len()
+            .checked_mul(size_of::<VcpuCpuidEntry2>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let current = Task::current().unwrap();
+        let thread_local = current.as_thread_local().unwrap();
+        let user_space = CurrentUserSpace::new(thread_local);
+        let mut writer = user_space.writer(entries_addr, entries_len)?;
+        for entry in entries {
+            writer.write_val(&entry)?;
+        }
+
+        Ok(0)
+    }
+
+    fn get_msr_index_list(&self, mut msr_list: MsrList, arg: usize) -> Result<i32> {
+        let indices = msr::msr_indices();
+        let needed = u32::try_from(indices.len())?;
+        let requested = usize::try_from(msr_list.nmsrs)?;
+        msr_list.nmsrs = needed;
+
+        if requested < indices.len() {
+            current_userspace!().write_val(arg, &msr_list)?;
+            return_errno_with_message!(Errno::E2BIG, "the userspace MSR buffer is too small");
+        }
+
+        current_userspace!().write_val(arg, &msr_list)?;
+        let entries_addr = arg
+            .checked_add(size_of::<MsrList>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let entries_len = indices
+            .len()
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+        let current = Task::current().unwrap();
+        let thread_local = current.as_thread_local().unwrap();
+        let user_space = CurrentUserSpace::new(thread_local);
+        let mut writer = user_space.writer(entries_addr, entries_len)?;
+        for index in &indices {
+            writer.write_val(index)?;
+        }
+
+        Ok(0)
+    }
+}
+
+impl Pollable for HypervisorDeviceFile {
+    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        let events = IoEvents::IN | IoEvents::OUT;
+        events & mask
+    }
+}
+
+impl FileOps for HypervisorDeviceFile {
+    fn read_at(
+        &self,
+        _offset: usize,
+        _writer: &mut VmWriter,
+        _status_flags: StatusFlags,
+    ) -> Result<usize> {
+        return_errno_with_message!(Errno::EINVAL, "cannot read from KVM device");
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _reader: &mut VmReader,
+        _status_flags: StatusFlags,
+    ) -> Result<usize> {
+        return_errno_with_message!(Errno::EINVAL, "cannot write to KVM device");
+    }
+}
+
+impl PerOpenFileOps for HypervisorDeviceFile {
+    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+        dispatch_ioctl!(match raw_ioctl {
+            GetApiVersion => {
+                Ok(KVM_API_VERSION)
+            }
+            CreateVm => {
+                // Allocate a new VM ID
+                let vm_id = self.alloc_vm_id();
+
+                // Create the VM
+                let vm = Vm::new(vm_id)?;
+
+                // Create a file descriptor for the VM
+                let vm_file = Arc::new(VmFile::new(vm));
+
+                // Insert into the current process's file table
+                let current = Task::current().unwrap();
+                let mut file_table = current.as_thread_local().unwrap().borrow_file_table_mut();
+                let mut file_table_locked = file_table.unwrap().write();
+                let vm_fd = file_table_locked.insert(vm_file, FdFlags::empty());
+
+                Ok(vm_fd.into())
+            }
+            cmd @ GetMsrIndexList => {
+                let msr_list = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+                self.get_msr_index_list(msr_list, raw_ioctl.arg())
+            }
+            CheckExtension => {
+                Ok(check_extension(raw_ioctl.arg()))
+            }
+            GetVcpuMmapSize => {
+                Ok(KVM_RUN_MMAP_SIZE as i32)
+            }
+            cmd @ GetSupportedCpuid => {
+                let cpuid = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+                self.get_supported_cpuid(cpuid, raw_ioctl.arg())
+            }
+            cmd @ X86GetMceCapSupported => {
+                // TODO: Implement this ioctl which is about x86 MCA(Machine Check Architecture)
+                cmd.write(&u64::MAX)?;
+                Ok(0)
+            }
+            _ => {
+                let ioctl_nr = raw_ioctl.cmd() & 0xff;
+                error!(
+                    "hypervisor: unimplemented device ioctl command: cmd={:#x}, nr={:#x}",
+                    raw_ioctl.cmd(),
+                    ioctl_nr
+                );
+                return_errno_with_message!(Errno::ENOTTY, "unknown device ioctl command");
+            }
+        })
+    }
+
+    fn check_seekable(&self) -> Result<()> {
+        return_errno_with_message!(Errno::ESPIPE, "the device is not seekable");
+    }
+
+    fn is_offset_aware(&self) -> bool {
+        false
+    }
+}

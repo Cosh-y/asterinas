@@ -2,6 +2,7 @@
 
 mod evdev;
 mod fb;
+mod hypervisor;
 mod mem;
 pub(crate) mod misc;
 mod pty;
@@ -62,6 +63,7 @@ pub(crate) fn init_in_first_kthread() {
 /// Initializes device state after mounting rootfs.
 pub(crate) fn init_in_first_process() -> Result<()> {
     tty::init_in_first_process()?;
+    hypervisor::init_in_first_process()?;
     registry::init_in_first_process()?;
 
     Ok(())

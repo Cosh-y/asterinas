@@ -328,8 +328,10 @@ impl<'a> VmarMapOptions<'a> {
             Some(Mappable::Vmo(vmo)) => {
                 let path = file.as_ref().map(|file| file.path());
 
-                if let Some(path) = path {
-                    debug_assert!(Arc::ptr_eq(&vmo, &path.inode().page_cache().unwrap()));
+                if let Some(ref path) = path
+                    && let Some(page_cache) = path.inode().page_cache()
+                {
+                    debug_assert!(Arc::ptr_eq(&vmo, &page_cache));
                 }
 
                 let is_writable_tracked = if let Some(path) = path
