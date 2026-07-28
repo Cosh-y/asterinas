@@ -4,7 +4,7 @@
 
 use ostd::arch::vm::{GuestContext, X86GprIndex};
 
-use super::{guest_address::translate_gva_to_gpa, vcpu::Vcpu};
+use super::{guest_address::translate_gva_to_gpa, vm_memory::VmMemory};
 use crate::prelude::*;
 
 const MAX_INSN_LENGTH: usize = 15;
@@ -160,24 +160,23 @@ impl MmioInstruction {
 }
 
 /// Fetches and decodes the instruction at the guest's current RIP.
-pub(super) fn decode_current_mmio_instruction(vcpu: &Vcpu) -> Result<Option<MmioInstruction>> {
-    let vm = vcpu.vm()?;
-    let (guest_rip, code_vaddr, mode) = {
-        let context = vcpu.guest_context();
-        let mode = InstructionMode::from_context(&context);
-        let guest_rip = context.rip();
-        let code_vaddr = if mode.long_mode {
-            guest_rip
-        } else {
-            context
-                .sregs()
-                .cs
-                .base
-                .checked_add(guest_rip)
-                .ok_or_else(|| Error::new(Errno::EFAULT))?
-        };
-        (guest_rip, usize::try_from(code_vaddr)?, mode)
+pub(super) fn decode_current_mmio_instruction(
+    context: &GuestContext,
+    vm_memory: &VmMemory,
+) -> Result<Option<MmioInstruction>> {
+    let mode = InstructionMode::from_context(context);
+    let guest_rip = context.rip();
+    let code_vaddr = if mode.long_mode {
+        guest_rip
+    } else {
+        context
+            .sregs()
+            .cs
+            .base
+            .checked_add(guest_rip)
+            .ok_or_else(|| Error::new(Errno::EFAULT))?
     };
+    let code_vaddr = usize::try_from(code_vaddr)?;
     let mut bytes = [0_u8; MAX_INSN_LENGTH];
     let mut bytes_read = 0;
 
@@ -185,13 +184,10 @@ pub(super) fn decode_current_mmio_instruction(vcpu: &Vcpu) -> Result<Option<Mmio
         let guest_vaddr = code_vaddr
             .checked_add(bytes_read)
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
-        let guest_paddr = {
-            let context = vcpu.guest_context();
-            translate_gva_to_gpa(&context, &vm, guest_vaddr)?
-        };
+        let guest_paddr = translate_gva_to_gpa(context, vm_memory, guest_vaddr)?;
         let page_remaining = PAGE_SIZE - (guest_vaddr & (PAGE_SIZE - 1));
         let read_len = page_remaining.min(bytes.len() - bytes_read);
-        vm.read_guest_bytes(guest_paddr, &mut bytes[bytes_read..bytes_read + read_len])?;
+        vm_memory.read_bytes(guest_paddr, &mut bytes[bytes_read..bytes_read + read_len])?;
         bytes_read += read_len;
 
         if let Some(instruction) = decode_mmio_instruction(&bytes[..bytes_read], mode) {

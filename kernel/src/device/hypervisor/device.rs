@@ -5,11 +5,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use device_id::{DeviceId, MajorId, MinorId};
-use ostd::{mm::VmIo, task::Task};
+use ostd::task::Task;
 
 use super::{KVM_MAJOR, KVM_MINOR, cpuid, ioctl::*, msr, vm::Vm, vm_file::VmFile};
 use crate::{
-    context::current_userspace,
     device::{Device, DeviceType, DevtmpfsInodeMeta},
     events::IoEvents,
     fs::{
@@ -65,66 +64,6 @@ impl HypervisorDeviceFile {
     fn alloc_vm_id(&self) -> u32 {
         self.next_vm_id.fetch_add(1, Ordering::Relaxed)
     }
-
-    fn get_supported_cpuid(&self, mut cpuid_data: VcpuCpuid2, arg: usize) -> Result<i32> {
-        let entries = cpuid::default_cpuid_entries();
-        let needed = u32::try_from(entries.len())?;
-        let requested = usize::try_from(cpuid_data.nent)?;
-        cpuid_data.nent = needed;
-
-        if requested < entries.len() {
-            current_userspace!().write_val(arg, &cpuid_data)?;
-            return_errno_with_message!(Errno::E2BIG, "the userspace CPUID buffer is too small");
-        }
-
-        current_userspace!().write_val(arg, &cpuid_data)?;
-        let entries_addr = arg
-            .checked_add(size_of::<VcpuCpuid2>())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let entries_len = entries
-            .len()
-            .checked_mul(size_of::<VcpuCpuidEntry2>())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let current = Task::current().unwrap();
-        let thread_local = current.as_thread_local().unwrap();
-        let user_space = CurrentUserSpace::new(thread_local);
-        let mut writer = user_space.writer(entries_addr, entries_len)?;
-        for entry in entries {
-            writer.write_val(&entry)?;
-        }
-
-        Ok(0)
-    }
-
-    fn get_msr_index_list(&self, mut msr_list: MsrList, arg: usize) -> Result<i32> {
-        let indices = msr::msr_indices();
-        let needed = u32::try_from(indices.len())?;
-        let requested = usize::try_from(msr_list.nmsrs)?;
-        msr_list.nmsrs = needed;
-
-        if requested < indices.len() {
-            current_userspace!().write_val(arg, &msr_list)?;
-            return_errno_with_message!(Errno::E2BIG, "the userspace MSR buffer is too small");
-        }
-
-        current_userspace!().write_val(arg, &msr_list)?;
-        let entries_addr = arg
-            .checked_add(size_of::<MsrList>())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let entries_len = indices
-            .len()
-            .checked_mul(size_of::<u32>())
-            .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-        let current = Task::current().unwrap();
-        let thread_local = current.as_thread_local().unwrap();
-        let user_space = CurrentUserSpace::new(thread_local);
-        let mut writer = user_space.writer(entries_addr, entries_len)?;
-        for index in &indices {
-            writer.write_val(index)?;
-        }
-
-        Ok(0)
-    }
 }
 
 impl Pollable for HypervisorDeviceFile {
@@ -179,18 +118,18 @@ impl PerOpenFileOps for HypervisorDeviceFile {
                 Ok(vm_fd.into())
             }
             cmd @ GetMsrIndexList => {
-                let msr_list = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
-                self.get_msr_index_list(msr_list, raw_ioctl.arg())
+                write_msr_index_list(&cmd, raw_ioctl, &msr::msr_indices())?;
+                Ok(0)
             }
             CheckExtension => {
-                Ok(check_extension(raw_ioctl.arg()))
+                Ok(check_extension(raw_ioctl))
             }
             GetVcpuMmapSize => {
                 Ok(KVM_RUN_MMAP_SIZE as i32)
             }
             cmd @ GetSupportedCpuid => {
-                let cpuid = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
-                self.get_supported_cpuid(cpuid, raw_ioctl.arg())
+                write_supported_cpuid(&cmd, raw_ioctl, &cpuid::default_cpuid_entries())?;
+                Ok(0)
             }
             cmd @ X86GetMceCapSupported => {
                 // TODO: Implement this ioctl which is about x86 MCA(Machine Check Architecture)

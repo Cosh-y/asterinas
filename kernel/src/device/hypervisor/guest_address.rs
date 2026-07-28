@@ -4,10 +4,14 @@
 
 use ostd::{arch::vm::GuestContext, mm::Gpaddr};
 
-use super::vm::Vm;
+use super::vm_memory::VmMemory;
 use crate::prelude::*;
 
-pub(super) fn translate_gva_to_gpa(context: &GuestContext, vm: &Vm, gva: usize) -> Result<Gpaddr> {
+pub(super) fn translate_gva_to_gpa(
+    context: &GuestContext,
+    vm_memory: &VmMemory,
+    gva: usize,
+) -> Result<Gpaddr> {
     const CR0_PAGING: u64 = 1 << 31;
     const CR4_PAGE_SIZE_EXTENSIONS: u64 = 1 << 4;
     const CR4_PHYSICAL_ADDRESS_EXTENSION: u64 = 1 << 5;
@@ -21,15 +25,15 @@ pub(super) fn translate_gva_to_gpa(context: &GuestContext, vm: &Vm, gva: usize) 
 
     if sregs.efer & EFER_LONG_MODE_ACTIVE != 0 {
         let five_level = sregs.cr4 & CR4_5_LEVEL_PAGING != 0;
-        return translate_long_mode_gva(vm, gva, sregs.cr3 as Gpaddr, five_level);
+        return translate_long_mode_gva(vm_memory, gva, sregs.cr3 as Gpaddr, five_level);
     }
 
     let gva = gva & u32::MAX as usize;
     if sregs.cr4 & CR4_PHYSICAL_ADDRESS_EXTENSION != 0 {
-        translate_pae_gva(vm, gva, sregs.cr3 as Gpaddr)
+        translate_pae_gva(vm_memory, gva, sregs.cr3 as Gpaddr)
     } else {
         translate_legacy_gva(
-            vm,
+            vm_memory,
             gva,
             sregs.cr3 as Gpaddr,
             sregs.cr4 & CR4_PAGE_SIZE_EXTENSIONS != 0,
@@ -37,7 +41,12 @@ pub(super) fn translate_gva_to_gpa(context: &GuestContext, vm: &Vm, gva: usize) 
     }
 }
 
-fn translate_long_mode_gva(vm: &Vm, gva: usize, cr3: Gpaddr, five_level: bool) -> Result<Gpaddr> {
+fn translate_long_mode_gva(
+    vm_memory: &VmMemory,
+    gva: usize,
+    cr3: Gpaddr,
+    five_level: bool,
+) -> Result<Gpaddr> {
     const PTE_PRESENT: u64 = 1 << 0;
     const PTE_HUGE: u64 = 1 << 7;
     const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -57,7 +66,7 @@ fn translate_long_mode_gva(vm: &Vm, gva: usize, cr3: Gpaddr, five_level: bool) -
         let entry_gpa = table
             .checked_add(((gva >> shift) & 0x1ff) * size_of::<u64>())
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
-        let entry: u64 = vm.read_guest_val(entry_gpa)?;
+        let entry: u64 = vm_memory.read_val(entry_gpa)?;
         if entry & PTE_PRESENT == 0 {
             return Err(Error::new(Errno::EFAULT));
         }
@@ -73,19 +82,19 @@ fn translate_long_mode_gva(vm: &Vm, gva: usize, cr3: Gpaddr, five_level: bool) -
     Err(Error::new(Errno::EFAULT))
 }
 
-fn translate_pae_gva(vm: &Vm, gva: usize, cr3: Gpaddr) -> Result<Gpaddr> {
+fn translate_pae_gva(vm_memory: &VmMemory, gva: usize, cr3: Gpaddr) -> Result<Gpaddr> {
     const PTE_PRESENT: u64 = 1 << 0;
     const PTE_HUGE: u64 = 1 << 7;
     const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
     let pdpt = cr3 & !0x1f;
-    let pdpte: u64 = vm.read_guest_val(pdpt + ((gva >> 30) & 0x3) * size_of::<u64>())?;
+    let pdpte: u64 = vm_memory.read_val(pdpt + ((gva >> 30) & 0x3) * size_of::<u64>())?;
     if pdpte & PTE_PRESENT == 0 {
         return Err(Error::new(Errno::EFAULT));
     }
 
     let pd = (pdpte & PTE_ADDR_MASK) as Gpaddr;
-    let pde: u64 = vm.read_guest_val(pd + ((gva >> 21) & 0x1ff) * size_of::<u64>())?;
+    let pde: u64 = vm_memory.read_val(pd + ((gva >> 21) & 0x1ff) * size_of::<u64>())?;
     if pde & PTE_PRESENT == 0 {
         return Err(Error::new(Errno::EFAULT));
     }
@@ -96,7 +105,7 @@ fn translate_pae_gva(vm: &Vm, gva: usize, cr3: Gpaddr) -> Result<Gpaddr> {
     }
 
     let pt = (pde & PTE_ADDR_MASK) as Gpaddr;
-    let pte: u64 = vm.read_guest_val(pt + ((gva >> 12) & 0x1ff) * size_of::<u64>())?;
+    let pte: u64 = vm_memory.read_val(pt + ((gva >> 12) & 0x1ff) * size_of::<u64>())?;
     if pte & PTE_PRESENT == 0 {
         return Err(Error::new(Errno::EFAULT));
     }
@@ -104,7 +113,7 @@ fn translate_pae_gva(vm: &Vm, gva: usize, cr3: Gpaddr) -> Result<Gpaddr> {
 }
 
 fn translate_legacy_gva(
-    vm: &Vm,
+    vm_memory: &VmMemory,
     gva: usize,
     cr3: Gpaddr,
     page_size_extensions: bool,
@@ -113,7 +122,7 @@ fn translate_legacy_gva(
     const PTE_HUGE: u32 = 1 << 7;
 
     let page_directory = cr3 & !0xfff;
-    let pde: u32 = vm.read_guest_val(page_directory + ((gva >> 22) & 0x3ff) * size_of::<u32>())?;
+    let pde: u32 = vm_memory.read_val(page_directory + ((gva >> 22) & 0x3ff) * size_of::<u32>())?;
     if pde & PTE_PRESENT == 0 {
         return Err(Error::new(Errno::EFAULT));
     }
@@ -126,7 +135,7 @@ fn translate_legacy_gva(
     }
 
     let page_table = usize::try_from(pde & 0xffff_f000)?;
-    let pte: u32 = vm.read_guest_val(page_table + ((gva >> 12) & 0x3ff) * size_of::<u32>())?;
+    let pte: u32 = vm_memory.read_val(page_table + ((gva >> 12) & 0x3ff) * size_of::<u32>())?;
     if pte & PTE_PRESENT == 0 {
         return Err(Error::new(Errno::EFAULT));
     }

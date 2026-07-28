@@ -681,7 +681,7 @@ const XLAPIC_WO_SELF_IPI: u64 = 0x3F0;
 const XLAPIC_RW_TIMER_DIVI: u64 = 0x3E0;
 
 use super::{
-    mmio::{decode_current_mmio_instruction, MmioDirection, MmioInstruction},
+    mmio::{MmioDirection, MmioInstruction, decode_current_mmio_instruction},
     vcpu::Vcpu,
 };
 
@@ -697,7 +697,11 @@ pub(super) fn emulate_apic_mmio(vcpu: Arc<Vcpu>, fault_gpa: u64) -> Result<bool>
         return Ok(false);
     }
 
-    let Some(insn) = decode_current_mmio_instruction(&vcpu)? else {
+    let vm = vcpu.vm()?;
+    let context = vcpu.guest_context();
+    let instruction = decode_current_mmio_instruction(&context, vm.memory())?;
+    drop(context);
+    let Some(insn) = instruction else {
         return Ok(false);
     };
 

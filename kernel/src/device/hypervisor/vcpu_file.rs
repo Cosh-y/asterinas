@@ -4,7 +4,6 @@
 
 use ostd::{
     arch::vm::{GuestExitInfo, VmxExitReason},
-    mm::VmIo,
     task::Task,
     vm::GuestRunResult,
 };
@@ -109,15 +108,13 @@ impl FileLike for VcpuFile {
                 Ok(0)
             }
             cmd @ GetMsrs => {
-                let msrs = cmd.with_data_ptr(|ptr| Ok(ptr.read()?))?;
-                let mut entries = read_msr_entries(msrs, raw_ioctl.arg())?;
+                let (msrs, mut entries) = read_get_msr_entries(&cmd, raw_ioctl)?;
                 let handled_count = self.vcpu.get_msrs(&mut entries)?;
-                write_msr_entries(msrs, raw_ioctl.arg(), &entries)?;
+                write_get_msr_entries(&cmd, raw_ioctl, msrs, &entries)?;
                 Ok(handled_count)
             }
             cmd @ SetMsrs => {
-                let msrs = cmd.read()?;
-                let entries = read_msr_entries(msrs, raw_ioctl.arg())?;
+                let entries = read_set_msr_entries(&cmd, raw_ioctl)?;
                 self.vcpu.set_msrs(&entries)
             }
             cmd @ SetFpu => {
@@ -136,8 +133,7 @@ impl FileLike for VcpuFile {
                 Ok(0)
             }
             cmd @ SetCpuid2 => {
-                let cpuid = cmd.read()?;
-                let entries = read_cpuid_entries(cpuid, raw_ioctl.arg())?;
+                let entries = read_cpuid_entries(&cmd, raw_ioctl)?;
                 self.vcpu.set_cpuid_entries(entries)?;
                 Ok(0)
             }
@@ -190,7 +186,7 @@ impl FileLike for VcpuFile {
                 Ok(0)
             }
             SetTscKhz => {
-                self.vcpu.set_tsc_khz(raw_ioctl.arg() as u64)?;
+                self.vcpu.set_tsc_khz(read_tsc_khz(raw_ioctl)?)?;
                 Ok(0)
             }
             GetTscKhz => {
@@ -243,76 +239,6 @@ fn default_debug_regs() -> DebugRegs {
     }
 }
 
-fn read_cpuid_entries(cpuid: VcpuCpuid2, arg: usize) -> Result<Vec<VcpuCpuidEntry2>> {
-    let nent = usize::try_from(cpuid.nent)?;
-    if nent > KVM_MAX_CPUID_ENTRIES {
-        return_errno_with_message!(Errno::E2BIG, "too many CPUID entries");
-    }
-
-    let entries_addr = arg
-        .checked_add(size_of::<VcpuCpuid2>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let entries_len = nent
-        .checked_mul(size_of::<VcpuCpuidEntry2>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let current = Task::current().unwrap();
-    let thread_local = current.as_thread_local().unwrap();
-    let user_space = CurrentUserSpace::new(thread_local);
-    let mut reader = user_space.reader(entries_addr, entries_len)?;
-    let mut entries = Vec::new();
-    for _ in 0..nent {
-        entries.push(reader.read_val()?);
-    }
-
-    Ok(entries)
-}
-
-fn read_msr_entries(msrs: VcpuMsrs, arg: usize) -> Result<Vec<VcpuMsrEntry>> {
-    let nmsrs = usize::try_from(msrs.nmsrs)?;
-    if nmsrs > KVM_MAX_MSR_ENTRIES {
-        return_errno_with_message!(Errno::E2BIG, "too many MSR entries");
-    }
-
-    let entries_addr = arg
-        .checked_add(size_of::<VcpuMsrs>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let entries_len = nmsrs
-        .checked_mul(size_of::<VcpuMsrEntry>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let current = Task::current().unwrap();
-    let thread_local = current.as_thread_local().unwrap();
-    let user_space = CurrentUserSpace::new(thread_local);
-    let mut reader = user_space.reader(entries_addr, entries_len)?;
-    let mut entries = Vec::new();
-    for _ in 0..nmsrs {
-        entries.push(reader.read_val()?);
-    }
-
-    Ok(entries)
-}
-
-fn write_msr_entries(msrs: VcpuMsrs, arg: usize, entries: &[VcpuMsrEntry]) -> Result<()> {
-    debug_assert_eq!(usize::try_from(msrs.nmsrs).ok(), Some(entries.len()));
-
-    let entries_addr = arg
-        .checked_add(size_of::<VcpuMsrs>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let entries_len = entries
-        .len()
-        .checked_mul(size_of::<VcpuMsrEntry>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let current = Task::current().unwrap();
-    let thread_local = current.as_thread_local().unwrap();
-    let user_space = CurrentUserSpace::new(thread_local);
-    user_space.write_val(arg, &msrs)?;
-    let mut writer = user_space.writer(entries_addr, entries_len)?;
-    for entry in entries {
-        writer.write_val(entry)?;
-    }
-
-    Ok(())
-}
-
 impl VcpuFile {
     fn ioctl_run(&self) -> Result<i32> {
         self.complete_pending_operation()?;
@@ -327,7 +253,7 @@ impl VcpuFile {
                 let mut context = self.vcpu.guest_context();
                 match guest_mode.execute(
                     &mut context,
-                    self.vm.guest_mem(),
+                    self.vm.memory().guest_mem(),
                     &self.vcpu.lapic,
                     &self.vcpu.lapic,
                 ) {
@@ -454,7 +380,7 @@ impl VcpuFile {
 
         operation.operation.complete(
             &mut self.vcpu.guest_context(),
-            &self.vm,
+            self.vm.memory(),
             operation.count,
             input_data.as_deref(),
         )
@@ -494,14 +420,20 @@ impl VcpuFile {
     ///         `Ok(false)` otherwise.
     fn handle_pio_ioeventfd(&self, exit_info: &GuestExitInfo) -> Result<bool> {
         let context = self.vcpu.guest_context();
-        let Some(operation) = PioOperation::decode(&context, &self.vm, exit_info)? else {
+        let Some(operation) = PioOperation::decode(&context, self.vm.memory(), exit_info)?
+        else {
             return Ok(false);
         };
         let count = operation.batch_count(&context, KVM_RUN_IO_DATA_CAPACITY);
         if count == 0 {
             drop(context);
             let input_data = (operation.direction() == PioDirection::In).then_some(&[] as &[u8]);
-            operation.complete(&mut self.vcpu.guest_context(), &self.vm, 0, input_data)?;
+            operation.complete(
+                &mut self.vcpu.guest_context(),
+                self.vm.memory(),
+                0,
+                input_data,
+            )?;
             return Ok(true);
         }
 
@@ -516,7 +448,7 @@ impl VcpuFile {
         ) {
             return Ok(false);
         }
-        let data = operation.output_data(&context, &self.vm, count)?;
+        let data = operation.output_data(&context, self.vm.memory(), count)?;
         let values = operation.output_values(&data)?;
         drop(context);
 
@@ -529,7 +461,12 @@ impl VcpuFile {
             return Ok(false);
         }
 
-        operation.complete(&mut self.vcpu.guest_context(), &self.vm, count, None)?;
+        operation.complete(
+            &mut self.vcpu.guest_context(),
+            self.vm.memory(),
+            count,
+            None,
+        )?;
         Ok(true)
     }
 
@@ -537,15 +474,18 @@ impl VcpuFile {
         if exit_info.exit_qualification & 0b111 != 0b010 {
             return Ok(false);
         }
-        let Some(instruction) = decode_current_mmio_instruction(&self.vcpu)? else {
+        let context = self.vcpu.guest_context();
+        let instruction = decode_current_mmio_instruction(&context, self.vm.memory())?;
+        let Some(instruction) = instruction else {
             return Ok(false);
         };
         if instruction.direction() != MmioDirection::Write {
             return Ok(false);
         }
-        let Some(value) = instruction.write_value(&self.vcpu.guest_context()) else {
+        let Some(value) = instruction.write_value(&context) else {
             return Ok(false);
         };
+        drop(context);
         if !self.vm.signal_ioeventfd(
             IoEventAddressSpace::Mmio,
             exit_info.guest_phys_addr as u64,
@@ -594,7 +534,9 @@ impl VcpuFile {
     fn write_io_exit(&self, exit_info: GuestExitInfo) -> Result<()> {
         let (operation, count, data) = {
             let context = self.vcpu.guest_context();
-            let Some(operation) = PioOperation::decode(&context, &self.vm, &exit_info)? else {
+            let Some(operation) =
+                PioOperation::decode(&context, self.vm.memory(), &exit_info)?
+            else {
                 return self.write_internal_error_exit(exit_info);
             };
             let count = operation.batch_count(&context, KVM_RUN_IO_DATA_CAPACITY);
@@ -602,7 +544,7 @@ impl VcpuFile {
                 return self.write_internal_error_exit(exit_info);
             }
             let data = if operation.direction() == PioDirection::Out {
-                operation.output_data(&context, &self.vm, count)?
+                operation.output_data(&context, self.vm.memory(), count)?
             } else {
                 let data_len = usize::try_from(count)?
                     .checked_mul(usize::from(operation.size()))
@@ -644,7 +586,9 @@ impl VcpuFile {
             0b010 => MmioDirection::Write,
             _ => return self.write_internal_error_exit(exit_info),
         };
-        let Some(instruction) = decode_current_mmio_instruction(&self.vcpu)? else {
+        let context = self.vcpu.guest_context();
+        let instruction = decode_current_mmio_instruction(&context, self.vm.memory())?;
+        let Some(instruction) = instruction else {
             return self.write_internal_error_exit(exit_info);
         };
         if instruction.direction() != direction {
@@ -656,11 +600,12 @@ impl VcpuFile {
         let is_write = u8::from(direction == MmioDirection::Write);
         let mut data = [0_u8; 8];
         if direction == MmioDirection::Write {
-            let Some(value) = instruction.write_value(&self.vcpu.guest_context()) else {
+            let Some(value) = instruction.write_value(&context) else {
                 return self.write_internal_error_exit(exit_info);
             };
             data[..size as usize].copy_from_slice(&value.to_le_bytes()[..size as usize]);
         }
+        drop(context);
 
         self.write_simple_exit(KVM_EXIT_MMIO)?;
         self.vcpu.write_run_val(

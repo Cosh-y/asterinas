@@ -3,7 +3,7 @@
 //! VM file descriptor implementation
 
 use ostd::{
-    mm::{CachePolicy, Gpaddr, PageFlags, PageProperty, VmIo, vm_space::VmQueriedItem},
+    mm::{CachePolicy, Gpaddr, PageFlags, PageProperty, vm_space::VmQueriedItem},
     task::Task,
 };
 
@@ -48,7 +48,7 @@ impl VmFile {
             return_errno_with_message!(Errno::EINVAL, "unsupported guest memory flags");
         }
         if memory_size == 0 {
-            self.vm.set_user_memory_region(
+            self.vm.memory().set_region(
                 region.slot,
                 0,
                 0,
@@ -75,7 +75,8 @@ impl VmFile {
 
         let prop = default_guest_mem_prop(region.flags & KVM_MEM_READONLY != 0);
         self.vm
-            .set_user_memory_region(region.slot, guest_start, memory_size, frames, prop)?;
+            .memory()
+            .set_region(region.slot, guest_start, memory_size, frames, prop)?;
 
         Ok(())
     }
@@ -131,10 +132,10 @@ impl FileLike for VmFile {
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
         dispatch_ioctl!(match raw_ioctl {
             CheckExtension => {
-                Ok(check_extension(raw_ioctl.arg()))
+                Ok(check_extension(raw_ioctl))
             }
             CreateVcpu => {
-                let vcpu_id = u32::try_from(raw_ioctl.arg())?;
+                let vcpu_id = read_vcpu_id(raw_ioctl)?;
 
                 // Create the VCPU
                 let vcpu = self.vm.create_vcpu(vcpu_id)?;
@@ -162,7 +163,7 @@ impl FileLike for VmFile {
                 // TODO:
                 Ok(0)
             }
-            cmd @ SetIdentityMapAddr => {
+            SetIdentityMapAddr => {
                 // KVM quirk api.
                 Ok(0)
             }
@@ -192,7 +193,7 @@ impl FileLike for VmFile {
                 }
             }
             SetIrqchip => {
-                let irqchip = read_irqchip(raw_ioctl.arg())?;
+                let irqchip = read_set_irqchip(raw_ioctl)?;
                 match irqchip.chip_id {
                     KVM_IRQCHIP_PIC_MASTER | KVM_IRQCHIP_PIC_SLAVE | KVM_IRQCHIP_IOAPIC => Ok(0),
                     _ => {
@@ -218,8 +219,7 @@ impl FileLike for VmFile {
                 Ok(0)
             }
             cmd @ SetGsiRouting => {
-                let routing = cmd.read()?;
-                let entries = read_irq_routing_entries(routing, raw_ioctl.arg())?;
+                let entries = read_irq_routing_entries(&cmd, raw_ioctl)?;
                 self.vm.set_gsi_routing(&entries)?;
                 Ok(0)
             }
@@ -280,37 +280,6 @@ impl FileLike for VmFile {
     fn dump_proc_fdinfo(self: Arc<Self>, _fd_flags: FdFlags) -> Box<dyn core::fmt::Display> {
         Box::new(alloc::format!("vm_id: {}\n", self.vm.id))
     }
-}
-
-fn read_irq_routing_entries(routing: IrqRouting, arg: usize) -> Result<Vec<IrqRoutingEntry>> {
-    let nr = usize::try_from(routing.nr)?;
-    if nr > KVM_MAX_IRQ_ROUTES {
-        return_errno_with_message!(Errno::E2BIG, "too many GSI routing entries");
-    }
-
-    let entries_addr = arg
-        .checked_add(size_of::<IrqRouting>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let entries_len = nr
-        .checked_mul(size_of::<IrqRoutingEntry>())
-        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-    let current = Task::current().unwrap();
-    let thread_local = current.as_thread_local().unwrap();
-    let user_space = CurrentUserSpace::new(thread_local);
-    let mut reader = user_space.reader(entries_addr, entries_len)?;
-    let mut entries = Vec::new();
-    for _ in 0..nr {
-        entries.push(reader.read_val()?);
-    }
-
-    Ok(entries)
-}
-
-fn read_irqchip(arg: usize) -> Result<IrqChip> {
-    let current = Task::current().unwrap();
-    let thread_local = current.as_thread_local().unwrap();
-    let user_space = CurrentUserSpace::new(thread_local);
-    Ok(user_space.read_val(arg)?)
 }
 
 fn current_vmar() -> Result<Arc<Vmar>> {
