@@ -167,7 +167,7 @@ impl Cursor<'_> {
     }
 
     /// Gets the guest physical address of the current slot.
-    pub fn guest_physical_addr(&self) -> Gpaddr {
+    pub fn gpa(&self) -> Gpaddr {
         self.0.virt_addr()
     }
 }
@@ -209,7 +209,7 @@ impl<'a> CursorMut<'a> {
     }
 
     /// Gets the guest physical address of the current slot.
-    pub fn guest_physical_addr(&self) -> Gpaddr {
+    pub fn gpa(&self) -> Gpaddr {
         self.pt_cursor.virt_addr()
     }
 
@@ -238,16 +238,13 @@ impl<'a> CursorMut<'a> {
     /// Panics if `len` is longer than the remaining range of the cursor or is
     /// not page-aligned.
     pub fn unmap(&mut self, len: usize) -> usize {
-        let end_gpa = self.guest_physical_addr() + len;
+        let end_gpa = self.gpa() + len;
         let mut num_unmapped: usize = 0;
         let mut frags = Vec::new();
         loop {
             // SAFETY: It is safe to un-map memory in the guest physical memory space.
             // And the un-mapped items are dropped after TLB flushes.
-            let Some(frag) = (unsafe {
-                self.pt_cursor
-                    .take_next(end_gpa - self.guest_physical_addr())
-            }) else {
+            let Some(frag) = (unsafe { self.pt_cursor.take_next(end_gpa - self.gpa()) }) else {
                 break; // No more mappings in the range.
             };
 

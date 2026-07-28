@@ -2,7 +2,10 @@
 
 //! Decodes guest instructions that access emulated MMIO regions.
 
-use ostd::arch::vm::{GuestContext, X86GprIndex};
+use ostd::{
+    arch::vm::{GuestContext, X86GprIndex},
+    mm::Gvaddr,
+};
 
 use super::{guest_address::translate_gva_to_gpa, vm_memory::VmMemory};
 use crate::prelude::*;
@@ -169,14 +172,10 @@ pub(super) fn decode_current_mmio_instruction(
     let code_vaddr = if mode.long_mode {
         guest_rip
     } else {
-        context
-            .sregs()
-            .cs
-            .base
+        Gvaddr::try_from(context.sregs().cs.base)?
             .checked_add(guest_rip)
             .ok_or_else(|| Error::new(Errno::EFAULT))?
     };
-    let code_vaddr = usize::try_from(code_vaddr)?;
     let mut bytes = [0_u8; MAX_INSN_LENGTH];
     let mut bytes_read = 0;
 

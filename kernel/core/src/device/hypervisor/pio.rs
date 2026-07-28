@@ -2,13 +2,16 @@
 
 //! Decodes and completes guest port-I/O instructions.
 
-use ostd::arch::vm::{GuestContext, GuestExitInfo, VcpuSegment, X86GprIndex};
+use ostd::{
+    arch::vm::{GuestContext, GuestExitInfo, VcpuSegment, X86GprIndex},
+    mm::Gvaddr,
+};
 
 use super::{guest_address::translate_gva_to_gpa, vm_memory::VmMemory};
 use crate::prelude::*;
 
 const MAX_INSN_LENGTH: usize = 15;
-const RFLAGS_DIRECTION: u64 = 1 << 10;
+const RFLAGS_DIRECTION: usize = 1 << 10;
 const EFER_LONG_MODE_ACTIVE: u64 = 1 << 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,9 +283,7 @@ fn decode_string_instruction(
     let code_linear = if long_mode {
         context.rip()
     } else {
-        sregs
-            .cs
-            .base
+        Gvaddr::try_from(sregs.cs.base)?
             .checked_add(context.rip())
             .ok_or_else(|| Error::new(Errno::EFAULT))?
     };
@@ -406,15 +407,14 @@ fn decode_string_bytes(
 fn read_guest_linear(
     context: &GuestContext,
     vm_memory: &VmMemory,
-    linear: u64,
+    linear: Gvaddr,
     bytes: &mut [u8],
 ) -> Result<()> {
     let mut completed = 0;
     while completed < bytes.len() {
-        let current = linear
-            .checked_add(u64::try_from(completed)?)
+        let gva = linear
+            .checked_add(completed)
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
-        let gva = usize::try_from(current).map_err(|_| Error::new(Errno::EFAULT))?;
         let gpa = translate_gva_to_gpa(context, vm_memory, gva)?;
         let page_remaining = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
         let copy_len = page_remaining.min(bytes.len() - completed);
@@ -427,15 +427,14 @@ fn read_guest_linear(
 fn write_guest_linear(
     context: &GuestContext,
     vm_memory: &VmMemory,
-    linear: u64,
+    linear: Gvaddr,
     bytes: &[u8],
 ) -> Result<()> {
     let mut completed = 0;
     while completed < bytes.len() {
-        let current = linear
-            .checked_add(u64::try_from(completed)?)
+        let gva = linear
+            .checked_add(completed)
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
-        let gva = usize::try_from(current).map_err(|_| Error::new(Errno::EFAULT))?;
         let gpa = translate_gva_to_gpa(context, vm_memory, gva)?;
         let page_remaining = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
         let copy_len = page_remaining.min(bytes.len() - completed);
@@ -449,10 +448,11 @@ fn segmented_linear_address(
     context: &GuestContext,
     segment: SegmentRegister,
     offset: u64,
-) -> Result<u64> {
-    segment_base(context, segment)
+) -> Result<Gvaddr> {
+    let linear = segment_base(context, segment)
         .checked_add(offset)
-        .ok_or_else(|| Error::new(Errno::EFAULT))
+        .ok_or_else(|| Error::new(Errno::EFAULT))?;
+    Gvaddr::try_from(linear).map_err(|_| Error::new(Errno::EFAULT))
 }
 
 fn segment_base(context: &GuestContext, segment: SegmentRegister) -> u64 {

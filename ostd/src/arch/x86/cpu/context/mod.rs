@@ -46,7 +46,7 @@ pub struct UserContext {
 /// General registers.
 #[expect(missing_docs)]
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod)]
 pub struct GeneralRegs {
     pub rax: usize,
     pub rbx: usize,

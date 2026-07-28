@@ -2,40 +2,13 @@
 
 //! Provide the basic types used to represent the context on an Intel x86 CPU
 
-use crate::{
-    error::Error,
-    prelude::*
-};
+use crate::{arch::cpu::context::GeneralRegs, error::Error, prelude::*};
 
 /// Guest general-purpose registers.
 ///
-/// This structure represents the guest CPU's general-purpose registers.
-#[expect(
-    missing_docs,
-    reason = "KVM-compatible register field names are self-describing."
-)]
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod)]
-pub struct VcpuRegs {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub rsp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rip: u64,
-    pub rflags: u64,
-}
+/// On x86-64, the guest and userspace CPU contexts use the same register
+/// representation.
+pub type VcpuRegs = GeneralRegs;
 
 /// A guest general-purpose register.
 #[expect(

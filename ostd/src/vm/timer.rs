@@ -2,7 +2,7 @@ use crate::arch::vm::GuestTimerInstant;
 
 /// Provides guest timer interrupt policy to [`super::GuestMode`].
 ///
-/// `GuestMode` uses this port before vm entry to ask when a vm exit should
+/// `GuestMode` uses this port before VM entry to ask when a VM exit should
 /// happen so the kernel can publish a virtual timer interrupt in time.
 ///
 /// This method may be called while guest entry preparation has disabled
