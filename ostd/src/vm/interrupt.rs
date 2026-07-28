@@ -24,7 +24,7 @@ pub trait GuestInterruptPort {
     ///
     /// An implementation that does not inject guest interrupts can always
     /// return `None`.
-    fn check_pending_interrupt(&self) -> Option<GuestInterrupt>;
+    fn query_pending_interrupt(&self) -> Option<GuestInterrupt>;
 
     /// Marks a guest interrupt as accepted for injection.
     ///

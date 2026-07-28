@@ -50,10 +50,10 @@ impl GuestContext {
     /// [`Self::receive_sipi`] accepts a startup vector.
     ///
     /// Returns an error if the VMX virtualization environment is not ready.
-    pub fn new(id: u32) -> Result<Self> {
+    pub fn new(vcpu_id: u32) -> Result<Self> {
         Ok(Self {
             arch: VcpuArchState::default(),
-            run: if id == 0 {
+            run: if vcpu_id == 0 {
                 VcpuRunState::Runnable
             } else {
                 VcpuRunState::WaitForSipi
@@ -80,7 +80,6 @@ impl GuestContext {
         };
         self.arch.set_sregs(VcpuSregs::with_startup(vector));
         self.arch.set_efer(0);
-        // self.arch.msrs.tsc_aux = u64::from(vcpu_id);
         self.run = VcpuRunState::Runnable;
     }
 
@@ -138,7 +137,7 @@ impl GuestContext {
     }
 
     /// Returns the guest instruction pointer.
-    pub fn rip(&self) -> u64 {
+    pub fn rip(&self) -> Gvaddr {
         self.arch.rip()
     }
 
@@ -261,7 +260,7 @@ impl VcpuArchState {
     }
 
     pub fn gpr(&self, reg: X86GprIndex) -> u64 {
-        match reg {
+        (match reg {
             X86GprIndex::Rax => self.regs.rax,
             X86GprIndex::Rbx => self.regs.rbx,
             X86GprIndex::Rcx => self.regs.rcx,
@@ -278,7 +277,7 @@ impl VcpuArchState {
             X86GprIndex::R13 => self.regs.r13,
             X86GprIndex::R14 => self.regs.r14,
             X86GprIndex::R15 => self.regs.r15,
-        }
+        }) as u64
     }
 
     pub fn set_gpr(&mut self, reg: X86GprIndex, width_byte: u8, value: u64) {
@@ -300,6 +299,7 @@ impl VcpuArchState {
             X86GprIndex::R14 => &mut self.regs.r14,
             X86GprIndex::R15 => &mut self.regs.r15,
         };
+        let value = value as usize;
 
         *slot = match width_byte {
             1 => (*slot & !0xff) | (value & 0xff),
@@ -310,23 +310,23 @@ impl VcpuArchState {
     }
 
     pub fn advance_rip(&mut self, len: u64) {
-        self.regs.rip += len;
+        self.regs.rip += len as usize;
     }
 
-    pub(crate) fn rip(&self) -> u64 {
+    pub(crate) fn rip(&self) -> Gvaddr {
         self.regs.rip
     }
 
-    pub(crate) fn set_rip(&mut self, value: u64) {
+    pub(crate) fn set_rip(&mut self, value: Gvaddr) {
         self.regs.rip = value;
     }
 
     pub(crate) fn rflags(&self) -> u64 {
-        self.regs.rflags
+        self.regs.rflags as u64
     }
 
     pub(crate) fn set_rflags(&mut self, value: u64) {
-        self.regs.rflags = value;
+        self.regs.rflags = value as usize;
     }
 
     pub(crate) fn msr(&self, index: u32) -> u64 {

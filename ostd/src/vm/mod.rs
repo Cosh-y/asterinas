@@ -43,6 +43,8 @@ pub fn init() -> Result<()> {
 /// Here is a sample code on how to use `GuestMode`.
 ///
 /// ```no_run
+/// # fn handle_vm_exit(guest_result: ostd::vm::GuestRunResult) {}
+/// #
 /// use ostd::{
 ///     arch::vm::GuestContext,
 ///     prelude::*,
@@ -58,8 +60,9 @@ pub fn init() -> Result<()> {
 ///     let mut guest_mode = GuestMode::new()?;
 ///
 ///     loop {
-///         let _run_result = guest_mode.execute(context, guest_mem, interrupt_port, timer_port)?;
-///         todo!("handle the userspace-visible VM exit");
+///         let run_result = guest_mode.execute(context, guest_mem, interrupt_port, timer_port)?;
+///         // Handle VM exit according to the exit reason recorded in `run_result`.
+///         handle_vm_exit(run_result);
 ///     }
 /// }
 /// ```
@@ -100,7 +103,7 @@ impl GuestMode {
     ///
     /// The method returns when guest execution needs handling by the kernel
     /// client. [`GuestRunResult::VmExit`] carries the architecture-specific
-    /// vmexit information.
+    /// VM-exit information.
     ///
     /// After handling the returned event and updating `context` or the guest
     /// device model as needed, call this method again to resume guest
@@ -151,7 +154,7 @@ impl GuestMode {
             let exit_info = vmexit_handler(context, &exit_info)?;
             drop(irq_guard);
 
-            // Deliver handling of vmexit to kernel client or userspace.
+            // Deliver VM-exit handling to the kernel client or userspace.
             if let Some(exit_info) = exit_info {
                 return Ok(GuestRunResult::VmExit(exit_info));
             }
@@ -240,7 +243,7 @@ impl GuestMode {
     ) -> Result<Option<u8>> {
         VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(0)?;
 
-        let pending_vector = interrupt_port.check_pending_interrupt();
+        let pending_vector = interrupt_port.query_pending_interrupt();
 
         let Some(vector) = pending_vector else {
             return Ok(None);
@@ -329,7 +332,7 @@ impl GuestMode {
         use x86_64::registers::control::Cr2;
         context.arch_mut().set_cr2(Cr2::read_raw());
 
-        context.arch_mut().set_rip(VmcsGuestNW::RIP.read()? as u64);
+        context.arch_mut().set_rip(VmcsGuestNW::RIP.read()?);
         context
             .arch_mut()
             .set_gpr(X86GprIndex::Rsp, 8, VmcsGuestNW::RSP.read()? as u64);

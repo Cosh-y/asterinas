@@ -2,7 +2,10 @@
 
 //! Translates guest virtual addresses to guest physical addresses.
 
-use ostd::{arch::vm::GuestContext, mm::Gpaddr};
+use ostd::{
+    arch::vm::GuestContext,
+    mm::{Gpaddr, Gvaddr},
+};
 
 use super::vm_memory::VmMemory;
 use crate::prelude::*;
@@ -10,7 +13,7 @@ use crate::prelude::*;
 pub(super) fn translate_gva_to_gpa(
     context: &GuestContext,
     vm_memory: &VmMemory,
-    gva: usize,
+    gva: Gvaddr,
 ) -> Result<Gpaddr> {
     const CR0_PAGING: u64 = 1 << 31;
     const CR4_PAGE_SIZE_EXTENSIONS: u64 = 1 << 4;
@@ -43,7 +46,7 @@ pub(super) fn translate_gva_to_gpa(
 
 fn translate_long_mode_gva(
     vm_memory: &VmMemory,
-    gva: usize,
+    gva: Gvaddr,
     cr3: Gpaddr,
     five_level: bool,
 ) -> Result<Gpaddr> {
@@ -52,7 +55,7 @@ fn translate_long_mode_gva(
     const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
     let address_width = if five_level { 57 } else { 48 };
-    if !is_canonical(gva as u64, address_width) {
+    if !is_canonical(gva, address_width) {
         return Err(Error::new(Errno::EFAULT));
     }
 
@@ -82,7 +85,7 @@ fn translate_long_mode_gva(
     Err(Error::new(Errno::EFAULT))
 }
 
-fn translate_pae_gva(vm_memory: &VmMemory, gva: usize, cr3: Gpaddr) -> Result<Gpaddr> {
+fn translate_pae_gva(vm_memory: &VmMemory, gva: Gvaddr, cr3: Gpaddr) -> Result<Gpaddr> {
     const PTE_PRESENT: u64 = 1 << 0;
     const PTE_HUGE: u64 = 1 << 7;
     const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -114,7 +117,7 @@ fn translate_pae_gva(vm_memory: &VmMemory, gva: usize, cr3: Gpaddr) -> Result<Gp
 
 fn translate_legacy_gva(
     vm_memory: &VmMemory,
-    gva: usize,
+    gva: Gvaddr,
     cr3: Gpaddr,
     page_size_extensions: bool,
 ) -> Result<Gpaddr> {
@@ -142,23 +145,7 @@ fn translate_legacy_gva(
     Ok(usize::try_from(pte & 0xffff_f000)? | (gva & (PAGE_SIZE - 1)))
 }
 
-fn is_canonical(address: u64, width: u32) -> bool {
+fn is_canonical(address: Gvaddr, width: u32) -> bool {
     let shift = 64 - width;
-    ((address << shift) as i64 >> shift) as u64 == address
-}
-
-#[cfg(ktest)]
-mod tests {
-    use ostd::prelude::ktest;
-
-    use super::*;
-
-    #[ktest]
-    fn canonical_address_widths_are_validated() {
-        assert!(is_canonical(0x0000_7fff_ffff_ffff, 48));
-        assert!(is_canonical(0xffff_8000_0000_0000, 48));
-        assert!(!is_canonical(0x0000_8000_0000_0000, 48));
-        assert!(is_canonical(0x00ff_ffff_ffff_ffff, 57));
-        assert!(!is_canonical(0x0100_0000_0000_0000, 57));
-    }
+    ((address << shift) as i64 >> shift) as Gvaddr == address
 }

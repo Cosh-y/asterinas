@@ -428,7 +428,7 @@ impl LapicPort {
 }
 
 impl GuestInterruptPort for LapicPort {
-    fn check_pending_interrupt(&self) -> Option<GuestInterrupt> {
+    fn query_pending_interrupt(&self) -> Option<GuestInterrupt> {
         if let Some(vector) = self.lock().check_pending_interrupt() {
             Some(GuestInterrupt { vector })
         } else {

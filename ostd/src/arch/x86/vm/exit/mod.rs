@@ -1,4 +1,7 @@
-use crate::{arch::vm::vmx::VmxExitInfo, mm::Gpaddr};
+use crate::{
+    arch::vm::vmx::VmxExitInfo,
+    mm::{Gpaddr, Gvaddr},
+};
 
 mod handler;
 
@@ -15,7 +18,7 @@ pub struct GuestExitInfo {
     /// Guest physical address associated with the exit, if any.
     pub guest_phys_addr: Gpaddr,
     /// Guest instruction pointer at the exit.
-    pub guest_rip: Gpaddr,
+    pub guest_rip: Gvaddr,
 }
 
 impl From<VmxExitInfo> for GuestExitInfo {

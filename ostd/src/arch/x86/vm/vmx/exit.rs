@@ -113,7 +113,7 @@ pub(crate) struct VmxExitInfo {
     pub(crate) instruction_len: u32,
     pub(crate) exit_qualification: u64,
     pub(crate) guest_phys_addr: GuestPhysAddr,
-    pub(crate) guest_rip: GuestPhysAddr,
+    pub(crate) guest_rip: Gvaddr,
 }
 
 /// Reads the VM-exit information fields from the current VMCS.
