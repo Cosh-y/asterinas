@@ -1,14 +1,19 @@
 //! Ioctl api compatible with Linux KVM.
 //! KVM api: https://www.kernel.org/doc/html/latest/virt/kvm/api.html
 
-use ostd::arch::vm::{
-    VcpuDtable as ArchVcpuDtable, VcpuRegs as ArchVcpuRegs, VcpuRunState,
-    VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
+use ostd::{
+    arch::vm::{
+        VcpuDtable as ArchVcpuDtable, VcpuRegs as ArchVcpuRegs, VcpuRunState,
+        VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
+    },
+    mm::VmIo,
+    task::Task,
 };
 
 use crate::{
+    context::current_userspace,
     prelude::*,
-    util::ioctl::{InData, InOutData, NoData, OutData, ioc},
+    util::ioctl::{InData, InOutData, NoData, OutData, RawIoctl, ioc},
 };
 
 const KVM_INTERRUPT_BITMAP_WORDS: usize = (256 + 63) / 64;
@@ -194,8 +199,8 @@ pub(super) type GetTscKhz = ioc!(KVM_GET_TSC_KHZ, 0xAE, 0xa3, NoData);
 pub(super) type GetXsave = ioc!(KVM_GET_XSAVE, 0xAE, 0xa4, OutData<XsaveState>);
 pub(super) type SetXsave = ioc!(KVM_SET_XSAVE, 0xAE, 0xa5, InData<XsaveState>);
 
-pub(super) fn check_extension(extension: usize) -> i32 {
-    match extension {
+pub(super) fn check_extension(raw_ioctl: RawIoctl) -> i32 {
+    match raw_ioctl.arg() {
         KVM_CAP_IRQCHIP
         | KVM_CAP_HLT
         | KVM_CAP_USER_MEMORY
@@ -234,6 +239,162 @@ pub(super) fn check_extension(extension: usize) -> i32 {
         // TODO: Report capabilities from the actual hypervisor implementation.
         _ => 0,
     }
+}
+
+pub(super) fn read_vcpu_id(raw_ioctl: RawIoctl) -> Result<u32> {
+    Ok(u32::try_from(raw_ioctl.arg())?)
+}
+
+pub(super) fn read_tsc_khz(raw_ioctl: RawIoctl) -> Result<u64> {
+    Ok(u64::try_from(raw_ioctl.arg())?)
+}
+
+pub(super) fn write_supported_cpuid(
+    command: &GetSupportedCpuid,
+    raw_ioctl: RawIoctl,
+    entries: &[VcpuCpuidEntry2],
+) -> Result<()> {
+    let mut cpuid = command.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+    let requested_count = usize::try_from(cpuid.nent)?;
+    cpuid.nent = u32::try_from(entries.len())?;
+    command.write(&cpuid)?;
+
+    if requested_count < entries.len() {
+        return_errno_with_message!(Errno::E2BIG, "the userspace CPUID buffer is too small");
+    }
+
+    write_trailing_array(raw_ioctl, size_of::<VcpuCpuid2>(), entries)
+}
+
+pub(super) fn write_msr_index_list(
+    command: &GetMsrIndexList,
+    raw_ioctl: RawIoctl,
+    indices: &[u32],
+) -> Result<()> {
+    let mut msr_list = command.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+    let requested_count = usize::try_from(msr_list.nmsrs)?;
+    msr_list.nmsrs = u32::try_from(indices.len())?;
+    command.write(&msr_list)?;
+
+    if requested_count < indices.len() {
+        return_errno_with_message!(Errno::E2BIG, "the userspace MSR buffer is too small");
+    }
+
+    write_trailing_array(raw_ioctl, size_of::<MsrList>(), indices)
+}
+
+pub(super) fn read_cpuid_entries(
+    command: &SetCpuid2,
+    raw_ioctl: RawIoctl,
+) -> Result<Vec<VcpuCpuidEntry2>> {
+    let cpuid = command.read()?;
+    let entry_count = usize::try_from(cpuid.nent)?;
+    if entry_count > KVM_MAX_CPUID_ENTRIES {
+        return_errno_with_message!(Errno::E2BIG, "too many CPUID entries");
+    }
+
+    read_trailing_array(raw_ioctl, size_of::<VcpuCpuid2>(), entry_count)
+}
+
+pub(super) fn read_get_msr_entries(
+    command: &GetMsrs,
+    raw_ioctl: RawIoctl,
+) -> Result<(VcpuMsrs, Vec<VcpuMsrEntry>)> {
+    let msrs = command.with_data_ptr(|ptr| Ok(ptr.read()?))?;
+    let entries = read_msr_entries(msrs, raw_ioctl)?;
+    Ok((msrs, entries))
+}
+
+pub(super) fn read_set_msr_entries(
+    command: &SetMsrs,
+    raw_ioctl: RawIoctl,
+) -> Result<Vec<VcpuMsrEntry>> {
+    let msrs = command.read()?;
+    read_msr_entries(msrs, raw_ioctl)
+}
+
+pub(super) fn write_get_msr_entries(
+    command: &GetMsrs,
+    raw_ioctl: RawIoctl,
+    msrs: VcpuMsrs,
+    entries: &[VcpuMsrEntry],
+) -> Result<()> {
+    debug_assert_eq!(usize::try_from(msrs.nmsrs).ok(), Some(entries.len()));
+
+    command.write(&msrs)?;
+    write_trailing_array(raw_ioctl, size_of::<VcpuMsrs>(), entries)
+}
+
+pub(super) fn read_irq_routing_entries(
+    command: &SetGsiRouting,
+    raw_ioctl: RawIoctl,
+) -> Result<Vec<IrqRoutingEntry>> {
+    let routing = command.read()?;
+    let entry_count = usize::try_from(routing.nr)?;
+    if entry_count > KVM_MAX_IRQ_ROUTES {
+        return_errno_with_message!(Errno::E2BIG, "too many GSI routing entries");
+    }
+
+    read_trailing_array(raw_ioctl, size_of::<IrqRouting>(), entry_count)
+}
+
+pub(super) fn read_set_irqchip(raw_ioctl: RawIoctl) -> Result<IrqChip> {
+    Ok(current_userspace!().read_val(raw_ioctl.arg())?)
+}
+
+fn read_msr_entries(msrs: VcpuMsrs, raw_ioctl: RawIoctl) -> Result<Vec<VcpuMsrEntry>> {
+    let entry_count = usize::try_from(msrs.nmsrs)?;
+    if entry_count > KVM_MAX_MSR_ENTRIES {
+        return_errno_with_message!(Errno::E2BIG, "too many MSR entries");
+    }
+
+    read_trailing_array(raw_ioctl, size_of::<VcpuMsrs>(), entry_count)
+}
+
+fn read_trailing_array<T: Pod>(
+    raw_ioctl: RawIoctl,
+    header_size: usize,
+    element_count: usize,
+) -> Result<Vec<T>> {
+    let elements_address = raw_ioctl
+        .arg()
+        .checked_add(header_size)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let elements_len = element_count
+        .checked_mul(size_of::<T>())
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let current = Task::current().unwrap();
+    let thread_local = current.as_thread_local().unwrap();
+    let user_space = CurrentUserSpace::new(thread_local);
+    let mut reader = user_space.reader(elements_address, elements_len)?;
+    let mut elements = Vec::with_capacity(element_count);
+    for _ in 0..element_count {
+        elements.push(reader.read_val()?);
+    }
+    Ok(elements)
+}
+
+fn write_trailing_array<T: Pod>(
+    raw_ioctl: RawIoctl,
+    header_size: usize,
+    elements: &[T],
+) -> Result<()> {
+    let elements_address = raw_ioctl
+        .arg()
+        .checked_add(header_size)
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let elements_len = elements
+        .len()
+        .checked_mul(size_of::<T>())
+        .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
+    let current = Task::current().unwrap();
+    let thread_local = current.as_thread_local().unwrap();
+    let user_space = CurrentUserSpace::new(thread_local);
+    let mut writer = user_space.writer(elements_address, elements_len)?;
+    for element in elements {
+        writer.write_val(element)?;
+    }
+    Ok(())
 }
 
 /// The x86 `struct kvm_msr_list`.

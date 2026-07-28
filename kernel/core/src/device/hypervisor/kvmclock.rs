@@ -137,7 +137,7 @@ impl KvmClock {
         let (mul, shift) = tsc_to_system_scale()?;
         let odd_version = next_odd_version(self.system_time_version);
         let even_version = next_even_version(odd_version);
-        vm.write_guest_val(gpa as usize, &odd_version)?;
+        vm.memory().write_val(gpa as usize, &odd_version)?;
 
         let time_info = PvclockVcpuTimeInfo {
             version: even_version,
@@ -149,7 +149,7 @@ impl KvmClock {
             flags: PVCLOCK_FLAGS_NONE,
             pad: [0; 2],
         };
-        vm.write_guest_val(gpa as usize, &time_info)?;
+        vm.memory().write_val(gpa as usize, &time_info)?;
         self.system_time_version = even_version;
         Ok(())
     }
@@ -162,14 +162,14 @@ impl KvmClock {
 
         let odd_version = next_odd_version(self.wall_clock_version);
         let even_version = next_even_version(odd_version);
-        vm.write_guest_val(gpa as usize, &odd_version)?;
+        vm.memory().write_val(gpa as usize, &odd_version)?;
 
         let wall_clock = PvclockWallClock {
             version: even_version,
             sec,
             nsec,
         };
-        vm.write_guest_val(gpa as usize, &wall_clock)?;
+        vm.memory().write_val(gpa as usize, &wall_clock)?;
         self.wall_clock_version = even_version;
         Ok(())
     }

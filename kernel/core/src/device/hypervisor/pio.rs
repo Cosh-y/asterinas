@@ -4,7 +4,7 @@
 
 use ostd::arch::vm::{GuestContext, GuestExitInfo, VcpuSegment, X86GprIndex};
 
-use super::{guest_address::translate_gva_to_gpa, vm::Vm};
+use super::{guest_address::translate_gva_to_gpa, vm_memory::VmMemory};
 use crate::prelude::*;
 
 const MAX_INSN_LENGTH: usize = 15;
@@ -46,7 +46,7 @@ enum SegmentRegister {
 impl PioOperation {
     pub(super) fn decode(
         context: &GuestContext,
-        vm: &Vm,
+        vm_memory: &VmMemory,
         exit_info: &GuestExitInfo,
     ) -> Result<Option<Self>> {
         let qualification = exit_info.exit_qualification;
@@ -65,7 +65,7 @@ impl PioOperation {
         let string = if is_string {
             let Some(string) = decode_string_instruction(
                 context,
-                vm,
+                vm_memory,
                 direction,
                 size,
                 repeated,
@@ -113,7 +113,7 @@ impl PioOperation {
     pub(super) fn output_data(
         self,
         context: &GuestContext,
-        vm: &Vm,
+        vm_memory: &VmMemory,
         count: u32,
     ) -> Result<Vec<u8>> {
         if self.direction != PioDirection::Out {
@@ -138,7 +138,7 @@ impl PioOperation {
                 let data_offset = usize::try_from(index)? * usize::from(self.size);
                 read_guest_linear(
                     context,
-                    vm,
+                    vm_memory,
                     linear,
                     &mut data[data_offset..data_offset + usize::from(self.size)],
                 )?;
@@ -168,7 +168,7 @@ impl PioOperation {
     pub(super) fn complete(
         self,
         context: &mut GuestContext,
-        vm: &Vm,
+        vm_memory: &VmMemory,
         count: u32,
         input_data: Option<&[u8]>,
     ) -> Result<()> {
@@ -222,7 +222,7 @@ impl PioOperation {
                 let data_offset = usize::try_from(index)? * usize::from(self.size);
                 write_guest_linear(
                     context,
-                    vm,
+                    vm_memory,
                     linear,
                     &data[data_offset..data_offset + usize::from(self.size)],
                 )?;
@@ -264,7 +264,7 @@ impl PioOperation {
 
 fn decode_string_instruction(
     context: &GuestContext,
-    vm: &Vm,
+    vm_memory: &VmMemory,
     direction: PioDirection,
     size: u8,
     repeated: bool,
@@ -287,7 +287,12 @@ fn decode_string_instruction(
             .ok_or_else(|| Error::new(Errno::EFAULT))?
     };
     let mut bytes = [0_u8; MAX_INSN_LENGTH];
-    read_guest_linear(context, vm, code_linear, &mut bytes[..instruction_len])?;
+    read_guest_linear(
+        context,
+        vm_memory,
+        code_linear,
+        &mut bytes[..instruction_len],
+    )?;
 
     let default_address_size = if long_mode {
         8
@@ -398,33 +403,43 @@ fn decode_string_bytes(
     })
 }
 
-fn read_guest_linear(context: &GuestContext, vm: &Vm, linear: u64, bytes: &mut [u8]) -> Result<()> {
+fn read_guest_linear(
+    context: &GuestContext,
+    vm_memory: &VmMemory,
+    linear: u64,
+    bytes: &mut [u8],
+) -> Result<()> {
     let mut completed = 0;
     while completed < bytes.len() {
         let current = linear
             .checked_add(u64::try_from(completed)?)
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
         let gva = usize::try_from(current).map_err(|_| Error::new(Errno::EFAULT))?;
-        let gpa = translate_gva_to_gpa(context, vm, gva)?;
+        let gpa = translate_gva_to_gpa(context, vm_memory, gva)?;
         let page_remaining = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
         let copy_len = page_remaining.min(bytes.len() - completed);
-        vm.read_guest_bytes(gpa, &mut bytes[completed..completed + copy_len])?;
+        vm_memory.read_bytes(gpa, &mut bytes[completed..completed + copy_len])?;
         completed += copy_len;
     }
     Ok(())
 }
 
-fn write_guest_linear(context: &GuestContext, vm: &Vm, linear: u64, bytes: &[u8]) -> Result<()> {
+fn write_guest_linear(
+    context: &GuestContext,
+    vm_memory: &VmMemory,
+    linear: u64,
+    bytes: &[u8],
+) -> Result<()> {
     let mut completed = 0;
     while completed < bytes.len() {
         let current = linear
             .checked_add(u64::try_from(completed)?)
             .ok_or_else(|| Error::new(Errno::EFAULT))?;
         let gva = usize::try_from(current).map_err(|_| Error::new(Errno::EFAULT))?;
-        let gpa = translate_gva_to_gpa(context, vm, gva)?;
+        let gpa = translate_gva_to_gpa(context, vm_memory, gva)?;
         let page_remaining = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
         let copy_len = page_remaining.min(bytes.len() - completed);
-        vm.write_guest_bytes(gpa, &bytes[completed..completed + copy_len])?;
+        vm_memory.write_bytes(gpa, &bytes[completed..completed + copy_len])?;
         completed += copy_len;
     }
     Ok(())

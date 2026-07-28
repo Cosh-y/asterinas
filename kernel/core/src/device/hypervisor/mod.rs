@@ -14,6 +14,7 @@ mod vcpu;
 mod vcpu_file;
 mod vm;
 mod vm_file;
+mod vm_memory;
 
 pub use device::HypervisorDevice;
 
