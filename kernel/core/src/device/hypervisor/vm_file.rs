@@ -137,11 +137,8 @@ impl FileLike for VmFile {
             CreateVcpu => {
                 let vcpu_id = read_vcpu_id(raw_ioctl)?;
 
-                // Create the VCPU
-                let vcpu = self.vm.create_vcpu(vcpu_id)?;
-
                 // Create a file descriptor for the VCPU
-                let vcpu_file = Arc::new(VcpuFile::new(self.vm.clone(), vcpu));
+                let vcpu_file = Arc::new(VcpuFile::new(self.vm.clone(), vcpu_id)?);
 
                 // Insert into the current process's file table
                 let current = Task::current().unwrap();

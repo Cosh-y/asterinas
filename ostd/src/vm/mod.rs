@@ -109,7 +109,7 @@ impl GuestMode {
     /// device model as needed, call this method again to resume guest
     /// execution.
     pub fn execute<I, T>(
-        &mut self,
+        &self,
         context: &mut GuestContext,
         guest_mem: &GuestPhysMemSpace,
         interrupt_port: &I,
@@ -133,7 +133,7 @@ impl GuestMode {
     }
 
     fn run_loop<I, T>(
-        &mut self,
+        &self,
         context: &mut GuestContext,
         interrupt_port: &I,
         timer_port: &T,
