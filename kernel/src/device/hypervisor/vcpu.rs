@@ -1,28 +1,25 @@
 use ostd::{
-    arch::vm::{GuestContext, VcpuRunState},
-    vm::GuestMode,
+    arch::vm::{GuestContext, GuestExitInfo, VcpuRunState, VmxExitReason},
+    task::Task,
+    vm::{GuestMode, GuestRunResult},
 };
 
 use super::{
-    apic::{Lapic, LapicPort},
+    apic::{Lapic, LapicPort, emulate_apic_mmio},
     cpuid, cr,
-    ioctl::{
-        KVM_RUN_EXIT_REASON_OFFSET, KVM_RUN_MMAP_SIZE, KVM_RUN_STRUCT_SIZE, LapicState, MpState,
-        VcpuCpuidEntry2, VcpuMsrEntry, VcpuRegs, VcpuSregs,
-    },
+    ioctl::{LapicState, MpState, VcpuCpuidEntry2, VcpuMsrEntry, VcpuRegs, VcpuSregs},
+    ioeventfd::IoEventAddressSpace,
     kvmclock::KvmClock,
-    mmio::MmioInstruction,
-    msr,
-    pio::PioOperation,
+    mmio::{MmioDirection, MmioInstruction, decode_current_mmio_instruction},
+    msr::{self, MsrAccess},
+    pio::{PioDirection, PioOperation},
     vm::Vm,
 };
-use crate::{
-    prelude::*,
-    vm::page_cache::{Vmo, VmoOptions},
-};
+use crate::prelude::*;
 
 const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 10_000;
 const HLT_WAKEUP_WAIT_FALLBACK_TICKS: u64 = 250_000;
+const MAX_PIO_IOEVENTFD_BATCH_BYTES: usize = PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PendingPioOperation {
@@ -45,25 +42,22 @@ pub struct Vcpu {
     id: u32,
     pub(super) vm: Weak<Vm>,
     pub(super) guest_context: Mutex<GuestContext>,
-    guest_mode: Mutex<GuestMode>,
+    guest_mode: GuestMode,
+    run_lock: Mutex<()>,
     pub(super) lapic: LapicPort,
-    run_page: Arc<Vmo>,
-    pending_operation: Mutex<Option<PendingOperation>>,
     kvmclock: Mutex<KvmClock>,
     cpuid_entries: Mutex<Vec<VcpuCpuidEntry2>>,
 }
 
 impl Vcpu {
     pub(super) fn new(id: u32, vm: &Arc<Vm>, lapic: Lapic) -> Result<Arc<Self>> {
-        let run_page = VmoOptions::new(KVM_RUN_MMAP_SIZE).alloc()?;
         Ok(Arc::new(Self {
             id,
             vm: Arc::downgrade(vm),
             guest_context: Mutex::new(GuestContext::new(id)?),
-            guest_mode: Mutex::new(GuestMode::new()?),
+            guest_mode: GuestMode::new()?,
+            run_lock: Mutex::new(()),
             lapic: LapicPort::new(lapic),
-            run_page,
-            pending_operation: Mutex::new(None),
             kvmclock: Mutex::new(KvmClock::default()),
             cpuid_entries: Mutex::new(cpuid::default_cpuid_entries()),
         }))
@@ -77,61 +71,213 @@ impl Vcpu {
         self.guest_context.lock()
     }
 
-    pub fn guest_mode(&self) -> MutexGuard<'_, GuestMode> {
-        self.guest_mode.lock()
-    }
-
     pub fn vm(&self) -> Result<Arc<Vm>> {
         self.vm
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::ENOENT, "vm not found"))
     }
 
-    pub(super) fn run_page(&self) -> Arc<Vmo> {
-        self.run_page.clone()
-    }
+    pub(super) fn run(self: &Arc<Self>) -> Result<GuestExitInfo> {
+        let vm = self.vm()?;
+        let _run_guard = self.run_lock.lock();
 
-    pub(super) fn read_run_val<T: Pod>(&self, offset: usize) -> Result<T> {
-        let mut value = T::new_zeroed();
-        let mut writer = VmWriter::from(value.as_mut_bytes()).to_fallible();
-        self.run_page.read(offset, &mut writer)?;
-        Ok(value)
-    }
+        loop {
+            let run_result = {
+                let mut context = self.guest_context();
+                match self.guest_mode.execute(
+                    &mut context,
+                    vm.memory().guest_mem(),
+                    &self.lapic,
+                    &self.lapic,
+                ) {
+                    Ok(exit_info) => exit_info,
+                    Err(err) => {
+                        error!("hypervisor: GuestMode::execute failed: {:?}", err);
+                        return Err(err.into());
+                    }
+                }
+            };
+            let GuestRunResult::VmExit(exit_info) = run_result else {
+                loop {
+                    if self.wait_for_sipi_wakeup() {
+                        break;
+                    }
 
-    pub(super) fn write_run_val<T: Pod>(&self, offset: usize, value: &T) -> Result<()> {
-        let mut reader = VmReader::from(value.as_bytes()).to_fallible();
-        self.run_page.write(offset, &mut reader)
-    }
+                    // TODO: Use a more efficient wait mechanism instead of busy-waiting.
+                    Task::yield_now();
+                }
+                continue;
+            };
+            let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
+                Ok(VmxExitReason::IO_INSTRUCTION) => {
+                    if self.handle_pio_ioeventfd(&vm, &exit_info)? {
+                        None
+                    } else {
+                        Some(exit_info)
+                    }
+                }
+                Ok(VmxExitReason::EPT_VIOLATION) => {
+                    let handled = emulate_apic_mmio(self.clone(), exit_info.guest_phys_addr as u64)
+                        .inspect_err(|err| {
+                            error!(
+                                "hypervisor: APIC MMIO handling failed: reason={:#x}, len={}, \
+                             rip={:#x}, gpa={:#x}, qualification={:#x}, err={:?}",
+                                exit_info.exit_reason,
+                                exit_info.instruction_len,
+                                exit_info.guest_rip,
+                                exit_info.guest_phys_addr,
+                                exit_info.exit_qualification,
+                                err
+                            );
+                        })?;
+                    if handled || self.handle_mmio_ioeventfd(&vm, &exit_info)? {
+                        None
+                    } else {
+                        Some(exit_info)
+                    }
+                }
+                Ok(VmxExitReason::PREEMPTION_TIMER) => None,
+                Ok(VmxExitReason::CPUID) => {
+                    cpuid::emulate_cpuid(self, &exit_info)?;
+                    None
+                }
+                Ok(VmxExitReason::CR_ACCESS) => {
+                    cr::emulate_cr_access(self, &exit_info)?;
+                    None
+                }
+                Ok(VmxExitReason::HLT) => {
+                    self.guest_context()
+                        .advance_rip(exit_info.instruction_len as _);
+                    loop {
+                        if self.wait_for_hlt_wakeup() {
+                            break None;
+                        }
 
-    pub(super) fn read_run_bytes(&self, offset: usize, buffer: &mut [u8]) -> Result<()> {
-        let mut writer = VmWriter::from(buffer).to_fallible();
-        self.run_page.read(offset, &mut writer)
-    }
+                        // TODO: Use a more efficient wait mechanism instead of busy-waiting.
+                        Task::yield_now();
+                    }
+                }
+                Ok(VmxExitReason::PAUSE_INSTRUCTION) => None,
+                Ok(VmxExitReason::MSR_READ) => {
+                    msr::emulate_msr(self, &exit_info, MsrAccess::Read)?;
+                    None
+                }
+                Ok(VmxExitReason::MSR_WRITE) => {
+                    msr::emulate_msr(self, &exit_info, MsrAccess::Write)?;
+                    None
+                }
+                Ok(_) => Some(exit_info),
+                Err(_) => Some(exit_info),
+            };
 
-    pub(super) fn write_run_bytes(&self, offset: usize, buffer: &[u8]) -> Result<()> {
-        let mut reader = VmReader::from(buffer).to_fallible();
-        self.run_page.write(offset, &mut reader)
-    }
-
-    pub(super) fn clear_run_output(&self) -> Result<()> {
-        static ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-
-        let mut offset = KVM_RUN_EXIT_REASON_OFFSET;
-        while offset < KVM_RUN_STRUCT_SIZE {
-            let len = (KVM_RUN_STRUCT_SIZE - offset).min(PAGE_SIZE);
-            let mut reader = VmReader::from(&ZERO_PAGE[..len]).to_fallible();
-            self.run_page.write(offset, &mut reader)?;
-            offset += len;
+            if let Some(exit_info) = exit_info {
+                return Ok(exit_info);
+            }
         }
+    }
+
+    pub(super) fn complete_pio_operation(
+        &self,
+        operation: PendingPioOperation,
+        input_data: Option<&[u8]>,
+    ) -> Result<()> {
+        let vm = self.vm()?;
+        operation.operation.complete(
+            &mut self.guest_context(),
+            vm.memory(),
+            operation.count,
+            input_data,
+        )
+    }
+
+    pub(super) fn complete_mmio_operation(
+        &self,
+        operation: PendingMmioOperation,
+        read_value: Option<u64>,
+    ) -> Result<()> {
+        let instruction = operation.instruction;
+        let mut context = self.guest_context();
+        if let Some(value) = read_value {
+            instruction.complete_read(&mut context, value)?;
+        }
+
+        context.advance_rip(u64::from(instruction.len()));
         Ok(())
     }
 
-    pub(super) fn set_pending_operation(&self, operation: PendingOperation) {
-        *self.pending_operation.lock() = Some(operation);
+    /// Handles a PIO exit by checking for an ioeventfd and signaling it if present.
+    ///
+    /// Returns `Ok(true)` if the PIO exit was handled by signaling an ioeventfd,
+    ///         `Ok(false)` otherwise.
+    fn handle_pio_ioeventfd(&self, vm: &Vm, exit_info: &GuestExitInfo) -> Result<bool> {
+        let context = self.guest_context();
+        let Some(operation) = PioOperation::decode(&context, vm.memory(), exit_info)? else {
+            return Ok(false);
+        };
+        let count = operation.batch_count(&context, MAX_PIO_IOEVENTFD_BATCH_BYTES);
+        if count == 0 {
+            drop(context);
+            let input_data = (operation.direction() == PioDirection::In).then_some(&[] as &[u8]);
+            operation.complete(&mut self.guest_context(), vm.memory(), 0, input_data)?;
+            return Ok(true);
+        }
+
+        // Pio ioeventfd is only supported for output operations.
+        if operation.direction() != PioDirection::Out {
+            return Ok(false);
+        }
+        if !vm.has_ioeventfd(
+            IoEventAddressSpace::Pio,
+            u64::from(operation.port()),
+            u32::from(operation.size()),
+        ) {
+            return Ok(false);
+        }
+        let data = operation.output_data(&context, vm.memory(), count)?;
+        let values = operation.output_values(&data)?;
+        drop(context);
+
+        if !vm.signal_ioeventfd_batch(
+            IoEventAddressSpace::Pio,
+            u64::from(operation.port()),
+            u32::from(operation.size()),
+            &values,
+        ) {
+            return Ok(false);
+        }
+
+        operation.complete(&mut self.guest_context(), vm.memory(), count, None)?;
+        Ok(true)
     }
 
-    pub(super) fn take_pending_operation(&self) -> Option<PendingOperation> {
-        self.pending_operation.lock().take()
+    fn handle_mmio_ioeventfd(&self, vm: &Vm, exit_info: &GuestExitInfo) -> Result<bool> {
+        if exit_info.exit_qualification & 0b111 != 0b010 {
+            return Ok(false);
+        }
+        let context = self.guest_context();
+        let instruction = decode_current_mmio_instruction(&context, vm.memory())?;
+        let Some(instruction) = instruction else {
+            return Ok(false);
+        };
+        if instruction.direction() != MmioDirection::Write {
+            return Ok(false);
+        }
+        let Some(value) = instruction.write_value(&context) else {
+            return Ok(false);
+        };
+        drop(context);
+        if !vm.signal_ioeventfd(
+            IoEventAddressSpace::Mmio,
+            exit_info.guest_phys_addr as u64,
+            u32::from(instruction.size()),
+            value,
+        ) {
+            return Ok(false);
+        }
+
+        self.guest_context()
+            .advance_rip(u64::from(instruction.len()));
+        Ok(true)
     }
 
     pub fn get_regs(&self) -> Result<VcpuRegs> {
