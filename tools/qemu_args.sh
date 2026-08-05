@@ -160,7 +160,7 @@ fi
 
 CPU_ARGS="-cpu Icelake-Server,+x2apic"
 if [ "$ENABLE_KVM" = "1" ]; then
-    # RustShyper needs nested VMX. KVM acceleration alone does not expose it
+    # Hypervisor needs nested VMX. KVM acceleration alone does not expose it
     # unless the guest CPU model advertises the VMX CPUID bit explicitly.
     CPU_ARGS="${CPU_ARGS},+vmx"
 fi

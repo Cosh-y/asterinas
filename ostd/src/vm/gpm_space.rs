@@ -79,7 +79,7 @@ impl GuestPhysMemSpace {
     ///
     /// The value is used by [`super::GuestMode`] so VM entry can use this EPT
     /// as the guest physical address space.
-    pub(super) fn eptp(&self) -> u64 {
+    pub(crate) fn eptp(&self) -> u64 {
         const EPT_MEM_TYPE_WB: u64 = 6;
         const EPT_PAGE_WALK_LENGTH_4_LEVELS: u64 = 3 << 3;
 
@@ -95,7 +95,7 @@ impl GuestPhysMemSpace {
 
 impl Drop for GuestPhysMemSpace {
     fn drop(&mut self) {
-        error!("hypervisor: release guest memory space.");
+        debug!("hypervisor: release guest memory space.");
         if let Err(err) = flush_ept_all_contexts_sync() {
             error!(
                 "hypervisor: failed to flush EPT translations while dropping guest memory: {:?}",

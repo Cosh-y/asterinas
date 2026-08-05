@@ -17,6 +17,7 @@ use super::{
     x86::get_tr_base,
 };
 use crate::{
+    Error,
     mm::{Frame, FrameAllocOptions, PAGE_SIZE, VmIo},
     prelude::*,
 };
@@ -28,8 +29,33 @@ pub(crate) struct Vmcs {
     io_bitmap_b: Frame<()>,
     /// MSR bitmap for trapping RDMSR/WRMSR accesses.
     msr_bitmap: Frame<()>,
+    /// VM-entry/exit MSR-load/store areas.
+    ///
+    /// The first list stores guest values and is shared by VM-entry load and
+    /// VM-exit store. The second list contains the host values restored by
+    /// VM-exit. Both lists remain private to OSTD.
+    run_msr_area: Frame<()>,
     /// Tracks the VMCS region state and CPU residency.
     tracking: Arc<VmcsTracking>,
+}
+
+const RUN_MSR_INDICES: [u32; 5] = [
+    Msr::IA32_STAR as u32,
+    Msr::IA32_LSTAR as u32,
+    Msr::IA32_CSTAR as u32,
+    Msr::IA32_FMASK as u32,
+    Msr::IA32_KERNEL_GSBASE as u32,
+];
+const RUN_MSR_COUNT: usize = RUN_MSR_INDICES.len();
+const GUEST_RUN_MSR_AREA_OFFSET: usize = 0;
+const HOST_RUN_MSR_AREA_OFFSET: usize = RUN_MSR_COUNT * size_of::<VmxMsrListEntry>();
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+struct VmxMsrListEntry {
+    index: u32,
+    reserved: u32,
+    value: u64,
 }
 
 pub(crate) struct VmcsGuestState {
@@ -61,15 +87,20 @@ impl Vmcs {
         let io_bitmap_a = FrameAllocOptions::new().alloc_frame()?;
         let io_bitmap_b = FrameAllocOptions::new().alloc_frame()?;
         let msr_bitmap = FrameAllocOptions::new().alloc_frame()?;
+        let run_msr_area = FrameAllocOptions::new().alloc_frame()?;
         let all_ones = [0xff_u8; PAGE_SIZE];
+        let all_zeros = [0_u8; PAGE_SIZE];
         io_bitmap_a.write_bytes(0, &all_ones)?;
         io_bitmap_b.write_bytes(0, &all_ones)?;
         msr_bitmap.write_bytes(0, &all_ones)?;
+        configure_guest_owned_msrs(&msr_bitmap)?;
+        run_msr_area.write_bytes(0, &all_zeros)?;
 
         Ok(Self {
             io_bitmap_a,
             io_bitmap_b,
             msr_bitmap,
+            run_msr_area,
             tracking: Arc::new(VmcsTracking::new(vmcs_region)),
         })
     }
@@ -96,11 +127,73 @@ impl Vmcs {
                 return Err(err);
             }
         }
+
+        // Unlike most VMCS host-state fields, FS.base belongs to the current
+        // userspace thread rather than to the physical CPU.  A VMCS can be
+        // reused by another thread without changing CPUs, so refresh it for
+        // every run.  Otherwise VM exit may restore a stale TLS base from the
+        // previous runner.
+        self.refresh_vmcs_host_task_state()?;
         Ok(())
     }
 
     pub fn launched(&self) -> bool {
         self.tracking.launched()
+    }
+
+    pub(crate) fn initialized(&self) -> bool {
+        self.tracking.initialized()
+    }
+
+    pub(crate) fn activate_for_access(&self) -> Result<()> {
+        let cpu_changed = activate_vmcs(self.vmcs_phys(), &self.tracking)?;
+        if cpu_changed {
+            self.setup_vmcs_host()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_guest_run_msrs(&self, values: [u64; RUN_MSR_COUNT]) -> Result<()> {
+        self.write_run_msr_list(GUEST_RUN_MSR_AREA_OFFSET, values)
+    }
+
+    pub(crate) fn read_guest_run_msrs(&self) -> Result<[u64; RUN_MSR_COUNT]> {
+        self.read_run_msr_list(GUEST_RUN_MSR_AREA_OFFSET)
+    }
+
+    pub(crate) fn write_host_run_msrs(&self, values: [u64; RUN_MSR_COUNT]) -> Result<()> {
+        self.write_run_msr_list(HOST_RUN_MSR_AREA_OFFSET, values)
+    }
+
+    fn write_run_msr_list(&self, base_offset: usize, values: [u64; RUN_MSR_COUNT]) -> Result<()> {
+        for (position, (&index, value)) in RUN_MSR_INDICES.iter().zip(values).enumerate() {
+            let entry = VmxMsrListEntry {
+                index,
+                reserved: 0,
+                value,
+            };
+            self.run_msr_area.write_val(
+                base_offset + position * size_of::<VmxMsrListEntry>(),
+                &entry,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn read_run_msr_list(&self, base_offset: usize) -> Result<[u64; RUN_MSR_COUNT]> {
+        let mut values = [0_u64; RUN_MSR_COUNT];
+        for (position, (&expected_index, value)) in
+            RUN_MSR_INDICES.iter().zip(values.iter_mut()).enumerate()
+        {
+            let entry: VmxMsrListEntry = self
+                .run_msr_area
+                .read_val(base_offset + position * size_of::<VmxMsrListEntry>())?;
+            if entry.index != expected_index || entry.reserved != 0 {
+                return Err(Error::InvalidArgs);
+            }
+            *value = entry.value;
+        }
+        Ok(values)
     }
 
     pub fn set_launched(&mut self, value: bool) {
@@ -148,10 +241,14 @@ impl Vmcs {
         VmcsHostNW::IDTR_BASE.write(idtp.base as usize)?;
         VmcsHostNW::RIP.write(vm_exit_handler_virtaddr() as _)?;
 
-        VmcsHostNW::IA32_SYSENTER_ESP.write(0)?;
-        VmcsHostNW::IA32_SYSENTER_EIP.write(0)?;
-        VmcsHost32::IA32_SYSENTER_CS.write(0)?;
+        VmcsHostNW::IA32_SYSENTER_ESP.write(Msr::IA32_SYSENTER_ESP.read() as usize)?;
+        VmcsHostNW::IA32_SYSENTER_EIP.write(Msr::IA32_SYSENTER_EIP.read() as usize)?;
+        VmcsHost32::IA32_SYSENTER_CS.write(Msr::IA32_SYSENTER_CS.read() as u32)?;
         Ok(())
+    }
+
+    fn refresh_vmcs_host_task_state(&self) -> Result<()> {
+        VmcsHostNW::FS_BASE.write(Msr::IA32_FS_BASE.read() as _)
     }
 
     fn setup_vmcs_guest(&self, vmcs_guest_state: &VmcsGuestState) -> Result<()> {
@@ -330,10 +427,15 @@ impl Vmcs {
             0,
         )?;
 
-        // No MSR switches if hypervisor doesn't use and there is only one vCPU.
-        VmcsControl32::VMEXIT_MSR_STORE_COUNT.write(0)?;
-        VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(0)?;
-        VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(0)?;
+        let guest_run_msr_addr =
+            self.run_msr_area.paddr() as u64 + GUEST_RUN_MSR_AREA_OFFSET as u64;
+        let host_run_msr_addr = self.run_msr_area.paddr() as u64 + HOST_RUN_MSR_AREA_OFFSET as u64;
+        VmcsControl64::VMEXIT_MSR_STORE_ADDR.write(guest_run_msr_addr)?;
+        VmcsControl64::VMEXIT_MSR_LOAD_ADDR.write(host_run_msr_addr)?;
+        VmcsControl64::VMENTRY_MSR_LOAD_ADDR.write(guest_run_msr_addr)?;
+        VmcsControl32::VMEXIT_MSR_STORE_COUNT.write(RUN_MSR_COUNT as u32)?;
+        VmcsControl32::VMEXIT_MSR_LOAD_COUNT.write(RUN_MSR_COUNT as u32)?;
+        VmcsControl32::VMENTRY_MSR_LOAD_COUNT.write(RUN_MSR_COUNT as u32)?;
 
         // Pass-through exceptions. Intercept I/O and MSR accesses via bitmaps.
         VmcsControl32::EXCEPTION_BITMAP.write(0)?;
@@ -344,6 +446,96 @@ impl Vmcs {
         // setup EPT
         VmcsControl64::EPTP.write(eptp)?;
         Ok(())
+    }
+}
+
+fn configure_guest_owned_msrs(msr_bitmap: &Frame<()>) -> Result<()> {
+    const IA32_TSC: u32 = 0x10;
+    const IA32_SYSENTER_CS: u32 = 0x174;
+    const IA32_SYSENTER_ESP: u32 = 0x175;
+    const IA32_SYSENTER_EIP: u32 = 0x176;
+
+    // TSC writes remain trapped so the kernel can update TSC offset and the
+    // paravirtual clock together. VMX applies TSC offsetting to direct reads.
+    allow_msr_access(msr_bitmap, IA32_TSC, MsrBitmapAccess::Read)?;
+
+    // FS/GS and SYSENTER are architecturally represented in VMCS guest state;
+    // KERNEL_GS_BASE is owned by the VM-entry/exit MSR lists above.
+    for msr in [
+        Msr::IA32_FS_BASE as u32,
+        Msr::IA32_GS_BASE as u32,
+        Msr::IA32_KERNEL_GSBASE as u32,
+        IA32_SYSENTER_CS,
+        IA32_SYSENTER_ESP,
+        IA32_SYSENTER_EIP,
+    ] {
+        allow_msr_access(msr_bitmap, msr, MsrBitmapAccess::Read)?;
+        allow_msr_access(msr_bitmap, msr, MsrBitmapAccess::Write)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum MsrBitmapAccess {
+    Read,
+    Write,
+}
+
+fn allow_msr_access(msr_bitmap: &Frame<()>, msr: u32, access: MsrBitmapAccess) -> Result<()> {
+    let Some((byte_offset, bit_mask)) = msr_bitmap_location(msr, access) else {
+        return Err(Error::InvalidArgs);
+    };
+    let mut byte: u8 = msr_bitmap.read_val(byte_offset)?;
+    byte &= !bit_mask;
+    msr_bitmap.write_val(byte_offset, &byte)
+}
+
+fn msr_bitmap_location(msr: u32, access: MsrBitmapAccess) -> Option<(usize, u8)> {
+    let access_offset = match access {
+        MsrBitmapAccess::Read => 0,
+        MsrBitmapAccess::Write => 0x800,
+    };
+    let (range_offset, bit) = if msr <= 0x1fff {
+        (0, msr as usize)
+    } else if (0xc000_0000..=0xc000_1fff).contains(&msr) {
+        (0x400, (msr & 0x1fff) as usize)
+    } else {
+        return None;
+    };
+    Some((access_offset + range_offset + bit / 8, 1 << (bit % 8)))
+}
+
+#[cfg(ktest)]
+mod tests {
+    use super::{MsrBitmapAccess, msr_bitmap_location};
+    use crate::prelude::*;
+
+    #[ktest]
+    fn msr_bitmap_locates_low_and_high_ranges() {
+        assert_eq!(
+            msr_bitmap_location(0x10, MsrBitmapAccess::Read),
+            Some((0x2, 0x1))
+        );
+        assert_eq!(
+            msr_bitmap_location(0x10, MsrBitmapAccess::Write),
+            Some((0x802, 0x1))
+        );
+        assert_eq!(
+            msr_bitmap_location(0xc000_0100, MsrBitmapAccess::Read),
+            Some((0x420, 0x1))
+        );
+        assert_eq!(
+            msr_bitmap_location(0xc000_0100, MsrBitmapAccess::Write),
+            Some((0xc20, 0x1))
+        );
+    }
+
+    #[ktest]
+    fn msr_bitmap_rejects_uncovered_ranges() {
+        assert_eq!(
+            msr_bitmap_location(0x4000_0000, MsrBitmapAccess::Read),
+            None
+        );
     }
 }
 

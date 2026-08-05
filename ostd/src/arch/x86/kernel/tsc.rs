@@ -18,9 +18,33 @@ pub(in crate::arch) static TSC_FREQ: AtomicU64 = AtomicU64::new(0);
 pub fn init_tsc_freq() {
     use crate::arch::cpu::cpuid::query_tsc_freq as determine_tsc_freq_via_cpuid;
 
-    let tsc_freq = determine_tsc_freq_via_cpuid().unwrap_or_else(determine_tsc_freq_via_pit);
+    let tsc_freq = if let Some(fixed_tsc_freq) = fixed_tsc_freq() {
+        info!(
+            "Using build-time fixed TSC frequency: {:?} Hz",
+            fixed_tsc_freq
+        );
+        fixed_tsc_freq
+    } else {
+        determine_tsc_freq_via_cpuid().unwrap_or_else(determine_tsc_freq_via_pit)
+    };
     TSC_FREQ.store(tsc_freq, Ordering::Relaxed);
     info!("TSC frequency: {:?} Hz", tsc_freq);
+}
+
+fn fixed_tsc_freq() -> Option<u64> {
+    let value = option_env!("FIXED_TSC_FREQ_HZ")?;
+    if value.is_empty() {
+        return None;
+    }
+
+    let freq_hz = value
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("FIXED_TSC_FREQ_HZ must be a positive decimal frequency in Hz"));
+    assert!(
+        freq_hz > 0,
+        "FIXED_TSC_FREQ_HZ must be a positive decimal frequency in Hz"
+    );
+    Some(freq_hz)
 }
 
 /// Determines the TSC frequency with the help of the Programmable Interval Timer (PIT).

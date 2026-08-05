@@ -13,9 +13,12 @@ pub(crate) mod context;
 pub(crate) mod control_regs;
 pub(crate) mod ept;
 pub(crate) mod exit;
+pub(crate) mod guest_mode;
+mod host_context;
 pub(crate) mod interrupt;
 mod types;
 pub(crate) mod vmcs;
+mod vmcs_state;
 pub(crate) mod vmx;
 pub(crate) mod x86;
 

@@ -7,6 +7,14 @@ use super::{
 };
 use crate::{arch::cpu::context::FpuContext, prelude::*};
 
+const RESET_RIP: usize = 0xfff0;
+const RESET_CS_SELECTOR: u16 = 0xf000;
+const RESET_CS_BASE: u64 = 0xffff_0000;
+const RESET_CPUID_VERSION: usize = 0x600;
+const DEFAULT_APIC_BASE: u64 = 0xfee0_0000;
+const APIC_BASE_BSP: u64 = 1 << 8;
+const APIC_BASE_ENABLE: u64 = 1 << 11;
+
 /// Stores the execution context and run state of a guest vCPU.
 ///
 /// The kernel uses it to configure the vCPU-visible context, including
@@ -17,6 +25,9 @@ use crate::{arch::cpu::context::FpuContext, prelude::*};
 /// hardware. After a VM exit, `GuestMode` synchronizes the hardware vCPU state
 /// back into this context.
 pub struct GuestContext {
+    /// Whether this vCPU is the bootstrap processor.
+    is_bsp: bool,
+
     /// The guest architectural state.
     arch: VcpuArchState,
 
@@ -26,7 +37,30 @@ pub struct GuestContext {
     /// The VMCS owned by this vCPU.
     pub(crate) vmcs: Vmcs,
 
+    /// Cached guest state that must be written to the VMCS before VM entry.
+    ///
+    /// Hardware state remains private to OSTD. Kernel-side emulation only
+    /// updates the safe `GuestContext` API, and OSTD applies these flags while
+    /// the VMCS is current on the pinned CPU.
+    vmcs_dirty: VmcsDirtyState,
+
     pub(crate) tsc_offset: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VmcsDirtyState {
+    pub(crate) rip: bool,
+    pub(crate) rsp: bool,
+    pub(crate) rflags: bool,
+    pub(crate) sregs: bool,
+    pub(crate) efer: bool,
+    pub(crate) pat: bool,
+    pub(crate) fs_base: bool,
+    pub(crate) gs_base: bool,
+    pub(crate) sysenter_cs: bool,
+    pub(crate) sysenter_esp: bool,
+    pub(crate) sysenter_eip: bool,
+    pub(crate) run_msrs: bool,
 }
 
 pub(crate) struct VcpuArchState {
@@ -46,41 +80,66 @@ impl GuestContext {
     /// Creates a guest vCPU context.
     ///
     /// The bootstrap vCPU, whose ID is zero, starts in the runnable state.
-    /// Other vCPUs start in wait-for-SIPI state and become runnable after
-    /// [`Self::receive_sipi`] accepts a startup vector.
+    /// Other vCPUs start uninitialized, matching the KVM MP-state ABI. All
+    /// vCPUs have architectural power-on reset state.
     ///
     /// Returns an error if the VMX virtualization environment is not ready.
     pub fn new(vcpu_id: u32) -> Result<Self> {
         Ok(Self {
-            arch: VcpuArchState::default(),
+            is_bsp: vcpu_id == 0,
+            arch: VcpuArchState::new(vcpu_id),
             run: if vcpu_id == 0 {
                 VcpuRunState::Runnable
             } else {
-                VcpuRunState::WaitForSipi
+                VcpuRunState::Uninitialized
             },
             vmcs: Vmcs::new()?,
+            vmcs_dirty: VmcsDirtyState::default(),
             tsc_offset: 0,
         })
     }
 
     /// Moves an AP vCPU from wait-for-SIPI state to runnable state.
-    ///
-    /// The startup vector is used to rebuild the vCPU's real-mode startup
-    /// state. Calling this method for a vCPU that is not waiting for SIPI has
-    /// no effect.
     pub fn receive_sipi(&mut self, vector: u8) {
         if self.run != VcpuRunState::WaitForSipi {
             return;
         }
 
-        self.arch.regs = VcpuRegs {
-            rip: 0,
-            rflags: 0x2,
-            ..VcpuRegs::default()
-        };
-        self.arch.set_sregs(VcpuSregs::with_startup(vector));
-        self.arch.set_efer(0);
+        let mut cs = self.arch.sregs().cs;
+        cs.selector = u16::from(vector) << 8;
+        cs.base = u64::from(vector) << 12;
+        self.arch.set_cs(cs);
+        self.arch.set_rip(0);
+        self.vmcs_dirty.rip = true;
+        self.vmcs_dirty.sregs = true;
         self.run = VcpuRunState::Runnable;
+    }
+
+    /// Applies an INIT reset and updates the vCPU's execution state.
+    ///
+    /// INIT resets the architectural state defined by Intel SDM Volume 3A,
+    /// Table 11-1. State such as the TSC offset, PAT, SYSENTER MSRs, syscall MSRs,
+    /// and FPU context survives INIT. The BSP remains runnable at the reset
+    /// vector; an AP enters wait-for-SIPI.
+    pub fn receive_init(&mut self, processor_signature: u32) -> bool {
+        if self.run == VcpuRunState::WaitForSipi {
+            return false;
+        }
+
+        self.arch.reset_after_init(processor_signature);
+        self.vmcs_dirty.rip = true;
+        self.vmcs_dirty.rsp = true;
+        self.vmcs_dirty.rflags = true;
+        self.vmcs_dirty.sregs = true;
+        self.vmcs_dirty.efer = true;
+        self.vmcs_dirty.fs_base = true;
+        self.vmcs_dirty.gs_base = true;
+        self.run = if self.is_bsp {
+            VcpuRunState::Runnable
+        } else {
+            VcpuRunState::WaitForSipi
+        };
+        true
     }
 
     /// Returns the guest general-purpose register state.
@@ -95,6 +154,9 @@ impl GuestContext {
     /// execution mode and entry point.
     pub fn set_regs(&mut self, regs: VcpuRegs) {
         self.arch.regs = regs;
+        self.vmcs_dirty.rip = true;
+        self.vmcs_dirty.rsp = true;
+        self.vmcs_dirty.rflags = true;
     }
 
     /// Returns the guest special-register state.
@@ -112,6 +174,7 @@ impl GuestContext {
     /// responsible for providing architecturally valid guest state.
     pub fn set_sregs(&mut self, sregs: VcpuSregs) {
         self.arch.set_sregs(sregs);
+        self.vmcs_dirty.sregs = true;
     }
 
     /// Returns a guest general-purpose register.
@@ -126,6 +189,9 @@ impl GuestContext {
     /// that match the emulated guest instruction.
     pub fn set_gpr(&mut self, reg: X86GprIndex, width_byte: u8, value: u64) {
         self.arch.set_gpr(reg, width_byte, value);
+        if reg == X86GprIndex::Rsp {
+            self.vmcs_dirty.rsp = true;
+        }
     }
 
     /// Advances the guest instruction pointer.
@@ -134,6 +200,7 @@ impl GuestContext {
     /// that has actually been consumed or emulated.
     pub fn advance_rip(&mut self, len: u64) {
         self.arch.advance_rip(len);
+        self.vmcs_dirty.rip = true;
     }
 
     /// Returns the guest instruction pointer.
@@ -184,11 +251,36 @@ impl GuestContext {
     ///
     /// Returns `false` if the MSR index is not supported by this context.
     pub fn write_msr(&mut self, index: u32, value: u64) -> bool {
-        self.arch.set_msr(index, value)
+        let written = self.arch.set_msr(index, value);
+        if written {
+            use x86::msr::*;
+            match index {
+                IA32_EFER => self.vmcs_dirty.efer = true,
+                IA32_PAT => self.vmcs_dirty.pat = true,
+                IA32_FS_BASE => self.vmcs_dirty.fs_base = true,
+                IA32_GS_BASE => self.vmcs_dirty.gs_base = true,
+                IA32_SYSENTER_CS => self.vmcs_dirty.sysenter_cs = true,
+                IA32_SYSENTER_ESP => self.vmcs_dirty.sysenter_esp = true,
+                IA32_SYSENTER_EIP => self.vmcs_dirty.sysenter_eip = true,
+                IA32_STAR | IA32_LSTAR | IA32_CSTAR | IA32_FMASK | IA32_KERNEL_GSBASE => {
+                    self.vmcs_dirty.run_msrs = true;
+                }
+                _ => {}
+            }
+        }
+        written
     }
 
     pub(crate) fn vmcs_guest_state(&self) -> VmcsGuestState {
         self.arch.vmcs_guest_state()
+    }
+
+    pub(crate) fn vmcs_dirty(&self) -> VmcsDirtyState {
+        self.vmcs_dirty
+    }
+
+    pub(crate) fn clear_vmcs_dirty(&mut self) {
+        self.vmcs_dirty = VmcsDirtyState::default();
     }
 
     pub(crate) fn arch_mut(&mut self) -> &mut VcpuArchState {
@@ -200,19 +292,42 @@ impl GuestContext {
     }
 }
 
-impl Default for VcpuArchState {
-    fn default() -> Self {
-        let sregs = VcpuSregs::with_startup(0);
+impl VcpuArchState {
+    fn new(vcpu_id: u32) -> Self {
+        let apic_base =
+            DEFAULT_APIC_BASE | APIC_BASE_ENABLE | if vcpu_id == 0 { APIC_BASE_BSP } else { 0 };
+        let sregs = VcpuSregs::reset(apic_base);
         Self {
             regs: VcpuRegs {
+                rdx: RESET_CPUID_VERSION,
+                rip: RESET_RIP,
                 rflags: 0x2,
                 ..VcpuRegs::default()
             },
             sregs,
             control_regs: VcpuControlRegisters::from_sregs(&sregs),
-            msrs: VcpuMsrs::default(),
+            msrs: VcpuMsrs {
+                apic_base,
+                ..VcpuMsrs::default()
+            },
             fpu: FpuContext::new(),
         }
+    }
+
+    fn reset_after_init(&mut self, processor_signature: u32) {
+        let apic_base = self.sregs().apic_base;
+        let cache_flags =
+            self.cr0() & (Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
+        let mut sregs = VcpuSregs::reset(apic_base);
+        sregs.cr0 = Cr0Flags::EXTENSION_TYPE.bits() | cache_flags;
+
+        self.regs = VcpuRegs {
+            rdx: processor_signature as usize,
+            rip: RESET_RIP,
+            rflags: 0x2,
+            ..VcpuRegs::default()
+        };
+        self.set_sregs(sregs);
     }
 }
 
@@ -236,6 +351,13 @@ pub enum VcpuRunState {
     Running,
     /// The vCPU Halted.
     Halted,
+}
+
+impl VcpuRunState {
+    /// Returns whether the vCPU is blocked until a startup IPI is accepted.
+    pub fn waits_for_startup(self) -> bool {
+        matches!(self, Self::Uninitialized | Self::WaitForSipi)
+    }
 }
 
 impl VcpuArchState {
@@ -498,29 +620,28 @@ impl VcpuArchState {
 }
 
 impl VcpuSregs {
-    fn with_startup(startup_vector: u8) -> Self {
-        let code_base = u64::from(startup_vector) << 12;
-        let code_selector = u16::from(startup_vector) << 8;
+    fn reset(apic_base: u64) -> Self {
         let data = VcpuSegment::real_mode_data_segment(0, 0);
+        let descriptor_table = VcpuDtable {
+            base: 0,
+            limit: 0xffff,
+            padding: [0; 3],
+        };
 
         Self {
-            cs: VcpuSegment::real_mode_code_segment(code_selector, code_base),
+            cs: VcpuSegment::real_mode_code_segment(RESET_CS_SELECTOR, RESET_CS_BASE),
             ds: data,
             es: data,
             fs: data,
             gs: data,
             ss: data,
-            tr: VcpuSegment::real_mode_system_segment(0x20, 0, 0x0b),
-            ldt: VcpuSegment {
-                unusable: 1,
-                ..VcpuSegment::default()
-            },
-            idt: VcpuDtable {
-                base: 0,
-                limit: 0x03ff,
-                padding: [0; 3],
-            },
-            cr0: (Cr0Flags::EXTENSION_TYPE | Cr0Flags::NUMERIC_ERROR).bits(),
+            tr: VcpuSegment::real_mode_system_segment(0, 0, 0x0b),
+            ldt: VcpuSegment::real_mode_system_segment(0, 0, 0x02),
+            gdt: descriptor_table,
+            idt: descriptor_table,
+            cr0: (Cr0Flags::CACHE_DISABLE | Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::EXTENSION_TYPE)
+                .bits(),
+            apic_base,
             ..VcpuSregs::default()
         }
     }

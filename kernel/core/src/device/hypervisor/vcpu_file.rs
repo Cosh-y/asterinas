@@ -18,8 +18,26 @@ use crate::{
         pseudofs::AnonInodeFs,
     },
     prelude::*,
+    process::{posix_thread::AsPosixThread, signal::HandlePendingSignal},
     util::ioctl::{RawIoctl, dispatch_ioctl},
     vm::page_cache::{Vmo, VmoOptions},
+};
+
+const _: () = {
+    assert!(KVM_RUN_READY_FOR_INTERRUPT_INJECTION_OFFSET + 1 == KVM_RUN_IF_FLAG_OFFSET);
+    assert!(KVM_RUN_IF_FLAG_OFFSET + 1 == KVM_RUN_FLAGS_OFFSET);
+    assert!(KVM_RUN_FLAGS_OFFSET + 2 == KVM_RUN_CR8_OFFSET);
+    assert!(KVM_RUN_CR8_OFFSET + 8 == KVM_RUN_APIC_BASE_OFFSET);
+    assert!(KVM_RUN_APIC_BASE_OFFSET + 8 == KVM_RUN_IO_DIRECTION_OFFSET);
+
+    assert!(KVM_RUN_IO_DIRECTION_OFFSET + 1 == KVM_RUN_IO_SIZE_OFFSET);
+    assert!(KVM_RUN_IO_SIZE_OFFSET + 1 == KVM_RUN_IO_PORT_OFFSET);
+    assert!(KVM_RUN_IO_PORT_OFFSET + 2 == KVM_RUN_IO_COUNT_OFFSET);
+    assert!(KVM_RUN_IO_COUNT_OFFSET + 4 == KVM_RUN_IO_DATA_OFFSET_OFFSET);
+
+    assert!(KVM_RUN_MMIO_PHYS_ADDR_OFFSET + 8 == KVM_RUN_MMIO_DATA_OFFSET);
+    assert!(KVM_RUN_MMIO_DATA_OFFSET + 8 == KVM_RUN_MMIO_LEN_OFFSET);
+    assert!(KVM_RUN_MMIO_LEN_OFFSET + 4 == KVM_RUN_MMIO_IS_WRITE_OFFSET);
 };
 
 /// VCPU file descriptor
@@ -244,9 +262,10 @@ impl VcpuFile {
         if self.immediate_exit()? {
             return_errno_with_message!(Errno::EINTR, "KVM_RUN interrupted by immediate_exit");
         }
-        self.clear_run_output()?;
 
-        let exit_info = self.vcpu.run()?;
+        let Some(exit_info) = self.vcpu.run(|| self.run_interrupted())? else {
+            return_errno_with_message!(Errno::EINTR, "KVM_RUN was interrupted");
+        };
         self.write_exit_to_run_page(exit_info)?;
         Ok(0)
     }
@@ -305,6 +324,20 @@ impl VcpuFile {
         Ok(immediate_exit != 0)
     }
 
+    fn run_interrupted(&self) -> Result<bool> {
+        if self.immediate_exit()? {
+            return Ok(true);
+        }
+
+        // QEMU normally kicks a running vCPU with a POSIX signal. Asterinas
+        // delivers that signal after the syscall returns, so KVM_RUN must
+        // notice the pending signal itself and return EINTR first.
+        let thread = current_thread!();
+        Ok(thread
+            .as_posix_thread()
+            .is_some_and(HandlePendingSignal::has_pending))
+    }
+
     fn write_exit_to_run_page(&self, exit_info: GuestExitInfo) -> Result<()> {
         self.clear_run_output()?;
         self.write_common_run_state()?;
@@ -319,13 +352,12 @@ impl VcpuFile {
     }
 
     fn write_common_run_state(&self) -> Result<()> {
-        let sregs = self.vcpu.get_sregs()?;
-        self.write_run_val(KVM_RUN_READY_FOR_INTERRUPT_INJECTION_OFFSET, &0_u8)?;
-        self.write_run_val(KVM_RUN_IF_FLAG_OFFSET, &0_u8)?;
-        self.write_run_val(KVM_RUN_FLAGS_OFFSET, &0_u16)?;
-        self.write_run_val(KVM_RUN_CR8_OFFSET, &sregs.cr8)?;
-        self.write_run_val(KVM_RUN_APIC_BASE_OFFSET, &sregs.apic_base)?;
-        Ok(())
+        // These fields are maintained in the safe context cache. Avoid a full
+        // VMCS synchronization on every userspace-visible VM exit.
+        let apic_base = self.vcpu.guest_context().sregs().apic_base;
+        let mut state = [0_u8; 20];
+        state[12..20].copy_from_slice(&apic_base.to_le_bytes());
+        self.write_run_bytes(KVM_RUN_READY_FOR_INTERRUPT_INJECTION_OFFSET, &state)
     }
 
     fn write_simple_exit(&self, exit_reason: u32) -> Result<()> {
@@ -362,11 +394,13 @@ impl VcpuFile {
         let data_offset = KVM_RUN_IO_DATA_OFFSET as u64;
 
         self.write_simple_exit(KVM_EXIT_IO)?;
-        self.write_run_val(KVM_RUN_IO_DIRECTION_OFFSET, &kvm_direction)?;
-        self.write_run_val(KVM_RUN_IO_SIZE_OFFSET, &size)?;
-        self.write_run_val(KVM_RUN_IO_PORT_OFFSET, &port)?;
-        self.write_run_val(KVM_RUN_IO_COUNT_OFFSET, &count)?;
-        self.write_run_val(KVM_RUN_IO_DATA_OFFSET_OFFSET, &data_offset)?;
+        let mut io = [0_u8; 16];
+        io[0] = kvm_direction;
+        io[1] = size;
+        io[2..4].copy_from_slice(&port.to_le_bytes());
+        io[4..8].copy_from_slice(&count.to_le_bytes());
+        io[8..16].copy_from_slice(&data_offset.to_le_bytes());
+        self.write_run_bytes(KVM_RUN_IO_DIRECTION_OFFSET, &io)?;
 
         self.write_run_bytes(KVM_RUN_IO_DATA_OFFSET, &data)?;
 
@@ -405,13 +439,12 @@ impl VcpuFile {
         drop(context);
 
         self.write_simple_exit(KVM_EXIT_MMIO)?;
-        self.write_run_val(
-            KVM_RUN_MMIO_PHYS_ADDR_OFFSET,
-            &(exit_info.guest_phys_addr as u64),
-        )?;
-        self.write_run_bytes(KVM_RUN_MMIO_DATA_OFFSET, &data)?;
-        self.write_run_val(KVM_RUN_MMIO_LEN_OFFSET, &len)?;
-        self.write_run_val(KVM_RUN_MMIO_IS_WRITE_OFFSET, &is_write)?;
+        let mut mmio = [0_u8; 24];
+        mmio[0..8].copy_from_slice(&(exit_info.guest_phys_addr as u64).to_le_bytes());
+        mmio[8..16].copy_from_slice(&data);
+        mmio[16..20].copy_from_slice(&len.to_le_bytes());
+        mmio[20] = is_write;
+        self.write_run_bytes(KVM_RUN_MMIO_PHYS_ADDR_OFFSET, &mmio)?;
 
         *self.pending_operation.lock() =
             Some(PendingOperation::Mmio(PendingMmioOperation { instruction }));

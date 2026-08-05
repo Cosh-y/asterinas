@@ -450,9 +450,9 @@ mod vmcs_initialization {
         );
 
         assert_eq!(VmcsControl64::EPTP.read().unwrap(), eptp);
-        assert_eq!(VmcsControl32::VMEXIT_MSR_STORE_COUNT.read().unwrap(), 0);
-        assert_eq!(VmcsControl32::VMEXIT_MSR_LOAD_COUNT.read().unwrap(), 0);
-        assert_eq!(VmcsControl32::VMENTRY_MSR_LOAD_COUNT.read().unwrap(), 0);
+        assert_eq!(VmcsControl32::VMEXIT_MSR_STORE_COUNT.read().unwrap(), 5);
+        assert_eq!(VmcsControl32::VMEXIT_MSR_LOAD_COUNT.read().unwrap(), 5);
+        assert_eq!(VmcsControl32::VMENTRY_MSR_LOAD_COUNT.read().unwrap(), 5);
         assert_eq!(VmcsControl32::EXCEPTION_BITMAP.read().unwrap(), 0);
         assert_ne!(VmcsControl64::IO_BITMAP_A_ADDR.read().unwrap(), 0);
         assert_ne!(VmcsControl64::IO_BITMAP_B_ADDR.read().unwrap(), 0);

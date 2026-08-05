@@ -36,12 +36,16 @@ pub fn vmexit_handler(
             handle_interrupt_window()?;
             Ok(None)
         }
+        Ok(VmxExitReason::NMI_WINDOW) => {
+            super::super::interrupt::disable_nmi_window_exiting()?;
+            Ok(None)
+        }
         Ok(VmxExitReason::CPUID) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::CR_ACCESS) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::MSR_READ) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::MSR_WRITE) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
-            context.arch_mut().advance_rip(PAUSE_INSN_LENGTH);
+            context.advance_rip(PAUSE_INSN_LENGTH);
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::HLT) => {

@@ -44,6 +44,8 @@ pub struct Lapic {
     pub icr: [u32; 2], // Interrupt Command Register, 64 bits
     pub tmr: [u32; 8], // Trigger Mode Register
 
+    nmi_pending: bool,
+
     pub lvt_lint0: u32,
     pub lvt_lint1: u32,
 
@@ -61,10 +63,24 @@ impl Default for Lapic {
             isr: [0; 8],
             icr: [0; 2],
             tmr: [0; 8],
+            nmi_pending: false,
             lvt_lint0: APIC_LVT_MASKED,
             lvt_lint1: APIC_LVT_MASKED,
             timer: ApicTimer::default(),
         }
+    }
+}
+
+impl Lapic {
+    /// Creates the reset LAPIC state for a vCPU.
+    pub(super) fn new(vcpu_id: u32) -> Self {
+        let mut lapic = Self::default();
+        lapic.id = vcpu_id;
+        lapic.ldr = (1_u32.checked_shl(vcpu_id).unwrap_or(0)) << 24;
+        if vcpu_id == 0 {
+            lapic.lvt_lint0 = APIC_MODE_EXTINT << 8;
+        }
+        lapic
     }
 }
 
@@ -428,8 +444,16 @@ impl LapicPort {
 }
 
 impl GuestInterruptPort for LapicPort {
+    fn query_pending_nmi(&self) -> bool {
+        self.lock().nmi_pending
+    }
+
+    fn accept_nmi(&self) {
+        self.lock().nmi_pending = false;
+    }
+
     fn query_pending_interrupt(&self) -> Option<GuestInterrupt> {
-        if let Some(vector) = self.lock().check_pending_interrupt() {
+        if let Some(vector) = self.lock().query_pending_interrupt() {
             Some(GuestInterrupt { vector })
         } else {
             None
@@ -452,7 +476,15 @@ impl GuestTimerPort for LapicPort {
 }
 
 impl Lapic {
-    pub(crate) fn check_pending_interrupt(&self) -> Option<u8> {
+    pub(crate) fn add_pending_nmi(&mut self) {
+        self.nmi_pending = true;
+    }
+
+    pub(crate) fn has_pending_interrupt(&self) -> bool {
+        self.nmi_pending || self.query_pending_interrupt().is_some()
+    }
+
+    pub(crate) fn query_pending_interrupt(&self) -> Option<u8> {
         let pending_vector = Self::find_highest(&self.irr)?;
 
         // interrupt vector 的高四位表示优先级，低四位表示具体的中断号。同一优先级的中断由低四位决定先后顺序。
@@ -529,8 +561,9 @@ impl Ioapic {
         }
 
         let entry = self.redtbl[irq].fields();
-        if (entry.trigger_mode == TriggerMode::Edge && was_asserted) ||
-           (entry.trigger_mode == TriggerMode::Level && entry.remote_irr) {
+        if (entry.trigger_mode == TriggerMode::Edge && was_asserted)
+            || (entry.trigger_mode == TriggerMode::Level && entry.remote_irr)
+        {
             return false;
         }
 
@@ -1004,18 +1037,6 @@ pub fn emulate_ioapic_write(ioapic: &mut Ioapic, offset: u64, value: u64) -> boo
     }
     warn!("IOAPIC: Write invalid offset {:#x}", offset);
     false
-}
-
-pub fn default_lapic_ldr(vcpu_id: u32) -> u32 {
-    (1_u32.checked_shl(vcpu_id).unwrap_or(0)) << 24
-}
-
-pub fn default_lapic_lvt_lint0(vcpu_id: u32) -> u32 {
-    if vcpu_id == 0 {
-        APIC_MODE_EXTINT << 8
-    } else {
-        APIC_LVT_MASKED
-    }
 }
 
 const APIC_ICR_DESTINATION_MODE_LOGICAL: u8 = 1;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub(crate) mod cpu;
+#[cfg(ktest)]
+mod hypervisor_test;
 mod power;
 pub(crate) mod ptrace;
 pub(crate) mod signal;

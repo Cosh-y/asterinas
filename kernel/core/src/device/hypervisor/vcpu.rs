@@ -77,11 +77,18 @@ impl Vcpu {
             .ok_or_else(|| Error::with_message(Errno::ENOENT, "vm not found"))
     }
 
-    pub(super) fn run(self: &Arc<Self>) -> Result<GuestExitInfo> {
+    pub(super) fn run<F>(self: &Arc<Self>, mut immediate_exit: F) -> Result<Option<GuestExitInfo>>
+    where
+        F: FnMut() -> Result<bool>,
+    {
         let vm = self.vm()?;
         let _run_guard = self.run_lock.lock();
 
         loop {
+            if immediate_exit()? {
+                return Ok(None);
+            }
+
             let run_result = {
                 let mut context = self.guest_context();
                 match self.guest_mode.execute(
@@ -97,16 +104,27 @@ impl Vcpu {
                     }
                 }
             };
-            let GuestRunResult::VmExit(exit_info) = run_result else {
-                loop {
-                    if self.wait_for_sipi_wakeup() {
-                        break;
-                    }
-
-                    // TODO: Use a more efficient wait mechanism instead of busy-waiting.
-                    Task::yield_now();
+            let exit_info = match run_result {
+                GuestRunResult::VmExit(exit_info) => exit_info,
+                GuestRunResult::HostInterrupt => {
+                    // GuestMode has released its CPU-pinning guard, so this is a
+                    // scheduling point if the host scheduler requested one.
+                    continue;
                 }
-                continue;
+                GuestRunResult::WaitForSipi => {
+                    loop {
+                        if immediate_exit()? {
+                            return Ok(None);
+                        }
+                        if self.wait_for_sipi_wakeup() {
+                            break;
+                        }
+
+                        // TODO: Use a more efficient wait mechanism instead of busy-waiting.
+                        Task::yield_now();
+                    }
+                    continue;
+                }
             };
             let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
                 Ok(VmxExitReason::IO_INSTRUCTION) => {
@@ -149,6 +167,9 @@ impl Vcpu {
                     self.guest_context()
                         .advance_rip(exit_info.instruction_len as _);
                     loop {
+                        if immediate_exit()? {
+                            return Ok(None);
+                        }
                         if self.wait_for_hlt_wakeup() {
                             break None;
                         }
@@ -171,7 +192,7 @@ impl Vcpu {
             };
 
             if let Some(exit_info) = exit_info {
-                return Ok(exit_info);
+                return Ok(Some(exit_info));
             }
         }
     }
@@ -281,10 +302,11 @@ impl Vcpu {
     }
 
     pub fn get_regs(&self) -> Result<VcpuRegs> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get regs while vCPU is running");
         }
+        self.guest_mode.synchronize_state(&mut context)?;
         Ok(context.regs().into())
     }
 
@@ -298,10 +320,11 @@ impl Vcpu {
     }
 
     pub fn get_sregs(&self) -> Result<VcpuSregs> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get sregs while vCPU is running");
         }
+        self.guest_mode.synchronize_state(&mut context)?;
         Ok(context.sregs().into())
     }
 
@@ -333,10 +356,11 @@ impl Vcpu {
     }
 
     pub fn get_msrs(&self, entries: &mut [VcpuMsrEntry]) -> Result<i32> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get MSRs while vCPU is running");
         }
+        self.guest_mode.synchronize_state(&mut context)?;
         drop(context);
 
         let mut handled_count = 0;
@@ -358,7 +382,7 @@ impl Vcpu {
 
         let mut handled_count = 0;
         for entry in entries {
-            msr::write_msr(self, entry.index, entry.data)?;
+            msr::write_msr_from_userspace(self, entry.index, entry.data)?;
             handled_count += 1;
         }
 
@@ -427,11 +451,20 @@ impl Vcpu {
     }
 
     pub fn receive_sipi(&self, vector: u8) {
-        self.guest_context.lock().receive_sipi(vector);
+        let mut context = self.guest_context.lock();
+        context.receive_sipi(vector);
+    }
+
+    pub fn receive_init(&self) {
+        let processor_signature = self.cpuid_result(1, 0).eax;
+        let mut context = self.guest_context.lock();
+        if context.receive_init(processor_signature) {
+            *self.lapic.lock() = Lapic::new(self.id);
+        }
     }
 
     pub(super) fn wait_for_sipi_wakeup(&self) -> bool {
-        self.guest_context.lock().run_state() != VcpuRunState::WaitForSipi
+        !self.guest_context.lock().run_state().waits_for_startup()
     }
 
     pub(super) fn wait_for_hlt_wakeup(&self) -> bool {
@@ -442,10 +475,16 @@ impl Vcpu {
         };
         let start_tsc = read_tsc();
         loop {
+            // INIT/SIPI may move a halted AP to wait-for-SIPI and then runnable
+            // without queuing a maskable interrupt.
+            if self.guest_context.lock().run_state() != VcpuRunState::Halted {
+                return true;
+            }
+
             let guest_tsc = self.guest_context().guest_tsc();
             self.lapic.lock().poll_deadline(guest_tsc);
 
-            if self.lapic.lock().check_pending_interrupt().is_some() {
+            if self.lapic.lock().has_pending_interrupt() {
                 return true;
             }
 
@@ -461,7 +500,7 @@ impl Vcpu {
 
 impl Drop for Vcpu {
     fn drop(&mut self) {
-        error!("hypervisor: release VCPU {}.", self.id);
+        debug!("hypervisor: release VCPU {}.", self.id);
     }
 }
 

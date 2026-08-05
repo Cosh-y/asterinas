@@ -6,6 +6,7 @@ use ostd::{
         VcpuDtable as ArchVcpuDtable, VcpuRegs as ArchVcpuRegs, VcpuRunState,
         VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
     },
+    cpu::num_cpus,
     mm::VmIo,
     task::Task,
 };
@@ -21,7 +22,6 @@ const KVM_APIC_REG_SIZE: usize = 0x400;
 pub(super) const KVM_MEM_READONLY: u32 = 1 << 1;
 
 pub(super) const KVM_API_VERSION: i32 = 12;
-pub(super) const KVM_RECOMMENDED_VCPUS: i32 = 1;
 pub(super) const KVM_MAX_VCPUS: i32 = 64;
 pub(super) const KVM_MAX_CPUID_ENTRIES: usize = 100;
 pub(super) const KVM_MAX_MSR_ENTRIES: usize = 100;
@@ -80,6 +80,7 @@ const KVM_IRQCHIP_PAYLOAD_SIZE: usize = 512;
 
 pub(super) const KVM_MP_STATE_RUNNABLE: u32 = 0;
 pub(super) const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
+pub(super) const KVM_MP_STATE_INIT_RECEIVED: u32 = 2;
 pub(super) const KVM_MP_STATE_HALTED: u32 = 3;
 
 pub(super) const KVM_COALESCED_MMIO_PAGE_OFFSET: usize = 2;
@@ -229,7 +230,7 @@ pub(super) fn check_extension(raw_ioctl: RawIoctl) -> i32 {
         | KVM_CAP_ENABLE_CAP_VM
         | KVM_CAP_IOEVENTFD_ANY_LENGTH
         | KVM_CAP_IMMEDIATE_EXIT => 1,
-        KVM_CAP_NR_VCPUS => KVM_RECOMMENDED_VCPUS,
+        KVM_CAP_NR_VCPUS => num_cpus().min(KVM_MAX_VCPUS as usize) as i32,
         KVM_CAP_NR_MEMSLOTS => KVM_MAX_NR_MEMSLOTS,
         KVM_CAP_IRQ_ROUTING => KVM_MAX_IRQ_ROUTES as i32,
         KVM_CAP_MCE => KVM_MAX_MCE_BANKS,
@@ -569,9 +570,8 @@ impl From<VcpuRunState> for MpState {
         Self {
             mp_state: match state {
                 VcpuRunState::Runnable | VcpuRunState::Running => KVM_MP_STATE_RUNNABLE,
-                VcpuRunState::Uninitialized | VcpuRunState::WaitForSipi => {
-                    KVM_MP_STATE_UNINITIALIZED
-                }
+                VcpuRunState::Uninitialized => KVM_MP_STATE_UNINITIALIZED,
+                VcpuRunState::WaitForSipi => KVM_MP_STATE_INIT_RECEIVED,
                 VcpuRunState::Halted => KVM_MP_STATE_HALTED,
             },
         }
@@ -584,7 +584,8 @@ impl TryFrom<MpState> for VcpuRunState {
     fn try_from(state: MpState) -> core::result::Result<Self, Self::Error> {
         match state.mp_state {
             KVM_MP_STATE_RUNNABLE => Ok(Self::Runnable),
-            KVM_MP_STATE_UNINITIALIZED => Ok(Self::WaitForSipi),
+            KVM_MP_STATE_UNINITIALIZED => Ok(Self::Uninitialized),
+            KVM_MP_STATE_INIT_RECEIVED => Ok(Self::WaitForSipi),
             KVM_MP_STATE_HALTED => Ok(Self::Halted),
             _ => Err(Error::with_message(
                 Errno::EINVAL,
