@@ -103,7 +103,7 @@ impl IrqFdBinding {
                 break;
             };
             match vm.inject_gsi(self.gsi) {
-                Ok(delivered) => error!(
+                Ok(delivered) => debug!(
                     "hypervisor: irqfd triggered: gsi={}, eventfd_value={}, delivered={}",
                     self.gsi, eventfd_value, delivered
                 ),

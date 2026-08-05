@@ -17,6 +17,9 @@ LOG_LEVEL ?= error
 SCHEME ?= ""
 SMP ?= 2
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
+# Leave empty to use CPUID/PIT detection. Benchmark builds may set a fixed
+# x86-64 TSC frequency so that repeated boots use one time conversion scale.
+FIXED_TSC_FREQ_HZ ?=
 FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0

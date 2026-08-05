@@ -263,7 +263,19 @@ impl Vm {
         len: u32,
         value: u64,
     ) -> bool {
-        self.signal_ioeventfd_batch(address_space, addr, len, &[value])
+        let bindings = self.ioeventfds.lock();
+        let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.matches_io(address_space, addr, len, value))
+        else {
+            return false;
+        };
+        binding.signal();
+        debug!(
+            "hypervisor: ioeventfd triggered: address_space={:?}, addr={:#x}, len={}",
+            address_space, addr, len
+        );
+        true
     }
 
     pub(super) fn has_ioeventfd(
@@ -309,7 +321,7 @@ impl Vm {
         for binding in routes {
             binding.signal();
         }
-        error!(
+        debug!(
             "hypervisor: ioeventfd triggered: address_space={:?}, addr={:#x}, len={}, signals={}",
             address_space, addr, len, signal_count
         );
@@ -522,7 +534,7 @@ impl Drop for Vm {
         for binding in bindings {
             binding.deactivate();
         }
-        error!("hypervisor: release VM {}.", self.id);
+        debug!("hypervisor: release VM {}.", self.id);
     }
 }
 

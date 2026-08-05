@@ -26,7 +26,30 @@ pub struct GuestContext {
     /// The VMCS owned by this vCPU.
     pub(crate) vmcs: Vmcs,
 
+    /// Cached guest state that must be written to the VMCS before VM entry.
+    ///
+    /// Hardware state remains private to OSTD. Kernel-side emulation only
+    /// updates the safe `GuestContext` API, and OSTD applies these flags while
+    /// the VMCS is current on the pinned CPU.
+    vmcs_dirty: VmcsDirtyState,
+
     pub(crate) tsc_offset: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VmcsDirtyState {
+    pub(crate) rip: bool,
+    pub(crate) rsp: bool,
+    pub(crate) rflags: bool,
+    pub(crate) sregs: bool,
+    pub(crate) efer: bool,
+    pub(crate) pat: bool,
+    pub(crate) fs_base: bool,
+    pub(crate) gs_base: bool,
+    pub(crate) sysenter_cs: bool,
+    pub(crate) sysenter_esp: bool,
+    pub(crate) sysenter_eip: bool,
+    pub(crate) run_msrs: bool,
 }
 
 pub(crate) struct VcpuArchState {
@@ -59,6 +82,7 @@ impl GuestContext {
                 VcpuRunState::WaitForSipi
             },
             vmcs: Vmcs::new()?,
+            vmcs_dirty: VmcsDirtyState::default(),
             tsc_offset: 0,
         })
     }
@@ -80,6 +104,13 @@ impl GuestContext {
         };
         self.arch.set_sregs(VcpuSregs::with_startup(vector));
         self.arch.set_efer(0);
+        self.vmcs_dirty = VmcsDirtyState {
+            rip: true,
+            rsp: true,
+            rflags: true,
+            sregs: true,
+            ..VmcsDirtyState::default()
+        };
         self.run = VcpuRunState::Runnable;
     }
 
@@ -95,6 +126,9 @@ impl GuestContext {
     /// execution mode and entry point.
     pub fn set_regs(&mut self, regs: VcpuRegs) {
         self.arch.regs = regs;
+        self.vmcs_dirty.rip = true;
+        self.vmcs_dirty.rsp = true;
+        self.vmcs_dirty.rflags = true;
     }
 
     /// Returns the guest special-register state.
@@ -112,6 +146,7 @@ impl GuestContext {
     /// responsible for providing architecturally valid guest state.
     pub fn set_sregs(&mut self, sregs: VcpuSregs) {
         self.arch.set_sregs(sregs);
+        self.vmcs_dirty.sregs = true;
     }
 
     /// Returns a guest general-purpose register.
@@ -126,6 +161,9 @@ impl GuestContext {
     /// that match the emulated guest instruction.
     pub fn set_gpr(&mut self, reg: X86GprIndex, width_byte: u8, value: u64) {
         self.arch.set_gpr(reg, width_byte, value);
+        if reg == X86GprIndex::Rsp {
+            self.vmcs_dirty.rsp = true;
+        }
     }
 
     /// Advances the guest instruction pointer.
@@ -134,6 +172,7 @@ impl GuestContext {
     /// that has actually been consumed or emulated.
     pub fn advance_rip(&mut self, len: u64) {
         self.arch.advance_rip(len);
+        self.vmcs_dirty.rip = true;
     }
 
     /// Returns the guest instruction pointer.
@@ -184,11 +223,36 @@ impl GuestContext {
     ///
     /// Returns `false` if the MSR index is not supported by this context.
     pub fn write_msr(&mut self, index: u32, value: u64) -> bool {
-        self.arch.set_msr(index, value)
+        let written = self.arch.set_msr(index, value);
+        if written {
+            use x86::msr::*;
+            match index {
+                IA32_EFER => self.vmcs_dirty.efer = true,
+                IA32_PAT => self.vmcs_dirty.pat = true,
+                IA32_FS_BASE => self.vmcs_dirty.fs_base = true,
+                IA32_GS_BASE => self.vmcs_dirty.gs_base = true,
+                IA32_SYSENTER_CS => self.vmcs_dirty.sysenter_cs = true,
+                IA32_SYSENTER_ESP => self.vmcs_dirty.sysenter_esp = true,
+                IA32_SYSENTER_EIP => self.vmcs_dirty.sysenter_eip = true,
+                IA32_STAR | IA32_LSTAR | IA32_CSTAR | IA32_FMASK | IA32_KERNEL_GSBASE => {
+                    self.vmcs_dirty.run_msrs = true;
+                }
+                _ => {}
+            }
+        }
+        written
     }
 
     pub(crate) fn vmcs_guest_state(&self) -> VmcsGuestState {
         self.arch.vmcs_guest_state()
+    }
+
+    pub(crate) fn vmcs_dirty(&self) -> VmcsDirtyState {
+        self.vmcs_dirty
+    }
+
+    pub(crate) fn clear_vmcs_dirty(&mut self) {
+        self.vmcs_dirty = VmcsDirtyState::default();
     }
 
     pub(crate) fn arch_mut(&mut self) -> &mut VcpuArchState {

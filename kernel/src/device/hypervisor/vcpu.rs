@@ -281,10 +281,11 @@ impl Vcpu {
     }
 
     pub fn get_regs(&self) -> Result<VcpuRegs> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get regs while vCPU is running");
         }
+        self.guest_mode.synchronize_regs(&mut context)?;
         Ok(context.regs().into())
     }
 
@@ -298,10 +299,11 @@ impl Vcpu {
     }
 
     pub fn get_sregs(&self) -> Result<VcpuSregs> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get sregs while vCPU is running");
         }
+        self.guest_mode.synchronize_sregs(&mut context)?;
         Ok(context.sregs().into())
     }
 
@@ -333,10 +335,11 @@ impl Vcpu {
     }
 
     pub fn get_msrs(&self, entries: &mut [VcpuMsrEntry]) -> Result<i32> {
-        let context = self.guest_context.lock();
+        let mut context = self.guest_context.lock();
         if context.is_running() {
             return_errno_with_message!(Errno::EBUSY, "cannot get MSRs while vCPU is running");
         }
+        self.guest_mode.synchronize_msrs(&mut context)?;
         drop(context);
 
         let mut handled_count = 0;
@@ -461,7 +464,7 @@ impl Vcpu {
 
 impl Drop for Vcpu {
     fn drop(&mut self) {
-        error!("hypervisor: release VCPU {}.", self.id);
+        debug!("hypervisor: release VCPU {}.", self.id);
     }
 }
 

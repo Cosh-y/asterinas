@@ -22,7 +22,6 @@ use crate::{
         trap::{RawUserContext, TrapFrame},
     },
     cpu::PrivilegeLevel,
-    debug,
     irq::{DisabledLocalIrqGuard, call_irq_callback_functions},
     mm::Vaddr,
     user::{ReturnReason, UserContextApi, UserContextApiInternal},
@@ -566,8 +565,6 @@ impl FpuContext {
         } else {
             unsafe { _fxsave64(mem_addr) };
         }
-
-        debug!("Save FPU context");
     }
 
     /// Loads CPU's FPU context from this instance.
@@ -581,8 +578,6 @@ impl FpuContext {
         } else {
             unsafe { _fxrstor64(mem_addr) };
         }
-
-        debug!("Load FPU context");
     }
 
     /// Returns the FPU context as a byte slice.

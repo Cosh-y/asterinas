@@ -1,37 +1,82 @@
+use spin::Once;
 use x86_64::registers::control::Cr2;
 
-use crate::arch::{
-    cpu::context::FpuContext,
-    vm::{vmx::Msr, x86::write_cr2_raw},
+use crate::{
+    arch::{
+        cpu::context::FpuContext,
+        vm::{vmx::Msr, x86::write_cr2_raw},
+    },
+    cpu::{PinCurrentCpu, all_cpus},
+    cpu_local,
+    sync::SpinLock,
 };
 
-#[derive(Debug, Clone)]
+cpu_local! {
+    static HOST_CONTEXT: Once<SpinLock<HostContext>> = Once::new();
+}
+
+pub(super) fn init_host_contexts() {
+    for cpu in all_cpus() {
+        HOST_CONTEXT
+            .get_on_cpu(cpu)
+            .call_once(|| SpinLock::new(HostContext::new()));
+    }
+}
+
+pub(super) fn with_host_context<R>(
+    pin_guard: &dyn PinCurrentCpu,
+    f: impl FnOnce(&mut HostContext) -> R,
+) -> R {
+    let host_context = HOST_CONTEXT
+        .get_on_cpu(pin_guard.current_cpu())
+        .get()
+        .expect("host contexts must be initialized before guest execution");
+    f(&mut host_context.lock())
+}
+
+#[derive(Debug)]
 /// Host Contexts that can't be auto loaded/saved by VMCS
-pub struct HostContext {
+pub(super) struct HostContext {
     msrs: HostRunMsrs,
     fpu: FpuContext,
     cr2: u64,
 }
 
 impl HostContext {
-    pub fn save() -> Self {
-        let mut fpu = FpuContext::new();
-        fpu.save();
+    pub fn new() -> Self {
         Self {
-            msrs: HostRunMsrs::read_current(),
-            fpu,
-            cr2: Cr2::read_raw(),
+            msrs: HostRunMsrs::default(),
+            fpu: FpuContext::new(),
+            cr2: 0,
         }
     }
 
-    pub fn load(self) {
+    pub fn save(&mut self) {
+        self.fpu.save();
+        self.msrs = HostRunMsrs::read_current();
+        self.cr2 = Cr2::read_raw();
+    }
+
+    pub fn load(&self) {
         write_cr2_raw(self.cr2);
         self.fpu.load();
         self.msrs.restore();
     }
+
+    pub fn load_after_vmexit(&self) {
+        // VM-exit has already restored the five syscall-related host MSRs
+        // from the VM-exit MSR-load area. CR2 and FPU state are not managed by
+        // VMCS and remain OSTD's responsibility.
+        write_cr2_raw(self.cr2);
+        self.fpu.load();
+    }
+
+    pub fn run_msr_values(&self) -> [u64; 5] {
+        self.msrs.values()
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct HostRunMsrs {
     star: u64,
     lstar: u64,
@@ -57,5 +102,15 @@ impl HostRunMsrs {
         Msr::IA32_CSTAR.write(self.cstar);
         Msr::IA32_FMASK.write(self.syscall_mask);
         Msr::IA32_KERNEL_GSBASE.write(self.kernel_gs_base);
+    }
+
+    fn values(self) -> [u64; 5] {
+        [
+            self.star,
+            self.lstar,
+            self.cstar,
+            self.syscall_mask,
+            self.kernel_gs_base,
+        ]
     }
 }

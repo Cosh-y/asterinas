@@ -41,7 +41,7 @@ pub fn vmexit_handler(
         Ok(VmxExitReason::MSR_READ) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::MSR_WRITE) => Ok(Some(GuestExitInfo::from(*exit_info))),
         Ok(VmxExitReason::PAUSE_INSTRUCTION) => {
-            context.arch_mut().advance_rip(PAUSE_INSN_LENGTH);
+            context.advance_rip(PAUSE_INSN_LENGTH);
             Ok(Some(GuestExitInfo::from(*exit_info)))
         }
         Ok(VmxExitReason::HLT) => {
