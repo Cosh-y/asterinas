@@ -21,6 +21,38 @@ use crate::{prelude::*, syscall::eventfd::EventFile};
 const KVM_CLOCK_REALTIME: u32 = 1 << 2;
 const KVM_CLOCK_HOST_TSC: u32 = 1 << 3;
 
+/// VM-wide state used to recognize userspace writes that intend to align the
+/// TSCs of multiple vCPUs.
+#[derive(Debug, Default)]
+struct TscWriteState {
+    initialized: bool,
+    last_host_tsc: u64,
+    last_guest_tsc: u64,
+    last_tsc_freq: u64,
+    generation_offset: i64,
+}
+
+impl TscWriteState {
+    fn synchronize(&mut self, guest_tsc: u64, host_tsc: u64, tsc_freq: u64) -> i64 {
+        let candidate_offset = (guest_tsc as i64).wrapping_sub(host_tsc as i64);
+        let same_frequency = self.initialized && tsc_freq != 0 && tsc_freq == self.last_tsc_freq;
+        let expected_guest_tsc = self
+            .last_guest_tsc
+            .wrapping_add(host_tsc.wrapping_sub(self.last_host_tsc));
+        let within_one_second = guest_tsc.abs_diff(expected_guest_tsc) < tsc_freq;
+        let matches_generation = same_frequency && (guest_tsc == 0 || within_one_second);
+
+        if !matches_generation {
+            self.generation_offset = candidate_offset;
+        }
+        self.initialized = true;
+        self.last_host_tsc = host_tsc;
+        self.last_guest_tsc = guest_tsc;
+        self.last_tsc_freq = tsc_freq;
+        self.generation_offset
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum IrqRoute {
     Ioapic {
@@ -42,6 +74,8 @@ pub(super) struct Vm {
     irq_routes: Mutex<BTreeMap<u32, Vec<IrqRoute>>>,
     ioeventfds: Mutex<Vec<Arc<IoEventFdBinding>>>,
     irqfds: Mutex<Vec<Arc<IrqFdBinding>>>,
+    /// Coordinates host-initiated TSC writes across all vCPUs in this VM.
+    tsc_write_state: Mutex<TscWriteState>,
     /// Guest monotonic time equals host monotonic time plus this offset.
     kvmclock_offset: Mutex<i128>,
 }
@@ -58,6 +92,7 @@ impl Vm {
             irq_routes: Mutex::new(BTreeMap::new()),
             ioeventfds: Mutex::new(Vec::new()),
             irqfds: Mutex::new(Vec::new()),
+            tsc_write_state: Mutex::new(TscWriteState::default()),
             kvmclock_offset: Mutex::new(kvmclock_offset),
         }))
     }
@@ -131,6 +166,20 @@ impl Vm {
         } else {
             guest_monotonic as u64
         }
+    }
+
+    /// Returns a VM-wide offset for a host-initiated IA32_TSC write.
+    ///
+    /// QEMU initializes every vCPU by writing the same TSC value through
+    /// KVM_SET_MSRS. Treat nearby writes, and zero writes in particular, as a
+    /// request to join one TSC generation. Guest WRMSR instructions bypass
+    /// this method and keep their per-vCPU semantics.
+    pub(super) fn synchronize_tsc_write(&self, guest_tsc: u64) -> i64 {
+        let host_tsc = ostd::arch::read_tsc();
+        let tsc_freq = ostd::arch::tsc_freq();
+        self.tsc_write_state
+            .lock()
+            .synchronize(guest_tsc, host_tsc, tsc_freq)
     }
 
     pub(super) fn enable_cap(&self, cap: EnableCapData) -> Result<()> {
@@ -497,6 +546,7 @@ impl Vm {
             }
 
             const APIC_ICR_DELIVERY_MODE_FIXED: u8 = 0;
+            const APIC_ICR_DELIVERY_MODE_NMI: u8 = 4;
             const APIC_ICR_DELIVERY_MODE_INIT: u8 = 5;
             const APIC_ICR_DELIVERY_MODE_STARTUP: u8 = 6;
 
@@ -507,14 +557,21 @@ impl Vm {
                             .add_pending_interrupt(icr.vector, TriggerMode::Edge);
                     }
                 }
+                APIC_ICR_DELIVERY_MODE_NMI => vcpu.lapic().add_pending_nmi(),
                 APIC_ICR_DELIVERY_MODE_INIT => {
-                    // Vcpu recieves INIT IPI, do nothing.
-                    warn!(
-                        "hypervisor: INIT IPI for vcpu {} is not fully migrated yet",
-                        vcpu_id
+                    debug!(
+                        "hypervisor: INIT IPI src={} dest={} shorthand={} target={}",
+                        icr.src_id, icr.dest_id, icr.dest_shorthand, vcpu_id
                     );
+                    vcpu.receive_init();
                 }
-                APIC_ICR_DELIVERY_MODE_STARTUP => vcpu.receive_sipi(icr.vector),
+                APIC_ICR_DELIVERY_MODE_STARTUP => {
+                    debug!(
+                        "hypervisor: SIPI src={} dest={} shorthand={} target={} vector={:#x}",
+                        icr.src_id, icr.dest_id, icr.dest_shorthand, vcpu_id, icr.vector
+                    );
+                    vcpu.receive_sipi(icr.vector);
+                }
                 _ => {
                     error!(
                         "hypervisor: unsupported LAPIC ICR delivery mode {}",
@@ -556,5 +613,42 @@ fn saturating_u128_to_u64(nanos: u128) -> u64 {
         u64::MAX
     } else {
         nanos as u64
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::TscWriteState;
+
+    #[ktest]
+    fn zero_tsc_writes_share_one_generation() {
+        let mut state = TscWriteState::default();
+        let first_offset = state.synchronize(0, 10_000, 1_000);
+        let second_offset = state.synchronize(0, 10_250, 1_000);
+
+        assert_eq!(first_offset, -10_000);
+        assert_eq!(second_offset, first_offset);
+    }
+
+    #[ktest]
+    fn nearby_nonzero_tsc_writes_share_one_generation() {
+        let mut state = TscWriteState::default();
+        let first_offset = state.synchronize(10_000, 50_000, 1_000);
+        let second_offset = state.synchronize(10_500, 50_500, 1_000);
+
+        assert_eq!(first_offset, -40_000);
+        assert_eq!(second_offset, first_offset);
+    }
+
+    #[ktest]
+    fn distant_tsc_write_starts_a_new_generation() {
+        let mut state = TscWriteState::default();
+        let first_offset = state.synchronize(10_000, 50_000, 1_000);
+        let second_offset = state.synchronize(20_000, 50_500, 1_000);
+
+        assert_eq!(first_offset, -40_000);
+        assert_eq!(second_offset, -30_500);
     }
 }

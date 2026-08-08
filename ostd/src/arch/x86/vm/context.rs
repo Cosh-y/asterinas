@@ -97,12 +97,15 @@ impl GuestContext {
             return;
         }
 
+        let apic_base = self.arch.sregs().apic_base;
         self.arch.regs = VcpuRegs {
             rip: 0,
             rflags: 0x2,
             ..VcpuRegs::default()
         };
-        self.arch.set_sregs(VcpuSregs::with_startup(vector));
+        let mut startup_sregs = VcpuSregs::with_startup(vector);
+        startup_sregs.apic_base = apic_base;
+        self.arch.set_sregs(startup_sregs);
         self.arch.set_efer(0);
         self.vmcs_dirty = VmcsDirtyState {
             rip: true,
@@ -112,6 +115,40 @@ impl GuestContext {
             ..VmcsDirtyState::default()
         };
         self.run = VcpuRunState::Runnable;
+    }
+
+    /// Resets an application processor after an INIT IPI and makes it wait
+    /// for a new startup IPI.
+    ///
+    /// The architectural reset remains inside OSTD so that kernel users do
+    /// not gain direct access to VMCS state. The TSC offset and VMCS ownership
+    /// are properties of the virtual CPU and therefore survive INIT. INIT also
+    /// preserves IA32_MISC_ENABLE, matching the behavior expected by KVM
+    /// userspace and preventing application processors from observing CPU
+    /// features that differ from the bootstrap processor.
+    pub fn receive_init(&mut self) {
+        let apic_base = self.arch.sregs().apic_base;
+        let misc_enable = self.arch.msr(x86::msr::IA32_MISC_ENABLE);
+        self.arch = VcpuArchState::default();
+        let mut reset_sregs = self.arch.sregs();
+        reset_sregs.apic_base = apic_base;
+        self.arch.set_sregs(reset_sregs);
+        self.arch.set_msr(x86::msr::IA32_MISC_ENABLE, misc_enable);
+        self.vmcs_dirty = VmcsDirtyState {
+            rip: true,
+            rsp: true,
+            rflags: true,
+            sregs: true,
+            efer: true,
+            pat: true,
+            fs_base: true,
+            gs_base: true,
+            sysenter_cs: true,
+            sysenter_esp: true,
+            sysenter_eip: true,
+            run_msrs: true,
+        };
+        self.run = VcpuRunState::WaitForSipi;
     }
 
     /// Returns the guest general-purpose register state.
