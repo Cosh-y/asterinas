@@ -18,6 +18,7 @@ use crate::{
         pseudofs::AnonInodeFs,
     },
     prelude::*,
+    process::{posix_thread::AsPosixThread, signal::HandlePendingSignal},
     util::ioctl::{RawIoctl, dispatch_ioctl},
     vm::page_cache::{Vmo, VmoOptions},
 };
@@ -262,7 +263,9 @@ impl VcpuFile {
             return_errno_with_message!(Errno::EINTR, "KVM_RUN interrupted by immediate_exit");
         }
 
-        let exit_info = self.vcpu.run()?;
+        let Some(exit_info) = self.vcpu.run(|| self.run_interrupted())? else {
+            return_errno_with_message!(Errno::EINTR, "KVM_RUN was interrupted");
+        };
         self.write_exit_to_run_page(exit_info)?;
         Ok(0)
     }
@@ -319,6 +322,20 @@ impl VcpuFile {
     fn immediate_exit(&self) -> Result<bool> {
         let immediate_exit = self.read_run_val::<u8>(KVM_RUN_IMMEDIATE_EXIT_OFFSET)?;
         Ok(immediate_exit != 0)
+    }
+
+    fn run_interrupted(&self) -> Result<bool> {
+        if self.immediate_exit()? {
+            return Ok(true);
+        }
+
+        // QEMU normally kicks a running vCPU with a POSIX signal. Asterinas
+        // delivers that signal after the syscall returns, so KVM_RUN must
+        // notice the pending signal itself and return EINTR first.
+        let thread = current_thread!();
+        Ok(thread
+            .as_posix_thread()
+            .is_some_and(HandlePendingSignal::has_pending))
     }
 
     fn write_exit_to_run_page(&self, exit_info: GuestExitInfo) -> Result<()> {

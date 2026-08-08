@@ -5,7 +5,7 @@ use ostd::{
 };
 
 use super::{
-    apic::{Lapic, LapicPort, emulate_apic_mmio},
+    apic::{Lapic, LapicPort, default_lapic_ldr, default_lapic_lvt_lint0, emulate_apic_mmio},
     cpuid, cr,
     ioctl::{LapicState, MpState, VcpuCpuidEntry2, VcpuMsrEntry, VcpuRegs, VcpuSregs},
     ioeventfd::IoEventAddressSpace,
@@ -77,11 +77,18 @@ impl Vcpu {
             .ok_or_else(|| Error::with_message(Errno::ENOENT, "vm not found"))
     }
 
-    pub(super) fn run(self: &Arc<Self>) -> Result<GuestExitInfo> {
+    pub(super) fn run<F>(self: &Arc<Self>, mut immediate_exit: F) -> Result<Option<GuestExitInfo>>
+    where
+        F: FnMut() -> Result<bool>,
+    {
         let vm = self.vm()?;
         let _run_guard = self.run_lock.lock();
 
         loop {
+            if immediate_exit()? {
+                return Ok(None);
+            }
+
             let run_result = {
                 let mut context = self.guest_context();
                 match self.guest_mode.execute(
@@ -97,16 +104,27 @@ impl Vcpu {
                     }
                 }
             };
-            let GuestRunResult::VmExit(exit_info) = run_result else {
-                loop {
-                    if self.wait_for_sipi_wakeup() {
-                        break;
-                    }
-
-                    // TODO: Use a more efficient wait mechanism instead of busy-waiting.
-                    Task::yield_now();
+            let exit_info = match run_result {
+                GuestRunResult::VmExit(exit_info) => exit_info,
+                GuestRunResult::HostInterrupt => {
+                    // GuestMode has released its CPU-pinning guard, so this is a
+                    // scheduling point if the host scheduler requested one.
+                    continue;
                 }
-                continue;
+                GuestRunResult::WaitForSipi => {
+                    loop {
+                        if immediate_exit()? {
+                            return Ok(None);
+                        }
+                        if self.wait_for_sipi_wakeup() {
+                            break;
+                        }
+
+                        // TODO: Use a more efficient wait mechanism instead of busy-waiting.
+                        Task::yield_now();
+                    }
+                    continue;
+                }
             };
             let exit_info = match VmxExitReason::try_from(exit_info.exit_reason) {
                 Ok(VmxExitReason::IO_INSTRUCTION) => {
@@ -149,6 +167,9 @@ impl Vcpu {
                     self.guest_context()
                         .advance_rip(exit_info.instruction_len as _);
                     loop {
+                        if immediate_exit()? {
+                            return Ok(None);
+                        }
                         if self.wait_for_hlt_wakeup() {
                             break None;
                         }
@@ -171,7 +192,7 @@ impl Vcpu {
             };
 
             if let Some(exit_info) = exit_info {
-                return Ok(exit_info);
+                return Ok(Some(exit_info));
             }
         }
     }
@@ -361,7 +382,7 @@ impl Vcpu {
 
         let mut handled_count = 0;
         for entry in entries {
-            msr::write_msr(self, entry.index, entry.data)?;
+            msr::write_msr_from_userspace(self, entry.index, entry.data)?;
             handled_count += 1;
         }
 
@@ -430,7 +451,29 @@ impl Vcpu {
     }
 
     pub fn receive_sipi(&self, vector: u8) {
-        self.guest_context.lock().receive_sipi(vector);
+        let mut context = self.guest_context.lock();
+        let old_state = context.run_state();
+        context.receive_sipi(vector);
+        debug!(
+            "hypervisor: vcpu={} received SIPI vector={:#x}, state={:?}->{:?}, apic_base={:#x}",
+            self.id,
+            vector,
+            old_state,
+            context.run_state(),
+            context.sregs().apic_base
+        );
+    }
+
+    pub fn receive_init(&self) {
+        let mut context = self.guest_context.lock();
+        let mut lapic = self.lapic.lock();
+        context.receive_init();
+
+        let mut reset_lapic = Lapic::default();
+        reset_lapic.id = self.id;
+        reset_lapic.ldr = default_lapic_ldr(self.id);
+        reset_lapic.lvt_lint0 = default_lapic_lvt_lint0(self.id);
+        *lapic = reset_lapic;
     }
 
     pub(super) fn wait_for_sipi_wakeup(&self) -> bool {
@@ -445,10 +488,17 @@ impl Vcpu {
         };
         let start_tsc = read_tsc();
         loop {
+            // INIT/SIPI may move a halted AP to wait-for-SIPI and then runnable
+            // without queuing a maskable interrupt. Stop waiting on the stale
+            // HLT state so the vCPU thread can observe the new startup state.
+            if self.guest_context.lock().run_state() != VcpuRunState::Halted {
+                return true;
+            }
+
             let guest_tsc = self.guest_context().guest_tsc();
             self.lapic.lock().poll_deadline(guest_tsc);
 
-            if self.lapic.lock().check_pending_interrupt().is_some() {
+            if self.lapic.lock().has_pending_interrupt() {
                 return true;
             }
 

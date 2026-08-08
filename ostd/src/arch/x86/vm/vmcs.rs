@@ -127,6 +127,13 @@ impl Vmcs {
                 return Err(err);
             }
         }
+
+        // Unlike most VMCS host-state fields, FS.base belongs to the current
+        // userspace thread rather than to the physical CPU.  A VMCS can be
+        // reused by another thread without changing CPUs, so refresh it for
+        // every run.  Otherwise VM exit may restore a stale TLS base from the
+        // previous runner.
+        self.refresh_vmcs_host_task_state()?;
         Ok(())
     }
 
@@ -238,6 +245,10 @@ impl Vmcs {
         VmcsHostNW::IA32_SYSENTER_EIP.write(Msr::IA32_SYSENTER_EIP.read() as usize)?;
         VmcsHost32::IA32_SYSENTER_CS.write(Msr::IA32_SYSENTER_CS.read() as u32)?;
         Ok(())
+    }
+
+    fn refresh_vmcs_host_task_state(&self) -> Result<()> {
+        VmcsHostNW::FS_BASE.write(Msr::IA32_FS_BASE.read() as _)
     }
 
     fn setup_vmcs_guest(&self, vmcs_guest_state: &VmcsGuestState) -> Result<()> {

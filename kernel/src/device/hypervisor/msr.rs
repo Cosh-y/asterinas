@@ -41,6 +41,12 @@ pub(super) enum MsrAccess {
     Write,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MsrWriteSource {
+    Guest,
+    Userspace,
+}
+
 /// Returns the MSR indexes emulated by the kernel hypervisor layer.
 pub(super) fn msr_indices() -> Vec<u32> {
     Vec::from([
@@ -88,7 +94,7 @@ pub(super) fn emulate_msr(vcpu: &Vcpu, exit_info: &GuestExitInfo, access: MsrAcc
             context.set_gpr(X86GprIndex::Rdx, 8, value >> 32);
         }
         MsrAccess::Write => {
-            write_msr(vcpu, msr_index, msr_value)?;
+            write_msr(vcpu, msr_index, msr_value, MsrWriteSource::Guest)?;
         }
     }
 
@@ -112,8 +118,12 @@ pub(super) fn read_msr(vcpu: &Vcpu, index: u32) -> u64 {
     }
 }
 
-/// Writes an emulated MSR for ioctl or guest instruction handling.
-pub(super) fn write_msr(vcpu: &Vcpu, index: u32, value: u64) -> Result<()> {
+/// Writes an emulated MSR on behalf of KVM userspace.
+pub(super) fn write_msr_from_userspace(vcpu: &Vcpu, index: u32, value: u64) -> Result<()> {
+    write_msr(vcpu, index, value, MsrWriteSource::Userspace)
+}
+
+fn write_msr(vcpu: &Vcpu, index: u32, value: u64, source: MsrWriteSource) -> Result<()> {
     match index {
         MSR_KVM_WALL_CLOCK
         | MSR_KVM_SYSTEM_TIME
@@ -125,7 +135,10 @@ pub(super) fn write_msr(vcpu: &Vcpu, index: u32, value: u64) -> Result<()> {
             vcpu.lapic().write_tsc_deadline_msr(value);
         }
         IA32_TSC => {
-            let offset = (value as i64).wrapping_sub(read_tsc() as i64);
+            let offset = match source {
+                MsrWriteSource::Guest => (value as i64).wrapping_sub(read_tsc() as i64),
+                MsrWriteSource::Userspace => vcpu.vm()?.synchronize_tsc_write(value),
+            };
             vcpu.guest_context().set_tsc_offset(offset);
             vcpu.update_kvmclock()?;
         }

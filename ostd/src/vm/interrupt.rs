@@ -15,6 +15,14 @@ use crate::arch::vm::GuestInterrupt;
 /// preemption or local interrupts. Implementations must not sleep, yield, or
 /// wait on synchronization primitives that can block the current task.
 pub trait GuestInterruptPort {
+    /// Returns whether a non-maskable interrupt is pending.
+    fn query_pending_nmi(&self) -> bool {
+        false
+    }
+
+    /// Marks a pending non-maskable interrupt as accepted for injection.
+    fn accept_nmi(&self) {}
+
     /// Returns the next guest interrupt to offer for injection.
     ///
     /// This method is a query. It should not consume the interrupt because

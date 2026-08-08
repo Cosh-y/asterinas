@@ -44,6 +44,8 @@ pub struct Lapic {
     pub icr: [u32; 2], // Interrupt Command Register, 64 bits
     pub tmr: [u32; 8], // Trigger Mode Register
 
+    nmi_pending: bool,
+
     pub lvt_lint0: u32,
     pub lvt_lint1: u32,
 
@@ -61,6 +63,7 @@ impl Default for Lapic {
             isr: [0; 8],
             icr: [0; 2],
             tmr: [0; 8],
+            nmi_pending: false,
             lvt_lint0: APIC_LVT_MASKED,
             lvt_lint1: APIC_LVT_MASKED,
             timer: ApicTimer::default(),
@@ -428,6 +431,14 @@ impl LapicPort {
 }
 
 impl GuestInterruptPort for LapicPort {
+    fn query_pending_nmi(&self) -> bool {
+        self.lock().nmi_pending
+    }
+
+    fn accept_nmi(&self) {
+        self.lock().nmi_pending = false;
+    }
+
     fn query_pending_interrupt(&self) -> Option<GuestInterrupt> {
         if let Some(vector) = self.lock().check_pending_interrupt() {
             Some(GuestInterrupt { vector })
@@ -452,6 +463,14 @@ impl GuestTimerPort for LapicPort {
 }
 
 impl Lapic {
+    pub(crate) fn add_pending_nmi(&mut self) {
+        self.nmi_pending = true;
+    }
+
+    pub(crate) fn has_pending_interrupt(&self) -> bool {
+        self.nmi_pending || self.check_pending_interrupt().is_some()
+    }
+
     pub(crate) fn check_pending_interrupt(&self) -> Option<u8> {
         let pending_vector = Self::find_highest(&self.irr)?;
 

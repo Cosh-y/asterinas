@@ -76,6 +76,9 @@ pub struct GuestMode {
 pub enum GuestRunResult {
     /// The vCPU exited and needs higher-level handling.
     VmExit(GuestExitInfo),
+    /// A host interrupt ended this run so the kernel can reach a scheduling point.
+    #[cfg(target_arch = "x86_64")]
+    HostInterrupt,
     /// The vCPU is waiting for a startup IPI and was not entered (x86 only).
     #[cfg(target_arch = "x86_64")]
     WaitForSipi,
@@ -162,10 +165,19 @@ impl GuestMode {
             self.prepare_vmentry(context, interrupt_port, timer_port, host_context)?;
             let run_result = self.vmlaunch_or_vmresume(context);
             let exit_info = self.complete_vmexit(context, run_result, host_context)?;
+            let host_interrupt =
+                exit_info.exit_reason == VmxExitReason::EXTERNAL_INTERRUPT as u32;
 
             use crate::arch::vm::exit::vmexit_handler;
             let exit_info = vmexit_handler(context, &exit_info)?;
             drop(irq_guard);
+
+            // Guest execution is pinned with preemption disabled while its VMCS is
+            // current. Return after a physical interrupt so the kernel client can
+            // release that guard and give competing host tasks a scheduling point.
+            if host_interrupt {
+                return Ok(GuestRunResult::HostInterrupt);
+            }
 
             // Deliver VM-exit handling to the kernel client or userspace.
             if let Some(exit_info) = exit_info {
@@ -271,6 +283,21 @@ impl GuestMode {
     ) -> Result<Option<u8>> {
         VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(0)?;
 
+        use crate::arch::vm::interrupt::*;
+        if interrupt_port.query_pending_nmi() {
+            if !vmx_nmi_injectable()? {
+                enable_nmi_window_exiting()?;
+                return Ok(None);
+            }
+            disable_nmi_window_exiting()?;
+
+            const NMI_VECTOR: u8 = 2;
+            let intr_info = u32::from(NMI_VECTOR) | INTR_INFO_VALID_MASK | INTR_TYPE_NMI;
+            VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD.write(intr_info)?;
+            interrupt_port.accept_nmi();
+            return Ok(Some(NMI_VECTOR));
+        }
+
         let pending_vector = interrupt_port.query_pending_interrupt();
 
         let Some(vector) = pending_vector else {
@@ -284,7 +311,6 @@ impl GuestMode {
             return Ok(None);
         }
 
-        use crate::arch::vm::interrupt::*;
         let intr_info = u32::from(vector) | INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
         let injectable = vmx_interrupt_injectable()?;
 

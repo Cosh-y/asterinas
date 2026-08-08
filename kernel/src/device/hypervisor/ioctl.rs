@@ -6,6 +6,7 @@ use ostd::{
         VcpuDtable as ArchVcpuDtable, VcpuRegs as ArchVcpuRegs, VcpuRunState,
         VcpuSegment as ArchVcpuSegment, VcpuSregs as ArchVcpuSregs,
     },
+    cpu::num_cpus,
     mm::VmIo,
     task::Task,
 };
@@ -21,7 +22,6 @@ const KVM_APIC_REG_SIZE: usize = 0x400;
 pub(super) const KVM_MEM_READONLY: u32 = 1 << 1;
 
 pub(super) const KVM_API_VERSION: i32 = 12;
-pub(super) const KVM_RECOMMENDED_VCPUS: i32 = 1;
 pub(super) const KVM_MAX_VCPUS: i32 = 64;
 pub(super) const KVM_MAX_CPUID_ENTRIES: usize = 100;
 pub(super) const KVM_MAX_MSR_ENTRIES: usize = 100;
@@ -229,7 +229,7 @@ pub(super) fn check_extension(raw_ioctl: RawIoctl) -> i32 {
         | KVM_CAP_ENABLE_CAP_VM
         | KVM_CAP_IOEVENTFD_ANY_LENGTH
         | KVM_CAP_IMMEDIATE_EXIT => 1,
-        KVM_CAP_NR_VCPUS => KVM_RECOMMENDED_VCPUS,
+        KVM_CAP_NR_VCPUS => num_cpus().min(KVM_MAX_VCPUS as usize) as i32,
         KVM_CAP_NR_MEMSLOTS => KVM_MAX_NR_MEMSLOTS,
         KVM_CAP_IRQ_ROUTING => KVM_MAX_IRQ_ROUTES as i32,
         KVM_CAP_MCE => KVM_MAX_MCE_BANKS,
