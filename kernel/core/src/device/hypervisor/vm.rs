@@ -15,7 +15,7 @@ use super::{
     vcpu::Vcpu,
     vm_memory::VmMemory,
 };
-use crate::{prelude::*, syscall::eventfd::EventFile};
+use crate::{events::KernelEventFile, prelude::*};
 
 const KVM_CLOCK_REALTIME: u32 = 1 << 2;
 const KVM_CLOCK_HOST_TSC: u32 = 1 << 3;
@@ -274,7 +274,7 @@ impl Vm {
     pub(super) fn configure_ioeventfd(
         &self,
         config: IoEventFdConfig,
-        eventfd: Arc<EventFile>,
+        eventfd: Arc<KernelEventFile>,
     ) -> Result<()> {
         validate_ioeventfd_config(&config)?;
         if config.flags & KVM_IOEVENTFD_FLAG_DEASSIGN != 0 {
@@ -379,7 +379,7 @@ impl Vm {
     pub(super) fn configure_irqfd(
         self: &Arc<Self>,
         config: IrqFdConfig,
-        eventfd: Arc<EventFile>,
+        eventfd: Arc<KernelEventFile>,
     ) -> Result<()> {
         const VALID_FLAGS: u32 = KVM_IRQFD_FLAG_DEASSIGN | KVM_IRQFD_FLAG_RESAMPLE;
         if config.flags & !VALID_FLAGS != 0 {

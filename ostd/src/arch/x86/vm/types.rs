@@ -107,10 +107,7 @@ impl Default for VcpuMsrs {
 }
 
 /// Guest special register state.
-#[expect(
-    missing_docs,
-    reason = "KVM-compatible register field names are self-describing."
-)]
+#[expect(missing_docs)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub struct VcpuSregs {
@@ -134,10 +131,7 @@ pub struct VcpuSregs {
 }
 
 /// Guest segment register state.
-#[expect(
-    missing_docs,
-    reason = "KVM-compatible segment field names are self-describing."
-)]
+#[expect(missing_docs)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub struct VcpuSegment {
@@ -157,10 +151,7 @@ pub struct VcpuSegment {
 }
 
 /// Guest descriptor table state.
-#[expect(
-    missing_docs,
-    reason = "KVM-compatible descriptor-table field names are self-describing."
-)]
+#[expect(missing_docs)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub struct VcpuDtable {

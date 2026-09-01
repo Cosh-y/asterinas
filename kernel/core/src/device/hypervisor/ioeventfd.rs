@@ -4,7 +4,7 @@ use super::ioctl::{
     IoEventFdConfig, KVM_IOEVENTFD_FLAG_DATAMATCH, KVM_IOEVENTFD_FLAG_DEASSIGN,
     KVM_IOEVENTFD_FLAG_PIO,
 };
-use crate::{prelude::*, syscall::eventfd::EventFile};
+use crate::{events::KernelEventFile, prelude::*};
 
 const KVM_IOEVENTFD_VALID_FLAGS: u32 =
     KVM_IOEVENTFD_FLAG_DATAMATCH | KVM_IOEVENTFD_FLAG_PIO | KVM_IOEVENTFD_FLAG_DEASSIGN;
@@ -16,7 +16,7 @@ pub(super) enum IoEventAddressSpace {
 }
 
 pub(super) struct IoEventFdBinding {
-    eventfd: Arc<EventFile>,
+    eventfd: Arc<KernelEventFile>,
     address_space: IoEventAddressSpace,
     addr: u64,
     len: u32,
@@ -25,7 +25,7 @@ pub(super) struct IoEventFdBinding {
 }
 
 impl IoEventFdBinding {
-    pub(super) fn new(config: IoEventFdConfig, eventfd: Arc<EventFile>) -> Result<Self> {
+    pub(super) fn new(config: IoEventFdConfig, eventfd: Arc<KernelEventFile>) -> Result<Self> {
         validate_config(&config)?;
         Ok(Self {
             eventfd,
@@ -54,7 +54,7 @@ impl IoEventFdBinding {
     pub(super) fn matches_config(
         &self,
         config: &IoEventFdConfig,
-        eventfd: &Arc<EventFile>,
+        eventfd: &Arc<KernelEventFile>,
     ) -> bool {
         Arc::ptr_eq(&self.eventfd, eventfd)
             && self.address_space == address_space(config)

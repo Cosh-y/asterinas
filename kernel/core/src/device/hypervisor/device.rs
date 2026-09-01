@@ -9,11 +9,12 @@ use ostd::task::Task;
 
 use super::{KVM_MAJOR, KVM_MINOR, cpuid, ioctl::*, msr, vm::Vm, vm_file::VmFile};
 use crate::{
-    device::{Device, DeviceType, DevtmpfsInodeMeta},
+    device::{Device, DeviceType},
     events::IoEvents,
     fs::{
+        devtmpfs::DevtmpfsNodeMeta,
         file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
-        vfs::inode::FileOps,
+        vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -44,8 +45,8 @@ impl Device for HypervisorDevice {
         DeviceId::new(MajorId::new(KVM_MAJOR), MinorId::new(u32::from(KVM_MINOR)))
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new("kvm"))
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
+        Some(DevtmpfsNodeMeta::new("kvm").unwrap())
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
@@ -94,7 +95,7 @@ impl FileOps for HypervisorDeviceFile {
 }
 
 impl PerOpenFileOps for HypervisorDeviceFile {
-    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         dispatch_ioctl!(match raw_ioctl {
             GetApiVersion => {
                 Ok(KVM_API_VERSION)
