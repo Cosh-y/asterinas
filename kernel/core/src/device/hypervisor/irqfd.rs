@@ -6,15 +6,14 @@ use ostd::sync::WaitQueue;
 
 use super::vm::Vm;
 use crate::{
-    events::{IoEvents, Observer},
+    events::{IoEvents, KernelEventFile, Observer},
     prelude::*,
     process::signal::{PollAdaptor, Pollable},
-    syscall::eventfd::EventFile,
     thread::work_queue::{WorkPriority, submit_work_item, work_item::WorkItem},
 };
 
 pub(super) struct IrqFdBinding {
-    eventfd: Arc<EventFile>,
+    eventfd: Arc<KernelEventFile>,
     gsi: u32,
     vm: Weak<Vm>,
     poll_adaptor: Mutex<Option<PollAdaptor<IrqFdObserver>>>,
@@ -25,7 +24,7 @@ pub(super) struct IrqFdBinding {
 }
 
 impl IrqFdBinding {
-    pub(super) fn new(eventfd: Arc<EventFile>, gsi: u32, vm: Weak<Vm>) -> Arc<Self> {
+    pub(super) fn new(eventfd: Arc<KernelEventFile>, gsi: u32, vm: Weak<Vm>) -> Arc<Self> {
         Arc::new_cyclic(|binding| {
             let observer = IrqFdObserver {
                 binding: binding.clone(),
@@ -60,11 +59,11 @@ impl IrqFdBinding {
         }
     }
 
-    pub(super) fn matches(&self, eventfd: &Arc<EventFile>, gsi: u32) -> bool {
+    pub(super) fn matches(&self, eventfd: &Arc<KernelEventFile>, gsi: u32) -> bool {
         self.gsi == gsi && Arc::ptr_eq(&self.eventfd, eventfd)
     }
 
-    pub(super) fn uses_eventfd(&self, eventfd: &Arc<EventFile>) -> bool {
+    pub(super) fn uses_eventfd(&self, eventfd: &Arc<KernelEventFile>) -> bool {
         Arc::ptr_eq(&self.eventfd, eventfd)
     }
 
