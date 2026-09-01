@@ -24,6 +24,9 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
+use x86::msr::rdmsr;
+use x86_64::registers::control::{Cr0, Cr4};
+
 pub use self::exit::VmxExitReason;
 #[expect(
     unused_imports,
@@ -46,22 +49,24 @@ pub(super) use self::{
     vmcs::{VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, alloc_vmcs, set_control},
 };
 use crate::{
-    cpu::{CpuId, PinCurrentCpu},
+    cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
     cpu_local, error,
     error::Error,
-    info, irq,
-    mm::Frame,
+    irq::{self, InterruptLevel},
+    mm::{Frame, FrameAllocOptions, paddr_to_vaddr},
     prelude::*,
     sync::{LocalIrqDisabled, Mutex, SpinLock},
 };
 
-static VMX_LIFECYCLE_ACKS: AtomicUsize = AtomicUsize::new(0);
-static VMX_LIFECYCLE_ERRORS: AtomicUsize = AtomicUsize::new(0);
-static VMX_GUARD_STATE: Mutex<VmxGuardState> = Mutex::new(VmxGuardState {
-    active_guards: 0,
-    enabled: false,
-});
-static VMXON_REGIONS: SpinLock<BTreeMap<usize, Frame<()>>> = SpinLock::new(BTreeMap::new());
+const IA32_FEATURE_CONTROL: u32 = 0x3a;
+const IA32_VMX_BASIC: u32 = 0x480;
+const IA32_VMX_CR0_FIXED0: u32 = 0x486;
+const IA32_VMX_CR0_FIXED1: u32 = 0x487;
+const IA32_VMX_CR4_FIXED0: u32 = 0x488;
+const IA32_VMX_CR4_FIXED1: u32 = 0x489;
+const CR4_VMXE: u64 = 1 << 13;
+
+static VMX_GUARD_STATE: Mutex<VmxGuardState> = Mutex::new(VmxGuardState::new());
 
 const NO_LOADED_CPU: usize = usize::MAX;
 const VMCLEAR_PENDING: u8 = 0;
@@ -146,32 +151,83 @@ impl VmclearRequest {
     }
 }
 
+struct VmxCpuState {
+    enabled: bool,
+    region: Option<Frame<()>>,
+    last_error: Option<Error>,
+}
+
+impl VmxCpuState {
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            region: None,
+            last_error: None,
+        }
+    }
+}
+
+struct EnableError {
+    error: Error,
+    cleanup_complete: bool,
+}
+
 cpu_local! {
     static LOCAL_VMCS_STATE: RefCell<LocalVmcsState> = RefCell::new(LocalVmcsState::new());
     static VMCLEAR_REQUESTS: SpinLock<VecDeque<Arc<VmclearRequest>>, LocalIrqDisabled> =
         SpinLock::new(VecDeque::new());
+    static VMX_CPU_STATE: SpinLock<VmxCpuState, LocalIrqDisabled> =
+        SpinLock::new(VmxCpuState::new());
 }
 
 struct VmxGuardState {
     active_guards: usize,
     enabled: bool,
+    poisoned: bool,
+}
+
+impl VmxGuardState {
+    const fn new() -> Self {
+        Self {
+            active_guards: 0,
+            enabled: false,
+            poisoned: false,
+        }
+    }
 }
 
 /// Keeps VMX operation enabled while at least one guest execution object exists.
+#[must_use]
 pub(crate) struct VmxGuard {
     _private: (),
 }
 
 /// Acquires a VMX lifecycle guard.
 pub(crate) fn acquire_vmx() -> Result<VmxGuard> {
+    if !InterruptLevel::current().is_task_context()
+        || !crate::arch::irq::is_local_enabled()
+        || crate::smp::IPI_SENDER.get().is_none()
+    {
+        return Err(Error::InvalidArgs);
+    }
+
     let mut state = VMX_GUARD_STATE.lock();
+    if state.poisoned {
+        return Err(Error::InvalidArgs);
+    }
     if state.active_guards == usize::MAX {
         return Err(Error::NotEnoughResources);
     }
 
     if !state.enabled {
-        enable_vmx_on_all_cpus()?;
-        state.enabled = true;
+        match enable_vmx_on_all_cpus() {
+            Ok(()) => state.enabled = true,
+            Err(enable_error) => {
+                state.enabled = !enable_error.cleanup_complete;
+                state.poisoned = !enable_error.cleanup_complete;
+                return Err(enable_error.error);
+            }
+        }
     }
 
     state.active_guards += 1;
@@ -180,25 +236,25 @@ pub(crate) fn acquire_vmx() -> Result<VmxGuard> {
 
 impl Drop for VmxGuard {
     fn drop(&mut self) {
+        debug_assert!(InterruptLevel::current().is_task_context());
+        debug_assert!(crate::arch::irq::is_local_enabled());
+
         let mut state = VMX_GUARD_STATE.lock();
         if state.active_guards == 0 {
-            error!("hypervisor: VMX guard state underflow");
+            error!("VMX guard state underflow");
             return;
         }
 
         state.active_guards -= 1;
-        if state.active_guards != 0 || !state.enabled {
+        if state.active_guards != 0 {
             return;
         }
 
-        match vmxoff_all_cpus() {
-            Ok(()) => {
-                state.enabled = false;
-                info!("VMX disabled successfully");
-            }
+        match disable_vmx_on_all_cpus() {
+            Ok(()) => state.enabled = false,
             Err(err) => {
-                state.enabled = false;
-                error!("hypervisor: failed to disable VMX on all CPUs: {:?}", err);
+                error!("failed to disable VMX on all CPUs: {:?}", err);
+                state.poisoned = true;
             }
         }
     }
@@ -261,7 +317,7 @@ fn clear_vmcs_on_cpu(cpu: CpuId, paddr: Paddr, tracking: Arc<VmcsTracking>) -> R
         .get_on_cpu(cpu)
         .lock()
         .push_back(request.clone());
-    crate::smp::inter_processor_call(&crate::cpu::CpuSet::from(cpu), process_vmclear_requests);
+    crate::smp::inter_processor_call(&CpuSet::from(cpu), process_vmclear_requests);
 
     loop {
         match request.result.load(Ordering::Acquire) {
@@ -334,126 +390,236 @@ fn clear_all_active_vmcs_on_current_cpu() -> Result<()> {
     Ok(())
 }
 
-fn enable_vmx_on_all_cpus() -> Result<()> {
-    // Check CPUID for VMX support
-    let cpuid_result = core::arch::x86_64::__cpuid(1);
-    if (cpuid_result.ecx & (1 << 5)) == 0 {
-        error!("VMX not supported by CPU");
+fn enable_vmx_on_all_cpus() -> core::result::Result<(), EnableError> {
+    prepare_vmxon_regions().map_err(|error| EnableError {
+        error,
+        cleanup_complete: true,
+    })?;
+
+    let targets = CpuSet::new_full();
+    let enable_error = match run_on_cpus(&targets, enable_vmx_on_current_cpu) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    cleanup_prepared_regions();
+
+    let rollback_targets = enabled_cpus();
+    if rollback_targets.is_empty() {
+        return Err(EnableError {
+            error: enable_error,
+            cleanup_complete: true,
+        });
+    }
+
+    let rollback_completed = run_on_cpus(&rollback_targets, disable_vmx_on_current_cpu).is_ok();
+    cleanup_prepared_regions();
+
+    Err(EnableError {
+        error: enable_error,
+        cleanup_complete: rollback_completed && enabled_cpus().is_empty(),
+    })
+}
+
+fn disable_vmx_on_all_cpus() -> Result<()> {
+    let targets = enabled_cpus();
+    if targets.is_empty() {
+        return Err(Error::InvalidArgs);
+    }
+
+    let result = run_on_cpus(&targets, disable_vmx_on_current_cpu);
+    cleanup_prepared_regions();
+    result
+}
+
+fn prepare_vmxon_regions() -> Result<()> {
+    for cpu in all_cpus() {
+        let region = match FrameAllocOptions::new().alloc_frame() {
+            Ok(region) => region,
+            Err(error) => {
+                cleanup_prepared_regions();
+                return Err(error);
+            }
+        };
+
+        let mut state = VMX_CPU_STATE.get_on_cpu(cpu).lock();
+        debug_assert!(state.region.is_none());
+        state.region = Some(region);
+        state.last_error = None;
+    }
+    Ok(())
+}
+
+fn cleanup_prepared_regions() {
+    for cpu in all_cpus() {
+        let region = {
+            let mut state = VMX_CPU_STATE.get_on_cpu(cpu).lock();
+            if state.enabled || state.region.is_none() {
+                continue;
+            }
+            state.last_error = None;
+            state.region.take()
+        };
+        drop(region);
+    }
+}
+
+fn enabled_cpus() -> CpuSet {
+    let mut enabled = CpuSet::new_empty();
+    for cpu in all_cpus() {
+        if VMX_CPU_STATE.get_on_cpu(cpu).lock().enabled {
+            enabled.add(cpu);
+        }
+    }
+    enabled
+}
+
+fn run_on_cpus(targets: &CpuSet, handler: fn()) -> Result<()> {
+    crate::smp::inter_processor_call(targets, handler).wait();
+    first_cpu_error(targets).map_or(Ok(()), Err)
+}
+
+fn first_cpu_error(targets: &CpuSet) -> Option<Error> {
+    for cpu in targets.iter() {
+        let state = VMX_CPU_STATE.get_on_cpu(cpu).lock();
+        if let Some(error) = state.last_error {
+            return Some(error);
+        }
+    }
+    None
+}
+
+fn enable_vmx_on_current_cpu() {
+    if let Err(error) = try_enable_vmx_on_current_cpu() {
+        let irq_guard = irq::disable_local();
+        VMX_CPU_STATE.get_with(&irq_guard).lock().last_error = Some(error);
+    }
+}
+
+fn try_enable_vmx_on_current_cpu() -> Result<()> {
+    let irq_guard = irq::disable_local();
+    let state = VMX_CPU_STATE.get_with(&irq_guard);
+    let region_paddr = {
+        let state = state.lock();
+        if state.enabled {
+            return Err(Error::InvalidArgs);
+        }
+        state.region.as_ref().ok_or(Error::InvalidArgs)?.paddr()
+    };
+
+    let cr4 = Cr4::read_raw();
+    if cr4 & CR4_VMXE != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let vmx_cr4 = cr4 | CR4_VMXE;
+    let revision_id = read_and_validate_capability(vmx_cr4)?;
+    initialize_vmxon_region(region_paddr, revision_id);
+
+    // SAFETY: `vmx_cr4` preserves the current `CR4` value, adds only
+    // `CR4.VMXE`, and has been checked against the VMX fixed-bit MSRs.
+    unsafe { Cr4::write_raw(vmx_cr4) };
+
+    // SAFETY: The capability checks, control-register update, and initialized
+    // region above establish the architectural prerequisites for `VMXON`.
+    if let Err(error) = unsafe { instructions::vmxon(region_paddr) } {
+        // SAFETY: A failed `VMXON` leaves this CPU outside VMX operation.
+        unsafe { clear_vmx_enable() };
+        return Err(error);
+    }
+
+    let mut state = state.lock();
+    state.enabled = true;
+    state.last_error = None;
+    Ok(())
+}
+
+fn disable_vmx_on_current_cpu() {
+    if let Err(error) = try_disable_vmx_on_current_cpu() {
+        let irq_guard = irq::disable_local();
+        VMX_CPU_STATE.get_with(&irq_guard).lock().last_error = Some(error);
+    }
+}
+
+fn try_disable_vmx_on_current_cpu() -> Result<()> {
+    let irq_guard = irq::disable_local();
+    let state = VMX_CPU_STATE.get_with(&irq_guard);
+    {
+        let state = state.lock();
+        if !state.enabled || state.region.is_none() {
+            return Err(Error::InvalidArgs);
+        }
+    }
+
+    clear_all_active_vmcs_on_current_cpu()?;
+    instructions::vmxoff()?;
+
+    // SAFETY: A successful `VMXOFF` leaves this CPU outside VMX operation.
+    unsafe { clear_vmx_enable() };
+
+    let mut state = state.lock();
+    state.enabled = false;
+    state.last_error = None;
+    Ok(())
+}
+
+/// Clears `CR4.VMXE` without changing any other `CR4` bits.
+///
+/// # Safety
+///
+/// The current CPU must be outside VMX operation.
+unsafe fn clear_vmx_enable() {
+    let cr4 = Cr4::read_raw();
+    // SAFETY: The caller guarantees that clearing `CR4.VMXE` is permitted.
+    unsafe { Cr4::write_raw(cr4 & !CR4_VMXE) };
+}
+
+fn read_and_validate_capability(vmx_cr4: u64) -> Result<u32> {
+    const FEATURE_CONTROL_LOCKED: u64 = 1;
+    const FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
+
+    let has_vmx =
+        crate::arch::cpu::cpuid::cpuid(1, 0).is_some_and(|result| result.ecx & (1 << 5) != 0);
+    if !has_vmx {
         return Err(Error::NotEnoughResources);
     }
 
-    if let Err(err) = vmxon_all_cpus() {
-        error!("hypervisor: failed to enable VMX on all CPUs: {:?}", err);
-        if let Err(rollback_err) = vmxoff_all_cpus() {
-            error!(
-                "hypervisor: failed to roll back partial VMX enablement: {:?}",
-                rollback_err
-            );
-        }
-        return Err(err);
-    }
-
-    info!("VMX initialized successfully");
-    Ok(())
-}
-
-fn vmxon_all_cpus() -> Result<()> {
-    run_vmx_lifecycle_on_all_cpus(vmxon_lifecycle_current_cpu)
-}
-
-fn vmxoff_all_cpus() -> Result<()> {
-    run_vmx_lifecycle_on_all_cpus(vmxoff_lifecycle_current_cpu)
-}
-
-fn run_vmx_lifecycle_on_all_cpus(operation: fn()) -> Result<()> {
-    VMX_LIFECYCLE_ACKS.store(0, Ordering::Release);
-    VMX_LIFECYCLE_ERRORS.store(0, Ordering::Release);
-
-    let targets = crate::cpu::CpuSet::new_full();
-    let cpu_count = crate::cpu::num_cpus();
-    crate::smp::inter_processor_call(&targets, operation);
-
-    while VMX_LIFECYCLE_ACKS.load(Ordering::Acquire) < cpu_count {
-        core::hint::spin_loop();
-    }
-
-    if VMX_LIFECYCLE_ERRORS.load(Ordering::Acquire) != 0 {
-        return Err(Error::InvalidArgs);
-    }
-    Ok(())
-}
-
-fn vmxon_lifecycle_current_cpu() {
-    enable_vmx_in_cr4();
-    if vmxon_current_cpu().is_err() {
-        VMX_LIFECYCLE_ERRORS.fetch_add(1, Ordering::AcqRel);
-    }
-    VMX_LIFECYCLE_ACKS.fetch_add(1, Ordering::AcqRel);
-}
-
-fn vmxoff_lifecycle_current_cpu() {
-    let result = clear_all_active_vmcs_on_current_cpu().and_then(|_| vmxoff_current_cpu());
-    if result.is_err() {
-        VMX_LIFECYCLE_ERRORS.fetch_add(1, Ordering::AcqRel);
-    }
-    VMX_LIFECYCLE_ACKS.fetch_add(1, Ordering::AcqRel);
-}
-
-fn enable_vmx_in_cr4() {
-    const CR4_VMXE: u64 = 1 << 13;
-
-    // SAFETY: VMXON requires CR4.VMXE on the current CPU. This only sets that
-    // architectural enable bit and preserves all other CR4 bits.
-    unsafe {
-        let mut cr4: u64;
-        core::arch::asm!(
-            "mov {}, cr4",
-            out(reg) cr4,
-            options(nomem, nostack)
-        );
-        cr4 |= CR4_VMXE;
-        core::arch::asm!(
-            "mov cr4, {}",
-            in(reg) cr4,
-            options(nostack)
-        );
-    }
-}
-
-fn vmxon_current_cpu() -> Result<()> {
-    let preempt_guard = crate::task::disable_preempt();
-    let cpu = u32::from(PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
-    if VMXON_REGIONS.lock().contains_key(&cpu) {
-        return Ok(());
-    }
-
-    let vmxon_region = alloc_vmcs()?;
-    let vmxon_region_paddr = vmxon_region.paddr();
-    // SAFETY: The VMXON region is page-sized, aligned, initialized with the
-    // current VMCS revision ID, and kept alive in `VMXON_REGIONS` until VMXOFF.
-    unsafe {
-        instructions::vmxon(vmxon_region_paddr)?;
-    }
-
-    let old_region = VMXON_REGIONS.lock().insert(cpu, vmxon_region);
-    debug_assert!(old_region.is_none());
-    Ok(())
-}
-
-fn vmxoff_current_cpu() -> Result<()> {
-    let cpu = {
-        let preempt_guard = crate::task::disable_preempt();
-        let cpu = u32::from(PinCurrentCpu::current_cpu(&preempt_guard)) as usize;
-        if !VMXON_REGIONS.lock().contains_key(&cpu) {
-            return Ok(());
-        }
-
-        instructions::vmxoff()?;
-        cpu
+    // SAFETY: A CPU that enumerates VMX provides the architectural VMX MSRs
+    // read below. This function runs independently on each target CPU.
+    let (feature_control, vmx_basic, cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1) = unsafe {
+        (
+            rdmsr(IA32_FEATURE_CONTROL),
+            rdmsr(IA32_VMX_BASIC),
+            rdmsr(IA32_VMX_CR0_FIXED0),
+            rdmsr(IA32_VMX_CR0_FIXED1),
+            rdmsr(IA32_VMX_CR4_FIXED0),
+            rdmsr(IA32_VMX_CR4_FIXED1),
+        )
     };
 
-    let _vmxon_region = VMXON_REGIONS.lock().remove(&cpu);
-    Ok(())
+    let required_feature_control = FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_VMX_OUTSIDE_SMX;
+    if feature_control & required_feature_control != required_feature_control {
+        return Err(Error::AccessDenied);
+    }
+
+    if !control_register_is_valid(Cr0::read_raw(), cr0_fixed0, cr0_fixed1)
+        || !control_register_is_valid(vmx_cr4, cr4_fixed0, cr4_fixed1)
+    {
+        return Err(Error::NotEnoughResources);
+    }
+
+    Ok(vmx_basic as u32 & 0x7fff_ffff)
+}
+
+fn control_register_is_valid(value: u64, fixed0: u64, fixed1: u64) -> bool {
+    value & fixed0 == fixed0 && value & !fixed1 == 0
+}
+
+fn initialize_vmxon_region(region_paddr: Paddr, revision_id: u32) {
+    let region_ptr = paddr_to_vaddr(region_paddr) as *mut u32;
+
+    // SAFETY: `region_paddr` belongs to the live, exclusively owned frame in
+    // the current CPU state. The frame is linearly mapped, page-aligned, and
+    // was zero-initialized before this four-byte write.
+    unsafe { region_ptr.write(revision_id) };
 }
 
 #[cfg(ktest)]
@@ -465,10 +631,10 @@ pub(super) mod test_support {
     }
 
     pub(in crate::arch::vm) fn vmxon_current_cpu() -> Result<()> {
-        super::vmxon_current_cpu()
+        super::try_enable_vmx_on_current_cpu()
     }
 
     pub(in crate::arch::vm) fn vmxoff_current_cpu() -> Result<()> {
-        super::vmxoff_current_cpu()
+        super::try_disable_vmx_on_current_cpu()
     }
 }
