@@ -80,17 +80,13 @@ impl VcpuFile {
             vcpu,
             run_page,
             pending_operation: Mutex::new(None),
-            common: FileCommon::new(pseudo_path, StatusFlags::empty()),
+            common: FileCommon::new(pseudo_path, AccessMode::O_RDWR, StatusFlags::empty()),
             compat_state: Mutex::new(VcpuCompatState::default()),
         })
     }
 }
 
 impl FileLike for VcpuFile {
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::O_RDWR
-    }
-
     fn read(&self, _writer: &mut VmWriter) -> Result<usize> {
         return_errno_with_message!(Errno::EINVAL, "cannot read from VCPU file");
     }

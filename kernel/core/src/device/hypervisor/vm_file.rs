@@ -9,6 +9,7 @@ use ostd::{
 
 use super::{ioctl::*, vcpu_file::VcpuFile, vm::Vm};
 use crate::{
+    events::KernelEventFile,
     fs::{
         file::{
             AccessMode, FileCommon, FileLike, StatusFlags,
@@ -17,7 +18,6 @@ use crate::{
         pseudofs::AnonInodeFs,
     },
     prelude::*,
-    syscall::eventfd::EventFile,
     util::ioctl::{RawIoctl, dispatch_ioctl},
     vm::vmar::{PageFaultInfo, Vmar},
 };
@@ -38,7 +38,7 @@ impl VmFile {
         let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[hypervisor-vm]".to_string());
         Self {
             vm,
-            common: FileCommon::new(pseudo_path, StatusFlags::empty()),
+            common: FileCommon::new(pseudo_path, AccessMode::O_RDWR, StatusFlags::empty()),
         }
     }
 
@@ -81,15 +81,13 @@ impl VmFile {
         Ok(())
     }
 
-    fn get_eventfd(&self, raw_fd: i32) -> Result<Arc<EventFile>> {
+    fn get_eventfd(&self, raw_fd: i32) -> Result<Arc<KernelEventFile>> {
         let fd = FileDesc::try_from(raw_fd)?;
         let current = Task::current().unwrap();
         let thread_local = current.as_thread_local().unwrap();
         let mut file_table = thread_local.borrow_file_table_mut();
         let file = get_file_fast!(&mut file_table, fd).into_owned();
-        let file: Arc<dyn Any + Send + Sync> = file;
-        file.downcast::<EventFile>()
-            .map_err(|_| Error::with_message(Errno::EINVAL, "file descriptor is not an eventfd"))
+        KernelEventFile::from_file(file.as_ref())
     }
 }
 
@@ -117,10 +115,6 @@ fn validate_user_memory_region(
 }
 
 impl FileLike for VmFile {
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::O_RDWR
-    }
-
     fn read(&self, _writer: &mut VmWriter) -> Result<usize> {
         return_errno_with_message!(Errno::EINVAL, "cannot read from VM file");
     }
