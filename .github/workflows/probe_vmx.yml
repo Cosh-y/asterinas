@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: Probe VMX environment
+
+on:
+  push:
+    branches:
+      - ci/vmx-environment-probe-20260905
+    paths:
+      - .github/workflows/probe_vmx.yml
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The project container shares this runner's kernel and CPU capabilities.
+      - name: Inspect runner CPU
+        run: |
+          uname -a
+          lscpu
+
+      - name: Inspect KVM device and modules
+        run: |
+          ls -l /dev/kvm || true
+          lsmod | awk 'NR == 1 || $1 ~ /^kvm/'
+
+      - name: Inspect nested virtualization settings
+        run: |
+          for module in kvm_intel kvm_amd; do
+            parameter="/sys/module/$module/parameters/nested"
+            if [[ -e "$parameter" ]]; then
+              printf '%s: ' "$parameter"
+              sudo cat "$parameter"
+            else
+              printf '%s: unavailable\n' "$parameter"
+            fi
+          done
