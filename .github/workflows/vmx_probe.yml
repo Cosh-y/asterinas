@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: VMX probe
+
+on:
+  push:
+    branches:
+      - ci/vmx-probe
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Inspect CPU
+        run: lscpu
+
+      - name: Inspect KVM
+        run: |
+          ls -l /dev/kvm || true
+          sudo cat /sys/module/kvm_intel/parameters/nested || true
+          sudo cat /sys/module/kvm_amd/parameters/nested || true
