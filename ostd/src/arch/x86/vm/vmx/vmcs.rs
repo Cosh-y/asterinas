@@ -5,15 +5,16 @@ use core::cell::RefCell;
 
 use x86::msr::{IA32_VMX_BASIC, rdmsr};
 
-use super::{VmxGuard, instructions};
+use super::{VmxGuard, context_switch, instructions};
 use crate::{
+    Error,
     cpu::{CpuId, CpuSet, PinCurrentCpu},
     cpu_local,
     irq::{self, DisabledLocalIrqGuard},
     mm::{Frame, FrameAllocOptions, paddr_to_vaddr},
     prelude::*,
     sync::{LocalIrqDisabled, SpinLock},
-    task,
+    task::{self, atomic_mode::AsAtomicModeGuard},
 };
 
 /// A reference-counted VMCS.
@@ -28,16 +29,21 @@ crate::impl_frame_meta_for!(VmcsRegionMeta);
 
 struct VmcsState {
     active_cpu: Option<CpuId>,
+    is_launched: bool,
+    are_fixed_fields_initialized: bool,
 }
 
 impl Vmcs {
     /// Allocates an inactive VMCS.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(in crate::arch::vm) fn new(_vmx_guard: &VmxGuard) -> Result<Self> {
         // SAFETY: `_vmx_guard` guarantees VMX support on every CPU.
         let revision_id = unsafe { rdmsr(IA32_VMX_BASIC) } as u32 & 0x7fff_ffff;
         let frame = FrameAllocOptions::new().alloc_frame_with(VmcsRegionMeta {
-            state: SpinLock::new(VmcsState { active_cpu: None }),
+            state: SpinLock::new(VmcsState {
+                active_cpu: None,
+                is_launched: false,
+                are_fixed_fields_initialized: false,
+            }),
         })?;
         // SAFETY: The frame is exclusively owned and has never been activated.
         unsafe { (paddr_to_vaddr(frame.paddr()) as *mut u32).write(revision_id) };
@@ -45,16 +51,34 @@ impl Vmcs {
         Ok(frame)
     }
 
-    /// Makes this VMCS current, clearing it on its previous CPU if necessary.
+    /// Makes this VMCS current and initializes its fixed fields if needed.
+    ///
+    /// Returns whether the fixed fields were initialized.
     ///
     /// # Panics
     ///
     /// Local IRQs must be enabled.
-    #[cfg_attr(not(ktest), expect(dead_code))]
-    pub(in crate::arch::vm) fn load(&self, vmx_guard: &VmxGuard) -> Result<()> {
+    pub(in crate::arch::vm) fn load(&self, vmx_guard: &VmxGuard) -> Result<bool> {
         assert!(crate::arch::irq::is_local_enabled());
-        // SAFETY: `vmcs_state` is the locked state of `vmcs`.
-        unsafe { LocalVmcsState::do_activate(self, &mut self.meta().state.lock(), vmx_guard) }
+        let mut state = self.meta().state.lock();
+        if state.active_cpu != Some(state.as_atomic_mode_guard().current_cpu()) {
+            // Controls and host state depend on the active CPU.
+            state.are_fixed_fields_initialized = false;
+        }
+        // SAFETY: `state` is the locked state of this VMCS.
+        unsafe { LocalVmcsState::do_activate(self, &mut state, vmx_guard) }?;
+
+        if !state.are_fixed_fields_initialized {
+            let irq_guard = irq::disable_local();
+            // SAFETY: `do_activate` made this VMCS current.
+            unsafe {
+                self.setup_fixed_controls(vmx_guard, &irq_guard)?;
+                self.setup_fixed_host(&irq_guard)?;
+            }
+            state.are_fixed_fields_initialized = true;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Clears this VMCS on its active CPU.
@@ -62,7 +86,6 @@ impl Vmcs {
     /// # Panics
     ///
     /// Local IRQs must be enabled.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(in crate::arch::vm) fn deactivate(&self, vmx_guard: &VmxGuard) -> Result<()> {
         assert!(crate::arch::irq::is_local_enabled());
         // SAFETY: `vmcs_state` is the locked state of `vmcs`.
@@ -72,7 +95,6 @@ impl Vmcs {
     /// # Safety
     ///
     /// The VMCS must be current on this CPU.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(in crate::arch::vm) unsafe fn read(
         &self,
         field: u32,
@@ -86,7 +108,6 @@ impl Vmcs {
     ///
     /// 1. The VMCS must be current on this CPU.
     /// 2. The `field` and `value` must not violate the host kernel's state.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(in crate::arch::vm) unsafe fn write(
         &self,
         field: u32,
@@ -95,6 +116,30 @@ impl Vmcs {
     ) -> Result<()> {
         // SAFETY: The caller ensures safety.
         unsafe { instructions::vmwrite(field, value, irq_guard) }
+    }
+
+    /// Enters the guest using this VMCS's hardware launch state.
+    ///
+    /// # Safety
+    ///
+    /// 1. The VMCS must satisfy the guest isolation and host-state requirements
+    ///    of [`context_switch::vcpu_run`].
+    /// 2. Resources referenced by the VMCS must remain alive through the VM exit.
+    /// 3. The caller must restore host MSRs not managed by VMX before allowing
+    ///    interrupts or scheduling on this CPU, including if guest entry fails.
+    pub(in crate::arch::vm) unsafe fn run(
+        &self,
+        regs: &mut crate::arch::vm::VcpuRegs,
+        irq_guard: &DisabledLocalIrqGuard,
+    ) -> Result<()> {
+        let is_launched = self.meta().state.lock().is_launched;
+        // SAFETY: The caller ensures safety.
+        let result = unsafe { context_switch::vcpu_run(regs, is_launched, irq_guard) };
+        if result != 0 {
+            return Err(Error::InvalidArgs);
+        }
+        self.meta().state.lock().is_launched = true;
+        Ok(())
     }
 }
 
@@ -151,6 +196,7 @@ impl LocalVmcsState {
                 // 2. The VMCS region is initialized. `previous_cpu` is `None` means
                 //    this VMCS has not been active on any CPU before.
                 unsafe { instructions::vmclear(vmcs.paddr(), &irq_guard) }?;
+                vmcs_state.is_launched = false;
             }
             local.active.insert(vmcs.paddr(), vmcs.clone());
         }
@@ -195,6 +241,7 @@ impl LocalVmcsState {
                     .clear(vmcs.paddr(), &irq_guard)?
             };
             vmcs_state.active_cpu = None;
+            vmcs_state.is_launched = false;
             return Ok(());
         }
 
@@ -220,6 +267,7 @@ impl LocalVmcsState {
         })
         .wait();
         vmcs_state.active_cpu = None;
+        vmcs_state.is_launched = false;
         Ok(())
     }
 
@@ -263,7 +311,9 @@ impl LocalVmcsState {
             // 2. Each active VMCS region is valid, page-aligned, and initialized,
             //    which is currently active on this CPU.
             unsafe { instructions::vmclear(paddr, irq_guard) }?;
-            vmcs.meta().state.lock().active_cpu = None;
+            let mut state = vmcs.meta().state.lock();
+            state.active_cpu = None;
+            state.is_launched = false;
         }
         Ok(())
     }
