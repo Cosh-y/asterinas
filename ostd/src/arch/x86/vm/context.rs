@@ -98,6 +98,10 @@ pub struct VcpuArchState {
     pub sregs: VcpuSregs,
     /// The model-specific registers.
     pub msrs: VcpuMsrs,
+    /// The vCPU can receive maskable hardware interrupt.
+    pub is_interruptable: bool,
+    /// 
+    pub request_interrupt_window: bool,
     /// An external interrupt awaiting injection by OSTD.
     pub pending_interrupt: Option<GuestInterrupt>,
     /// The guest TSC deadline for returning from guest execution.

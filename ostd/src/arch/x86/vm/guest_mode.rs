@@ -52,6 +52,11 @@ impl ArchGuestMode {
 
         let mut irq_guard = None;
         let current_vmcs = vmcs.load(&self.vmx_guard, &mut irq_guard)?;
+
+        let rflags = arch.regs.rflags;
+        let blocking = current_vmcs.read(guest::INTERRUPTIBILITY_STATE)?;
+        arch.is_interruptable = rflags & (1 << 9) != 0 && blocking & 3 == 0;
+
         hooks.pre_guest_run(arch, current_vmcs.irq_guard());
         let result = current_vmcs.run_guest(arch, guest_mem, &self.vmx_guard);
         hooks.post_guest_run(arch, current_vmcs.irq_guard());
@@ -80,7 +85,7 @@ impl CurrentVmcs<'_> {
         // SAFETY: The borrowed `guest_mem` ensures EPT isolation and frame lifetimes.
         unsafe { self.sync_controls(guest_mem.eptp(), arch.sregs.efer) }?;
         self.load_guest_context(arch, vmx_guard)?;
-        let is_interrupt_armed = self.prepare_events(arch)?;
+        let has_interrupt_injected = self.prepare_events(arch)?;
         self.sync_host()?;
 
         let kernel_gs_base_restorer = KernelGsBaseRestorer::new(self.irq_guard());
@@ -98,9 +103,12 @@ impl CurrentVmcs<'_> {
         drop(syscall_msrs_restorer);
         drop(kernel_gs_base_restorer);
 
-        if is_interrupt_armed {
+        // TODO: Check if the interrupt was injected successfully.
+        // has_interrupt_injected && injected_successfully
+        if has_interrupt_injected {
             arch.pending_interrupt = None;
         }
+
         self.save_guest_context(arch)?;
         Ok(exit)
     }
@@ -118,23 +126,8 @@ impl CurrentVmcs<'_> {
         // SAFETY: This only bounds guest execution.
         unsafe { self.write(guest::VMX_PREEMPTION_TIMER_VALUE, timer_count as usize) }?;
 
-        let interrupt = if let Some(interrupt) = arch.pending_interrupt {
-            if interrupt.vector < 32 {
-                return Err(Error::InvalidArgs);
-            }
-            let rflags = self.read(guest::RFLAGS)?;
-            let blocking = self.read(guest::INTERRUPTIBILITY_STATE)?;
-            if rflags & (1 << 9) == 0 || blocking & 3 != 0 {
-                None
-            } else {
-                Some(interrupt)
-            }
-        } else {
-            None
-        };
-
         let mut primary = self.read(control::PRIMARY_PROCBASED_EXEC_CONTROLS)?;
-        if arch.pending_interrupt.is_some() && interrupt.is_none() {
+        if arch.request_interrupt_window {
             primary |= control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits() as usize;
         } else {
             primary &= !(control::PrimaryControls::INTERRUPT_WINDOW_EXITING.bits() as usize);
@@ -142,11 +135,15 @@ impl CurrentVmcs<'_> {
         // SAFETY: This only enables exits when the guest can accept an interrupt.
         unsafe { self.write(control::PRIMARY_PROCBASED_EXEC_CONTROLS, primary) }?;
 
-        let vector = interrupt.map_or(0, |interrupt| (1 << 31) | usize::from(interrupt.vector));
+        let vector = if arch.pending_interrupt.is_some() && arch.is_interruptable {
+            (1 << 31) | usize::from(arch.pending_interrupt.unwrap().vector)
+        } else {
+            0
+        };
         // SAFETY: This only provides details about the event to be injected into the guest.
         unsafe { self.write(control::VMENTRY_INTERRUPTION_INFO_FIELD, vector) }?;
-
-        Ok(interrupt.is_some())
+        
+        Ok(vector != 0)
     }
 }
 

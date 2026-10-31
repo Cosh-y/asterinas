@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{vcpu::Vcpu, vm_memory::VmMemory};
+use super::{
+    arch::vm::VmArch,
+    vcpu::Vcpu,
+    vm_memory::VmMemory
+};
 use crate::prelude::*;
 
 pub(crate) struct Vm {
     _id: u32,
     memory: VmMemory,
     vcpus: Mutex<BTreeMap<u32, Weak<Vcpu>>>,
+    // gsi_routing: Mutex<>,
+    arch: VmArch,
 }
 
 impl Vm {
@@ -16,6 +22,10 @@ impl Vm {
             memory: VmMemory::new()?,
             vcpus: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    pub(super) fn arch(&self) -> &VmArch {
+        &self.arch
     }
 
     pub(crate) fn create_vcpu(self: &Arc<Self>, vcpu_id: u32) -> Result<Arc<Vcpu>> {
@@ -32,5 +42,9 @@ impl Vm {
 
     pub(crate) fn memory(&self) -> &VmMemory {
         &self.memory
+    }
+
+    pub(super) fn vcpus(&self) -> MutexGuard<'_, BTreeMap<u32, Weak<Vcpu>>> {
+        self.vcpus.lock()
     }
 }

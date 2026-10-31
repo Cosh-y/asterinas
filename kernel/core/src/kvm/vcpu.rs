@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use ostd::{
-    arch::vm::GuestContext,
-    vm::{GuestMode, GuestModeHooks, GuestReturnReason},
+    arch::vm::GuestContext, cpu::{CpuId, CpuSet}, smp::inter_processor_call, sync::WaitQueue, vm::{GuestMode, GuestModeHooks, GuestReturnReason},
 };
 
 use crate::{
     device::hypervisor::ioctl,
-    kvm::{arch::vcpu::PendingIo, run_page::KvmRunPage, vm::Vm},
+    kvm::{
+        arch::vcpu::{
+            PendingIo,
+            VcpuArch,
+        },
+        run_page::KvmRunPage,
+        vm::Vm
+    },
     prelude::*,
 };
 
 pub(crate) struct Vcpu {
     _id: u32,
     vm: Weak<Vm>,
-    state: Mutex<VcpuState>,
-}
-
-pub(super) struct VcpuState {
-    pub guest_context: GuestContext,
-    pub pending_io: Option<PendingIo>,
+    arch: VcpuArch,
+    cpu: SpinLock<Option<CpuId>>,
+    wait_queue: WaitQueue,
 }
 
 impl Vcpu {
@@ -31,11 +34,21 @@ impl Vcpu {
                 guest_context: Self::new_guest_context()?,
                 pending_io: None,
             }),
+            cpu: SpinLock::new(None),
+            wait_queue: WaitQueue::new(),
         }))
     }
 
-    pub(super) fn state(&self) -> MutexGuard<'_, VcpuState> {
-        self.state.lock()
+    pub(super) fn arch(&self) -> &VcpuArch {
+        &self.arch
+    }
+
+    pub(super) fn cpu(&self) -> SpinLockGuard<'_, Option<CpuId>> {
+        self.cpu.lock()
+    }
+
+    pub(super) fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
     }
 
     pub(super) fn vm(&self) -> Arc<Vm> {
@@ -78,6 +91,20 @@ impl Vcpu {
             if self.handle_exit(&mut state, exit_info, run_page)? {
                 return Ok(());
             }
+        }
+    }
+
+    pub(super) fn notify(&self) {
+        self.wait_queue.wake_one();
+
+        let cpu = { *self.cpu.lock() };
+
+        if let Some(cpu) = cpu {
+            let mut targets = CpuSet::new_empty();
+            targets.add(cpu);
+
+            let kick_ipi = || {};
+            let _ = inter_processor_call(&targets, kick_ipi);
         }
     }
 }

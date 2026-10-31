@@ -2,13 +2,14 @@
 
 use ostd::{
     arch::vm::{
-        GuestContext, GuestExitInfo, VcpuArchState, VcpuMsrs, VcpuRegs, VcpuSregs, VmxExitReason,
-    },
-    irq::DisabledLocalIrqGuard,
-    vm::GuestModeHooks,
+        GuestContext, GuestExitInfo, GuestInterrupt, GuestTimerInstant, VcpuArchState, VcpuMsrs, VcpuRegs, VcpuSregs, VmxExitReason,
+    }, irq::DisabledLocalIrqGuard, vm::GuestModeHooks,
 };
 
-use super::ioctl::{GetRegs, GetSregs, KvmRegs, KvmSregs, SetRegs, SetSregs};
+use super::{
+    ioctl::{GetRegs, GetSregs, KvmRegs, KvmSregs, SetRegs, SetSregs},
+    apic::Lapic,
+};
 use crate::{
     device::hypervisor::ioctl,
     dispatch_ioctl,
@@ -20,6 +21,32 @@ use crate::{
     process::{posix_thread::AsPosixThread, signal::HandlePendingSignal},
     util::ioctl::RawIoctl,
 };
+
+pub(in crate::kvm) struct VcpuArch {
+    state: Mutex<VcpuState>,
+
+    // lapic, 内部处理同步访问
+    lapic: Lapic,
+
+    tsc_offset: u64,
+}
+
+impl VcpuArch {
+    pub(in crate::kvm) fn new() -> Self {
+        Self {
+
+        }
+    }
+
+    pub(super) fn lapic(&self) -> &Lapic {
+        &self.lapic
+    }
+}
+
+struct VcpuState {
+    pub guest_context: GuestContext,
+    pub pending_io: Option<PendingIo>,
+}
 
 pub(in crate::kvm) struct PendingIo {
     rip: usize,
@@ -55,6 +82,7 @@ impl Vcpu {
                 *self.state().guest_context.sregs_mut() = sregs.into();
                 Ok(0)
             }
+            
             _ => {
                 return_errno_with_message!(Errno::ENOTTY, "unsupported vCPU ioctl")
             }
@@ -115,6 +143,7 @@ impl Vcpu {
                 Ok(true)
             }
             Ok(VmxExitReason::EPT_VIOLATION) => {
+                // MMIO 处理
                 self.vm()
                     .memory()
                     .handle_page_fault(exit_info.guest_phys_addr)?;
@@ -127,11 +156,56 @@ impl Vcpu {
                     .rip
                     .checked_add(exit_info.instruction_len as usize)
                     .ok_or_else(|| Error::new(Errno::EOVERFLOW))?;
-                run_page.write_run_val(ioctl::KVM_RUN_EXIT_REASON_OFFSET, &ioctl::KVM_EXIT_HLT)?;
+                // run_page.write_run_val(ioctl::KVM_RUN_EXIT_REASON_OFFSET, &ioctl::KVM_EXIT_HLT)?;
                 state.guest_context.regs_mut().rip = rip;
-                Ok(true)
+
+                // 这里应该判断 guest 是否设置了 lapic timer
+                // 如果是应该设置定时器，到期时向 Lapic 注入时钟中断并调用 vcpu.notify
+
+                // 唤醒的条件
+                // 1. signal: pause_until 自动保证
+                // 2. guest interrupt: 新的中断进入 LAPIC IRR 并且能进入 ISR
+                self.wait_queue().pause_until(|| {
+                    self.arch().lapic.quiry_irq()
+                })?;
+
+                // Ok(true)
+                Ok(false)
             }
-            Ok(VmxExitReason::PREEMPTION_TIMER) => Ok(false),
+            Ok(VmxExitReason::MSR_READ) => {
+                let regs = state.guest_context.regs_mut();
+                let msr = regs.rcx as u32;
+                let value = match msr {
+                    // IA32_APIC_BASE
+                    0x1B => ,
+                    0x800..=0x8FF => {
+                        self.arch().lapic.emulate_msr_read(msr, self.guest_tsc())?
+                    }
+                };
+                regs.rax = value as u32 as usize;
+                regs.rdx = (value >> 32) as u32 as usize;
+                Ok(false)
+            }
+            Ok(VmxExitReason::MSR_WRITE) => {
+                let regs = state.guest_context.regs();
+                let msr = regs.rcx as u32;
+                let value = ((regs.rdx as u32 as u64) << 32)
+                    | (regs.rax as u32 as u64);
+                match msr {
+                    // IA32_APIC_BASE
+                    0x1B => ,
+                    0x800..=0x8FF => {
+                        self.arch().lapic.emulate_msr_write(msr, value, self.guest_tsc())?;
+                    }
+                }
+                Ok(false)
+            }
+            Ok(VmxExitReason::PREEMPTION_TIMER) => {
+                // 判断定时器是否到时
+                // 设置时钟中断
+
+                Ok(false)
+            },
             _ => return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported VM exit"),
         }
     }
@@ -144,12 +218,48 @@ impl Vcpu {
             }
         }
     }
+
+    pub(super) fn guest_tsc(&self) -> u64 {
+        ostd::arch::read_tsc() + self.arch().tsc_offset
+    }
 }
 
 impl GuestModeHooks for Vcpu {
-    fn pre_guest_run(&self, _state: &mut VcpuArchState, _guard: &DisabledLocalIrqGuard) {}
+    fn pre_guest_run(&self, state: &mut VcpuArchState, guard: &DisabledLocalIrqGuard) {
+        *self.cpu() = Some(guard.current_cpu());
+        // Prepare VMX preempt timer.
+        let cur_guest_tsc = self.guest_tsc();
+        self.arch().lapic.process_timer_expire(cur_guest_tsc);
 
-    fn post_guest_run(&self, _state: &mut VcpuArchState, _guard: &DisabledLocalIrqGuard) {}
+        state.timer_deadline = self.arch().lapic.timer()
+            .quiry_deadline_tsc()
+            .map(|tsc| GuestTimerInstant { tsc });
+
+        // Prepare interrupt injection.
+        state.request_interrupt_window = false;
+
+        if state.pending_interrupt.is_some() {
+            state.request_interrupt_window = !state.is_interruptable;
+            return;
+        }
+        
+        if state.is_interruptable {
+            let vector = self.arch().lapic.inject_irq();
+            if let Some(vector) = vector {
+                state.pending_interrupt = Some(GuestInterrupt { vector });
+            }
+        } else {
+            state.request_interrupt_window = self.arch().lapic.quiry_irq().is_some();
+        }
+    }
+
+    fn post_guest_run(&self, _state: &mut VcpuArchState, _guard: &DisabledLocalIrqGuard) {
+        *self.cpu() = None;
+
+        // // 检查是否要注入时钟中断，如果是，通过 lapic 注入
+        // let cur_guest_tsc = self.guest_tsc();
+        // self.arch().lapic.process_timer_expire(cur_guest_tsc);
+    }
 
     fn has_kernel_event(&self) -> bool {
         current_thread!().as_posix_thread().unwrap().has_pending()
