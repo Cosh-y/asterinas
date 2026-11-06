@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use ostd::{
-    arch::vm::GuestContext,
-    vm::{GuestMode, GuestModeHooks, GuestReturnReason},
+    arch::vm::GuestContext, cpu::{CpuId, CpuSet}, smp::inter_processor_call, sync::WaitQueue, vm::{GuestMode, GuestModeHooks, GuestReturnReason},
 };
 
 use crate::{
-    device::hypervisor::ioctl,
-    kvm::{arch::vcpu::PendingIo, run_page::KvmRunPage, vm::Vm},
+    device::kvm::ioctl,
+    kvm::{
+        arch::vcpu::{
+            PendingIo,
+            VcpuArch,
+        },
+        run_page::KvmRunPage,
+        vm::Vm
+    },
     prelude::*,
 };
 
 pub(crate) struct Vcpu {
     _id: u32,
     vm: Weak<Vm>,
-    state: Mutex<VcpuState>,
-}
-
-pub(super) struct VcpuState {
-    pub guest_context: GuestContext,
-    pub pending_io: Option<PendingIo>,
+    arch: VcpuArch,
+    cpu: SpinLock<Option<CpuId>>,
+    wait_queue: WaitQueue,
 }
 
 impl Vcpu {
@@ -27,15 +30,22 @@ impl Vcpu {
         Ok(Arc::new(Self {
             _id: id,
             vm: Arc::downgrade(vm),
-            state: Mutex::new(VcpuState {
-                guest_context: Self::new_guest_context()?,
-                pending_io: None,
-            }),
+            arch: VcpuArch::new(id)?,
+            cpu: SpinLock::new(None),
+            wait_queue: WaitQueue::new(),
         }))
     }
 
-    pub(super) fn state(&self) -> MutexGuard<'_, VcpuState> {
-        self.state.lock()
+    pub(super) fn arch(&self) -> &VcpuArch {
+        &self.arch
+    }
+
+    pub(super) fn cpu(&self) -> SpinLockGuard<'_, Option<CpuId>> {
+        self.cpu.lock()
+    }
+
+    pub(super) fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
     }
 
     pub(super) fn vm(&self) -> Arc<Vm> {
@@ -43,14 +53,19 @@ impl Vcpu {
     }
 
     pub(crate) fn run(&self, run_page: &KvmRunPage) -> Result<()> {
-        let mut state = self.state();
+        let mut state = self.arch().state();
 
-        self.finish_pending(&mut state);
+        if !self.finish_pending(&mut state, run_page)? {
+            return Ok(())
+        }
 
         // Handle immediate exit.
         if run_page.read_run_val::<u8>(ioctl::KVM_RUN_IMMEDIATE_EXIT_OFFSET)? != 0 {
             return_errno!(Errno::EINTR);
         }
+
+        // Wait until vCPU is runnable.
+        self.wait_runnable(&mut state)?;
 
         let guest_mode = GuestMode::new()?;
         let vm = self.vm();
@@ -78,6 +93,20 @@ impl Vcpu {
             if self.handle_exit(&mut state, exit_info, run_page)? {
                 return Ok(());
             }
+        }
+    }
+
+    pub(super) fn notify(&self) {
+        self.wait_queue.wake_one();
+
+        let cpu = { *self.cpu.lock() };
+
+        if let Some(cpu) = cpu {
+            let mut targets = CpuSet::new_empty();
+            targets.add(cpu);
+
+            let kick_ipi = || {};
+            let _ = inter_processor_call(&targets, kick_ipi);
         }
     }
 }

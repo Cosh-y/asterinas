@@ -2,24 +2,25 @@
 
 //! The x86 KVM ioctl definitions and register layouts.
 
-use ostd::arch::vm::{VcpuDescTable, VcpuRegs, VcpuSegment, VcpuSregs};
+use ostd::{arch::vm::{VcpuDescTable, VcpuRegs, VcpuSegment, VcpuSregs}, task::Task};
 
 use crate::{
-    ioc,
-    prelude::*,
-    util::ioctl::{InData, NoData, OutData},
+    ioc, prelude::*, util::ioctl::{InData, NoData, OutData, RawIoctl},
 };
 
 const KVM_INTERRUPT_BITMAP_WORDS: usize = 4;
 
 // VM ioctls.
 pub(super) type SetTssAddr = ioc!(KVM_SET_TSS_ADDR, 0xae, 0x47, NoData);
+pub(super) type IrqLine = ioc!(KVM_IRQ_LINE, 0xae, 0x61, InData<KvmGsiLevel>);
+pub(super) type SetGsiRouting = ioc!(KVM_SET_GSI_ROUTING, 0xae, 0x6a, InData<KvmGsiRouting>);
 
 // VCPU ioctls.
 pub(super) type GetRegs = ioc!(KVM_GET_REGS, 0xae, 0x81, OutData<KvmRegs>);
 pub(super) type SetRegs = ioc!(KVM_SET_REGS, 0xae, 0x82, InData<KvmRegs>);
 pub(super) type GetSregs = ioc!(KVM_GET_SREGS, 0xae, 0x83, OutData<KvmSregs>);
 pub(super) type SetSregs = ioc!(KVM_SET_SREGS, 0xae, 0x84, InData<KvmSregs>);
+pub(super) type Interrupt = ioc!(KVM_INTERRUPT, 0xae, 0x86, InData<u32>);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
@@ -164,4 +165,49 @@ impl From<KvmSregs> for VcpuSregs {
             interrupt_bitmap: sregs.interrupt_bitmap,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod)]
+pub(super) struct KvmGsiLevel {
+    pub gsi: u32,
+    pub level: u32,
+}
+
+pub(super) struct KvmGsiRouting {
+    nr: u32,
+    flags: u32,  // 0, currently.
+    entries: [KvmGsiRoutingEntry; 0],
+}
+
+pub(super) const KVM_IRQ_ROUTING_IRQCHIP: u32 = 1;
+
+pub(super) struct KvmGsiRoutingEntry {
+    pub gsi: u32,    // GSI in KVM_IRQ_LINE
+    pub type_: u32,  // type of `data`, 1 `KVM_IRQ_ROUTING_IRQCHIP` currently.
+    pub flags: u32,  // 0, currently.
+    pub pad: u32,
+    pub data: [u32; 8],
+}
+
+pub(super) fn read_gsi_routing_entries(
+    command: &SetGsiRouting,
+    raw_ioctl: RawIoctl
+) -> Result<Vec<KvmGsiRoutingEntry>> {
+    let routing = command.read()?;
+    let nr = routing.nr;
+    let base_address = raw_ioctl.arg();
+    let offset = size_of::<KvmGsiRouting>();
+    let entries_address = base_address + offset;
+    let entries_len = nr * size_of::<KvmGsiRoutingEntry>();
+
+    let current = Task::current().unwrap();
+    let thread_local = current.as_thread_local().unwrap();
+    let user_space = CurrentUserSpace::new(thread_local);
+    let mut reader = user_space.reader(entries_address, entries_len)?;
+    let mut entries = Vec::with_capacity(nr);
+    for _ in 0..nr {
+        entries.push(reader.read_val()?);
+    }
+    Ok(entries)
 }

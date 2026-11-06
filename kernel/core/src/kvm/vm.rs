@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{vcpu::Vcpu, vm_memory::VmMemory};
+use super::{
+    arch::vm::VmArch,
+    vcpu::Vcpu,
+    vm_memory::VmMemory
+};
 use crate::prelude::*;
 
 pub(crate) struct Vm {
     _id: u32,
     memory: VmMemory,
     vcpus: Mutex<BTreeMap<u32, Weak<Vcpu>>>,
+    arch: VmArch,
 }
 
 impl Vm {
     pub(crate) fn new(id: u32) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+        let memory = VmMemory::new()?;
+
+        Ok(Arc::new_cyclic(move |vm| Self {
             _id: id,
-            memory: VmMemory::new()?,
+            memory,
             vcpus: Mutex::new(BTreeMap::new()),
+            arch: VmArch::new(vm.clone()),
         }))
+    }
+
+    pub(super) fn arch(&self) -> &VmArch {
+        &self.arch
     }
 
     pub(crate) fn create_vcpu(self: &Arc<Self>, vcpu_id: u32) -> Result<Arc<Vcpu>> {
@@ -32,5 +44,9 @@ impl Vm {
 
     pub(crate) fn memory(&self) -> &VmMemory {
         &self.memory
+    }
+
+    pub(super) fn vcpus(&self) -> MutexGuard<'_, BTreeMap<u32, Weak<Vcpu>>> {
+        self.vcpus.lock()
     }
 }
