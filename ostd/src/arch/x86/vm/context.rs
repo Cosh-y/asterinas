@@ -35,7 +35,11 @@ impl GuestContext {
                 regs,
                 sregs,
                 msrs,
+                is_interruptable: false,
+                request_interrupt_window: false,
+                clear_interrupt_block: false,
                 pending_interrupt: None,
+                tsc_offset: 0,
                 timer_deadline: None,
             },
             vmcs: Vmcs::new(&vmx_guard)?,
@@ -73,6 +77,20 @@ impl GuestContext {
         &mut self.arch.msrs
     }
 
+    pub fn get_tsc_offset(&self) -> u64 {
+        self.arch.tsc_offset
+    }
+
+    /// 
+    pub fn set_tsc_offset(&mut self, tsc_offset: u64) {
+        self.arch.tsc_offset = tsc_offset;
+    }
+
+    ///
+    pub fn clear_interrupt_block(&mut self) {
+        self.arch.clear_interrupt_block = true;
+    }
+
     /// Returns the mutable architectural state and the associated VMCS.
     pub(super) fn arch_and_vmcs(&mut self) -> (&mut VcpuArchState, &Vmcs) {
         (&mut self.arch, &self.vmcs)
@@ -98,8 +116,16 @@ pub struct VcpuArchState {
     pub sregs: VcpuSregs,
     /// The model-specific registers.
     pub msrs: VcpuMsrs,
+    /// The vCPU can receive maskable hardware interrupt.
+    pub is_interruptable: bool,
+    /// A VM exit should be triggered on next interrupt window.
+    pub request_interrupt_window: bool,
+    ///
+    pub clear_interrupt_block: bool,
     /// An external interrupt awaiting injection by OSTD.
     pub pending_interrupt: Option<GuestInterrupt>,
+    /// 
+    pub tsc_offset: u64,
     /// The guest TSC deadline for returning from guest execution.
     pub timer_deadline: Option<GuestTimerInstant>,
 }

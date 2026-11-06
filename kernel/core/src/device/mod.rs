@@ -3,7 +3,7 @@
 mod evdev;
 mod fb;
 #[cfg(target_arch = "x86_64")]
-pub(crate) mod hypervisor;
+pub(crate) mod kvm;
 mod mem;
 pub(crate) mod misc;
 mod model;
@@ -69,7 +69,7 @@ pub(crate) fn init_in_first_kthread() {
 pub(crate) fn init_in_first_process() -> Result<()> {
     tty::init_in_first_process()?;
     #[cfg(target_arch = "x86_64")]
-    hypervisor::init_in_first_process()?;
+    kvm::init_in_first_process()?;
     registry::init_in_first_process()?;
 
     Ok(())

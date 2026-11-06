@@ -6,4 +6,4 @@ pub(crate) mod vm;
 mod vm_memory;
 
 #[cfg_attr(target_arch = "x86_64", path = "arch/x86/mod.rs")]
-mod arch;
+pub mod arch;

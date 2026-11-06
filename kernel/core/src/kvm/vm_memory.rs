@@ -118,7 +118,11 @@ impl VmMemory {
         Ok(())
     }
 
-    pub(super) fn handle_page_fault(&self, guest_phys_addr: Gpaddr) -> Result<()> {
+    /// Lazy maps a guest physical page to the corresponding userspace page.
+    /// 
+    /// Returns `Ok(true)` if the page was mapped, or `Ok(false)` if the address is outside
+    /// the configured guest memory slots.
+    pub(super) fn handle_page_fault(&self, guest_phys_addr: Gpaddr) -> Result<bool> {
         let guest_start = guest_phys_addr.align_down(PAGE_SIZE);
 
         let slots = self.slots.lock();
@@ -126,7 +130,7 @@ impl VmMemory {
             .values()
             .find(|slot| slot.guest_range.contains(&guest_start))
         else {
-            return_errno_with_message!(Errno::EFAULT, "guest address is outside memory slots");
+            return Ok(false);
         };
 
         let hva = slot.vaddr(guest_start);
@@ -169,6 +173,21 @@ impl VmMemory {
                 PageProperty::new_guest(PageFlags::RWX, CachePolicy::Writeback),
             );
         }
-        Ok(())
+        Ok(true)
+    }
+
+    pub(super) fn read_val<T: Pod>(&self, guest_phys_addr: Gpaddr) -> Result<T> {
+        let vaddr = self
+            .slots
+            .lock()
+            .iter()
+            .find(|(_, slot)| slot.guest_range.contains(&guest_phys_addr))
+            .map(|(_, slot)| slot.vaddr(guest_phys_addr))
+            .unwrap();
+        let current = Task::current().unwrap();
+        let thread_local = current.as_thread_local().unwrap();
+        let user_space = CurrentUserSpace::new(thread_local);
+        let mut reader = user_space.reader(vaddr, size_of::<T>())?;
+        reader.read_val::<T>()
     }
 }

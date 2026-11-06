@@ -15,7 +15,10 @@ use crate::{
         file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
         vfs::{inode::FileOps, path::Path},
     },
-    kvm::vm::Vm,
+    kvm::{
+        arch::system,
+        vm::Vm
+    },
     prelude::*,
     process::signal::{PollHandle, Pollable},
     util::ioctl::RawIoctl,
@@ -86,7 +89,7 @@ impl PerOpenFileOps for KvmDeviceFile {
                 Ok(KVM_RUN_MMAP_SIZE as i32)
             }
             _ => {
-                return_errno_with_message!(Errno::ENOTTY, "unsupported KVM ioctl")
+                system::ioctl(raw_ioctl)
             }
         })
     }

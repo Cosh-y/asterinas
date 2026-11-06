@@ -70,7 +70,8 @@ pub(super) const VMCS_CONTROLS: [VmcsControl; 5] = [
             | PrimaryControls::CR8_STORE_EXITING.bits()
             | PrimaryControls::MOV_DR_EXITING.bits()
             | PrimaryControls::UNCOND_IO_EXITING.bits()
-            | PrimaryControls::SECONDARY_CONTROLS.bits(),
+            | PrimaryControls::SECONDARY_CONTROLS.bits()
+            | PrimaryControls::USE_TSC_OFFSETTING.bits(),
         forbidden_bits: PrimaryControls::CR3_LOAD_EXITING.bits()
             | PrimaryControls::CR3_STORE_EXITING.bits(),
         runtime_bits: 0,
@@ -271,6 +272,7 @@ impl CurrentVmcs<'_> {
                 [guest::IA32_SYSENTER_CS, arch.msrs.sysenter_cs],
                 [guest::IA32_SYSENTER_ESP, arch.msrs.sysenter_esp],
                 [guest::IA32_SYSENTER_EIP, arch.msrs.sysenter_eip],
+                [control::TSC_OFFSET_FULL, arch.tsc_offset],
 
                 // HLT exits are handled in software, so every explicit entry is active.
                 [guest::ACTIVITY_STATE, 0],
