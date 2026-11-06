@@ -36,11 +36,19 @@ pub(crate) const KVM_RUN_IO_SIZE_OFFSET: usize = 33;
 pub(crate) const KVM_RUN_IO_PORT_OFFSET: usize = 34;
 pub(crate) const KVM_RUN_IO_COUNT_OFFSET: usize = 36;
 pub(crate) const KVM_RUN_IO_DATA_OFFSET_OFFSET: usize = 40;
+pub(crate) const KVM_RUN_MMIO_PHYS_ADDR_OFFSET: usize = 32;
+pub(crate) const KVM_RUN_MMIO_DATA_OFFSET: usize = 40;
+pub(crate) const KVM_RUN_MMIO_LEN_OFFSET: usize = 48;
+pub(crate) const KVM_RUN_MMIO_IS_WRITE_OFFSET: usize = 52;
+
 
 // Exit reasons for `KVM_RUN`.
 pub(crate) const KVM_EXIT_IO: u32 = 2;
 pub(crate) const KVM_EXIT_HLT: u32 = 5;
+pub(crate) const KVM_EXIT_MMIO: u32 = 6;
+
 pub(crate) const KVM_EXIT_IO_OUT: u8 = 1;
+pub(crate) const KVM_EXIT_IO_IN: u8 = 0;
 
 pub(super) fn check_extension(cap: usize) -> i32 {
     const KVM_CAP_HLT: usize = 1;

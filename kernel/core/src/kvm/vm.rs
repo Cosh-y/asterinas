@@ -1,36 +1,53 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{vcpu::Vcpu, vm_memory::VmMemory};
+use super::{
+    arch::vm::VmArch,
+    vcpu::Vcpu,
+    vm_memory::VmMemory
+};
 use crate::prelude::*;
 
 pub(crate) struct Vm {
     _id: u32,
     memory: VmMemory,
-    vcpus: Mutex<BTreeMap<u32, Weak<Vcpu>>>,
+    vcpus: SpinLock<BTreeMap<u32, Weak<Vcpu>>>,
+    arch: VmArch,
 }
 
 impl Vm {
     pub(crate) fn new(id: u32) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+        let memory = VmMemory::new()?;
+
+        Ok(Arc::new_cyclic(move |vm| Self {
             _id: id,
-            memory: VmMemory::new()?,
-            vcpus: Mutex::new(BTreeMap::new()),
+            memory,
+            vcpus: SpinLock::new(BTreeMap::new()),
+            arch: VmArch::new(vm.clone()),
         }))
     }
 
+    pub(super) fn arch(&self) -> &VmArch {
+        &self.arch
+    }
+
     pub(crate) fn create_vcpu(self: &Arc<Self>, vcpu_id: u32) -> Result<Arc<Vcpu>> {
+        let vcpu = Vcpu::new(vcpu_id, self)?;
+
         let mut vcpus = self.vcpus.lock();
 
         if vcpus.get(&vcpu_id).and_then(Weak::upgrade).is_some() {
             return_errno_with_message!(Errno::EEXIST, "vCPU already exists");
         }
 
-        let vcpu = Vcpu::new(vcpu_id, self)?;
         vcpus.insert(vcpu_id, Arc::downgrade(&vcpu));
         Ok(vcpu)
     }
 
     pub(crate) fn memory(&self) -> &VmMemory {
         &self.memory
+    }
+
+    pub(super) fn vcpus(&self) -> SpinLockGuard<'_, BTreeMap<u32, Weak<Vcpu>>> {
+        self.vcpus.lock()
     }
 }
