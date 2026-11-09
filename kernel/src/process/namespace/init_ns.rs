@@ -50,12 +50,6 @@ macro_rules! define_initial_namespace {
 }
 
 define_initial_namespace!(
-    IpcNamespace,
-    NsType::Ipc,
-    Errno::EINVAL,
-    "IPC namespaces do not support NS_GET_PARENT"
-);
-define_initial_namespace!(
     NetNamespace,
     NsType::Net,
     Errno::EINVAL,

@@ -1,0 +1,168 @@
+diff --git a/libs/kata-types/src/config/hypervisor/qemu.rs b/libs/kata-types/src/config/hypervisor/qemu.rs
+--- a/libs/kata-types/src/config/hypervisor/qemu.rs
++++ b/libs/kata-types/src/config/hypervisor/qemu.rs
+@@ -12,7 +12,6 @@ use super::{default, register_hypervisor_plugin};
+ use crate::config::default::MAX_QEMU_VCPUS;
+ use crate::config::default::MIN_QEMU_MEMORY_SIZE_MB;
+ 
+-use crate::config::hypervisor::VIRTIO_BLK_MMIO;
+ use crate::config::{ConfigPlugin, TomlConfig};
+ use crate::{eother, resolve_path, validate_path};
+ 
+@@ -108,12 +107,6 @@ impl ConfigPlugin for QemuConfig {
+                 return Err(eother!("Valid Qemu jailer path list should be empty"));
+             }
+ 
+-            if !qemu.blockdev_info.disable_block_device_use
+-                && qemu.blockdev_info.block_device_driver == VIRTIO_BLK_MMIO
+-            {
+-                return Err(eother!("Qemu doesn't support virtio-blk-mmio"));
+-            }
+-
+             if qemu.boot_info.kernel.is_empty() {
+                 return Err(eother!("Guest kernel image for qemu is empty"));
+             }
+diff --git a/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs b/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs
+--- a/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs
++++ b/runtime-rs/crates/hypervisor/src/qemu/cmdline_generator.rs
+@@ -54,6 +54,7 @@ trait ToQemuParams: Send + Sync {
+ enum VirtioBusType {
+     Pci,
+     Ccw,
++    Mmio,
+ }
+ 
+ impl VirtioBusType {
+@@ -61,6 +62,7 @@ impl VirtioBusType {
+         match self {
+             VirtioBusType::Pci => "pci",
+             VirtioBusType::Ccw => "ccw",
++            VirtioBusType::Mmio => "device",
+         }
+     }
+ }
+@@ -72,7 +74,9 @@ impl Display for VirtioBusType {
+ }
+ 
+ fn bus_type(config: &HypervisorConfig) -> VirtioBusType {
+-    if config.machine_info.machine_type.contains("-ccw-") {
++    if config.machine_info.machine_type == "microvm" {
++        VirtioBusType::Mmio
++    } else if config.machine_info.machine_type.contains("-ccw-") {
+         VirtioBusType::Ccw
+     } else {
+         VirtioBusType::Pci
+@@ -247,6 +251,7 @@ impl Memory {
+ 
+         let mut mem_size = config.memory_info.default_memory as u64;
+         let mut max_mem_size = config.memory_info.default_maxmemory as u64;
++        let supports_memory_hotplug = config.machine_info.machine_type != "microvm";
+ 
+         if let Ok(sysinfo) = nix::sys::sysinfo::sysinfo() {
+             let host_memory = sysinfo.ram_total() >> 20;
+@@ -271,8 +276,16 @@ impl Memory {
+         // need to convert them to bytes for storage.
+         Memory {
+             size: mem_size * MI_B,
+-            num_slots: config.memory_info.memory_slots,
+-            max_size: max_mem_size * MI_B,
++            num_slots: if supports_memory_hotplug {
++                config.memory_info.memory_slots
++            } else {
++                0
++            },
++            max_size: if supports_memory_hotplug {
++                max_mem_size * MI_B
++            } else {
++                0
++            },
+             memory_backend_file: None,
+         }
+     }
+@@ -355,8 +368,12 @@ struct Cpu {
+ impl Cpu {
+     fn new(config: &HypervisorConfig) -> Cpu {
+         Cpu {
+-            // '-cpu host' has always to be used when using KVM
+-            r#type: "host".to_owned(),
++            r#type: if config.machine_info.machine_type == "microvm" {
++                "qemu64".to_owned()
++            } else {
++                // Use the host CPU model for the normal KVM machine types.
++                "host".to_owned()
++            },
+             cpu_features: config.cpu_info.cpu_features.clone(),
+         }
+     }
+@@ -1447,9 +1464,9 @@ struct DeviceRng {
+ }
+ 
+ impl DeviceRng {
+-    fn new() -> DeviceRng {
++    fn new(bus_type: VirtioBusType) -> DeviceRng {
+         DeviceRng {
+-            transport: "virtio-rng-pci".to_owned(),
++            transport: format!("virtio-rng-{}", bus_type),
+         }
+     }
+ }
+@@ -1903,13 +1920,15 @@ impl<'a> QemuCmdLine<'a> {
+             qemu_cmd_line.add_monitor(&config.debug_info.dbg_monitor_socket)?;
+         }
+ 
+-        qemu_cmd_line.add_rtc();
++        if config.machine_info.machine_type != "microvm" {
++            qemu_cmd_line.add_rtc();
++        }
+ 
+         if bus_type(config) != VirtioBusType::Ccw {
+             qemu_cmd_line.add_rng();
+         }
+ 
+-        if bus_type(config) != VirtioBusType::Ccw && config.device_info.default_bridges > 0 {
++        if bus_type(config) == VirtioBusType::Pci && config.device_info.default_bridges > 0 {
+             qemu_cmd_line.add_bridges(config.device_info.default_bridges);
+         }
+ 
+@@ -1938,7 +1957,7 @@ impl<'a> QemuCmdLine<'a> {
+ 
+     fn add_rng(&mut self) {
+         let rng_object = ObjectRngRandom::new();
+-        let rng_device = DeviceRng::new();
++        let rng_device = DeviceRng::new(bus_type(self.config));
+ 
+         self.devices.push(Box::new(rng_object));
+         self.devices.push(Box::new(rng_device));
+@@ -2025,7 +2044,7 @@ impl<'a> QemuCmdLine<'a> {
+                 self.machine.set_nvdimm(true);
+                 self.devices.push(Box::new(NumaNode::new(&mem_file.id)));
+             }
+-            VirtioBusType::Ccw => {
++            VirtioBusType::Ccw | VirtioBusType::Mmio => {
+                 self.machine.set_memory_backend(&mem_file.id);
+             }
+         }
+@@ -2037,7 +2056,10 @@ impl<'a> QemuCmdLine<'a> {
+         let devno = get_devno_ccw(&mut self.ccw_subchannel, "vsock-0");
+         let mut vhost_vsock_pci = VhostVsock::new(vhostfd, guest_cid, bus_type(self.config), devno);
+ 
+-        if !self.config.disable_nesting_checks && should_disable_modern() {
++        if bus_type(self.config) == VirtioBusType::Pci
++            && !self.config.disable_nesting_checks
++            && should_disable_modern()
++        {
+             vhost_vsock_pci.set_disable_modern(true);
+         }
+ 
+diff --git a/runtime-rs/crates/hypervisor/src/qemu/inner.rs b/runtime-rs/crates/hypervisor/src/qemu/inner.rs
+--- a/runtime-rs/crates/hypervisor/src/qemu/inner.rs
++++ b/runtime-rs/crates/hypervisor/src/qemu/inner.rs
+@@ -107,7 +107,7 @@ impl QemuInner {
+                             &block_dev.config.path_on_host,
+                             block_dev.config.is_readonly,
+                         )?,
+-                        "ccw" | "blk" => cmdline.add_block_device(
++                        "ccw" | "blk" | "mmioblk" => cmdline.add_block_device(
+                             block_dev.device_id.as_str(),
+                             &block_dev.config.path_on_host,
+                             block_dev

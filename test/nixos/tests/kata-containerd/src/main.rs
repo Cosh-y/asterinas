@@ -91,8 +91,16 @@ fn kata_runtime_registered(nixos_shell: &mut Session) -> Result<(), Error> {
         "kata-pull-debug-ready",
     )?;
     nixos_shell.run_cmd_and_expect(
+        "test -r /etc/kata-debug/guest/30-run-security-demo.sh && echo kata-security-demo-ready",
+        "kata-security-demo-ready",
+    )?;
+    nixos_shell.run_cmd_and_expect(
         "test -r /etc/kata-debug/busybox.tar && echo kata-image-tar-ready",
         "kata-image-tar-ready",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "test -r /etc/kata-debug/security-demo.tar && echo kata-security-demo-tar-ready",
+        "kata-security-demo-tar-ready",
     )?;
 
     nixos_shell.run_cmd(
@@ -314,30 +322,375 @@ fn kata_rootfs_exit_code_propagation(nixos_shell: &mut Session) -> Result<(), Er
 /// Validates the real container image path: import an offline busybox image into
 /// containerd, let containerd prepare the snapshot rootfs, then run it through
 /// the Kata runtime without `--rootfs`.
-#[nixos_test]
-fn kata_image_run_busybox(nixos_shell: &mut Session) -> Result<(), Error> {
+fn run_kata_image_run_busybox(nixos_shell: &mut Session, accel: &str) -> Result<(), Error> {
+    assert!(matches!(accel, "kvm" | "tcg"));
     nixos_shell.run_cmd(
         "rm -rf /tmp/kata-debug-out /tmp/kata-debug-run-image.stdout \
          /tmp/kata-debug-run-image.status /tmp/kata-run.txt /tmp/kata-image-run.txt \
-         /tmp/kata-image-import.txt /tmp/containerd-debug.sock /tmp/containerd-root \
+         /tmp/kata-image-import.txt /tmp/kata-image-run-status.txt \
+         /tmp/kata-image-run.pid /tmp/containerd-debug.sock /tmp/containerd-root \
          /tmp/containerd-state",
     )?;
-    nixos_shell.run_cmd(
-        "(timeout 1080s kata-debug-run-image; echo $? > /tmp/kata-debug-run-image.status) \
+    nixos_shell.run_cmd(&format!(
+        "(KATA_QEMU_ACCEL={accel} KATA_QEMU_BOOT_DIAG=1 \
+           KATA_IMAGE_RUN_TIMEOUT=120s KATA_IMAGE_LIVE_INTERVAL=5 \
+           KATA_IMAGE_LIVE_SAMPLES=40 \
+           KATA_DEBUG_COLLECT_TIMEOUT=45s \
+           timeout 300s kata-debug-run-image; \
+         echo $? > /tmp/kata-debug-run-image.status) \
          2>&1 | tee /tmp/kata-debug-run-image.stdout; \
          echo run-image-exit:$(cat /tmp/kata-debug-run-image.status) \
-           >> /tmp/kata-debug-run-image.stdout",
-    )?;
+           >> /tmp/kata-debug-run-image.stdout"
+    ))?;
     nixos_shell.run_cmd_and_expect(
         "grep -E '^run-image-exit:' /tmp/kata-debug-run-image.stdout; \
-         tail -180 /tmp/kata-debug-run-image.stdout; \
          ls -la /tmp/kata-debug-out/ 2>/dev/null; \
          echo BUSYBOX_DIAG_END",
         "BUSYBOX_DIAG_END",
     )?;
+    nixos_shell.run_cmd_and_expect(
+        "for log in /tmp/kata-debug-out/qemu-wrapper-*.mode \
+                    /tmp/kata-debug-out/qemu-wrapper-*.effective-argv; do \
+           test -e \"$log\" || continue; \
+           echo --- \"$log\"; cat \"$log\"; \
+         done; \
+         for log in /tmp/kata-debug-out/qemu-wrapper-*.boot-serial.log; do \
+           test -e \"$log\" || continue; \
+           echo --- \"$log\"; \
+           grep -a -E 'Linux version|EXT4-fs|kata-agent|ttRPC|virtio|panic|BUG:|Call Trace|VFS:' \"$log\" \
+             | tail -120 || true; \
+         done; \
+         for log in /tmp/kata-debug-out/qemu-wrapper-*.qemu-debug.log; do \
+           test -e \"$log\" || continue; \
+           echo --- \"$log\"; tail -120 \"$log\"; \
+         done; \
+         echo BUSYBOX_DIAG_FILES_END",
+        "BUSYBOX_DIAG_FILES_END",
+    )?;
     nixos_shell.run_cmd_and_expect("cat /tmp/kata-image-run.txt", "HI-IMG")?;
     nixos_shell.run_cmd_and_expect("cat /tmp/kata-image-run.txt", "exit:7")?;
     Ok(())
+}
+
+#[nixos_test]
+fn kata_image_run_busybox(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_image_run_busybox(nixos_shell, "kvm")
+}
+
+/// TCG-only diagnostic for the same image/runtime path. This is not a final
+/// Kata result because the experiment requires inner KVM.
+#[nixos_test]
+fn kata_image_run_busybox_tcg_diagnostic(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_image_run_busybox(nixos_shell, "tcg")
+}
+
+/// Runs the same untrusted Agent task fixture used by the Docker comparison.
+/// The fixture records its task identity and probes paths that must not expose
+/// the Asterinas Host. It intentionally does not claim a kernel compromise;
+/// a real Guest-kernel CVE can later replace the payload inside the image.
+#[nixos_test]
+fn kata_agent_security_demo_fixture(nixos_shell: &mut Session) -> Result<(), Error> {
+    wait_for_containerd_ready(nixos_shell)?;
+    nixos_shell.run_cmd(
+        "rm -rf /tmp/kata-debug-out /tmp/kata-security-demo.stdout \
+         /run/security-demo-host-canary; \
+         timeout 420s kata-debug-run-security-demo \
+           > /tmp/kata-security-demo.stdout 2>&1; \
+         echo security-demo-exit:$? >> /tmp/kata-security-demo.stdout",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "cat /tmp/kata-security-demo.stdout; \
+         cat /tmp/kata-debug-out/security-demo.log 2>/dev/null || true; \
+         echo SECURITY_DEMO_OUTPUT_END",
+        "SECURITY_DEMO_OUTPUT_END",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'SECURITY_DEMO_RESULT=pass' /tmp/kata-debug-out/security-demo.log",
+        "SECURITY_DEMO_RESULT=pass",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'TASK_UID=1000' /tmp/kata-debug-out/security-demo.log",
+        "TASK_UID=1000",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'ATTACK_FIXTURE=task-boundary-probe-only' \
+           /tmp/kata-debug-out/security-demo.log",
+        "ATTACK_FIXTURE=task-boundary-probe-only",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'BOUNDARY_BLOCKED path=/run/security-demo-host-canary' \
+           /tmp/kata-debug-out/security-demo.log",
+        "BOUNDARY_BLOCKED path=/run/security-demo-host-canary",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'SECURITY_DEMO_RECOVERY=pass' /tmp/kata-debug-out/security-demo.log",
+        "SECURITY_DEMO_RECOVERY=pass",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'RECOVERY_TASK=normal-agent-task' \
+           /tmp/kata-debug-out/security-demo.log",
+        "RECOVERY_TASK=normal-agent-task",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -qx 'host-canary-original' /run/security-demo-host-canary && \
+           echo SECURITY_DEMO_HOST_CANARY_OK",
+        "SECURITY_DEMO_HOST_CANARY_OK",
+    )?;
+    Ok(())
+}
+
+/// Runs Dirty Pipe in a vulnerable Kata Guest kernel and checks that the
+/// Asterinas Host boundary and the next Agent task remain healthy.
+fn run_kata_agent_security_demo_cve_2022_0847(
+    nixos_shell: &mut Session,
+    accel: &str,
+) -> Result<(), Error> {
+    assert!(matches!(accel, "kvm" | "tcg"));
+    wait_for_containerd_ready(nixos_shell)?;
+    nixos_shell.run_cmd(&format!(
+        "rm -rf /tmp/kata-debug-out /tmp/containerd-debug.sock \
+         /tmp/containerd-root /tmp/containerd-state; \
+         KATA_QEMU_ACCEL={accel} KATA_QEMU_BOOT_DIAG=1 \
+           kata-debug-start-containerd \
+           > /tmp/kata-security-demo-cve-containerd.stdout 2>&1"
+    ))?;
+    nixos_shell.run_cmd_and_expect(
+        "cat /tmp/kata-security-demo-cve-containerd.stdout; \
+         test -S /tmp/containerd-debug.sock && echo SECURITY_DEMO_DEBUG_CONTAINERD_READY",
+        "SECURITY_DEMO_DEBUG_CONTAINERD_READY",
+    )?;
+    nixos_shell.run_cmd(
+        "rm -rf /tmp/kata-debug-out /tmp/kata-security-demo-cve.stdout \
+         /run/security-demo-host-canary; \
+         SECURITY_DEMO_ATTACK_MODE=cve-2022-0847 \
+           timeout 420s kata-debug-run-security-demo \
+           > /tmp/kata-security-demo-cve.stdout 2>&1; \
+         echo security-demo-cve-exit:$? >> /tmp/kata-security-demo-cve.stdout",
+    )?;
+    nixos_shell
+        .run_cmd("kata-debug-collect > /tmp/kata-security-demo-cve-collect.stdout 2>&1 || true")?;
+    nixos_shell.run_cmd_and_expect(
+        "cat /tmp/kata-security-demo-cve.stdout; \
+         cat /tmp/kata-debug-out/security-demo.log 2>/dev/null || true; \
+         cat /tmp/kata-security-demo-cve-collect.stdout; \
+         echo SECURITY_DEMO_CVE_OUTPUT_END",
+        "SECURITY_DEMO_CVE_OUTPUT_END",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'SECURITY_DEMO_RESULT=pass' \
+           /tmp/kata-debug-out/security-demo.log",
+        "SECURITY_DEMO_RESULT=pass",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'TASK_KERNEL=Linux 5.15.24' \
+           /tmp/kata-debug-out/security-demo.log",
+        "TASK_KERNEL=Linux 5.15.24",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'CVE_PAYLOAD_EXIT=0' /tmp/kata-debug-out/security-demo.log",
+        "CVE_PAYLOAD_EXIT=0",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'CVE_TARGET_CONTENT=gXest-canary-original ' \
+           /tmp/kata-debug-out/security-demo.log",
+        "CVE_TARGET_CONTENT=gXest-canary-original ",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'CVE_REPRODUCTION=success' \
+           /tmp/kata-debug-out/security-demo.log",
+        "CVE_REPRODUCTION=success",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'BOUNDARY_BLOCKED path=/run/security-demo-host-canary' \
+           /tmp/kata-debug-out/security-demo.log",
+        "BOUNDARY_BLOCKED path=/run/security-demo-host-canary",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'SECURITY_DEMO_RECOVERY=pass' \
+           /tmp/kata-debug-out/security-demo.log",
+        "SECURITY_DEMO_RECOVERY=pass",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -qx 'host-canary-original' /run/security-demo-host-canary && \
+           echo SECURITY_DEMO_HOST_CANARY_OK",
+        "SECURITY_DEMO_HOST_CANARY_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "cat /tmp/kata-debug-out/qemu-wrapper-*.mode 2>/dev/null || true",
+        &format!("KATA_QEMU_ACCEL={accel}"),
+    )?;
+    Ok(())
+}
+
+#[nixos_test]
+fn kata_agent_security_demo_cve_2022_0847(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_agent_security_demo_cve_2022_0847(nixos_shell, "kvm")
+}
+
+/// Diagnostic variant: bind a read-only file from the Kata Guest root ext4
+/// into the same Agent task. The image's /opt/guest-canary is virtiofs-backed,
+/// so it is not a valid Dirty Pipe target for proving the Guest ext4 lane.
+#[nixos_test]
+fn kata_agent_security_demo_cve_guest_ext4_bind(nixos_shell: &mut Session) -> Result<(), Error> {
+    wait_for_containerd_ready(nixos_shell)?;
+    nixos_shell.run_cmd(
+        "rm -rf /tmp/kata-debug-out /tmp/containerd-debug.sock \
+         /tmp/containerd-root /tmp/containerd-state; \
+         KATA_QEMU_ACCEL=kvm KATA_QEMU_BOOT_DIAG=1 \
+           kata-debug-start-containerd \
+           > /tmp/kata-security-demo-bind-containerd.stdout 2>&1",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "cat /tmp/kata-security-demo-bind-containerd.stdout; \
+         test -S /tmp/containerd-debug.sock && echo GUEST_EXT4_BIND_CONTAINERD_READY",
+        "GUEST_EXT4_BIND_CONTAINERD_READY",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "rm -f /tmp/kata-security-demo-bind.stdout; \
+         ctr --address /tmp/containerd-debug.sock image import \
+           /etc/kata-debug/security-demo.tar >/tmp/kata-security-demo-bind-import.stdout 2>&1; \
+         timeout 300s ctr --debug --address /tmp/containerd-debug.sock run \
+           --runtime io.containerd.kata.v2 --user 1000:1000 \
+           --mount type=bind,src=/etc/passwd,dst=/opt/guest-canary,options=rbind:ro \
+           --env SECURITY_DEMO_ATTACK_MODE=cve-2022-0847 \
+           --env CVE_PAYLOAD_TARGET=/opt/guest-canary \
+           docker.io/library/agent-security-demo:fixture-v1 \
+           agent-security-demo-guest-ext4-bind /opt/agent-task.sh \
+           >/tmp/kata-security-demo-bind.stdout 2>&1; \
+         echo bind-run-exit:$? >> /tmp/kata-security-demo-bind.stdout; \
+         cat /tmp/kata-security-demo-bind.stdout; \
+         echo GUEST_EXT4_BIND_OUTPUT_END",
+        "GUEST_EXT4_BIND_OUTPUT_END",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        "grep -x 'CVE_PAYLOAD_EXIT=0' /tmp/kata-security-demo-bind.stdout",
+        "CVE_PAYLOAD_EXIT=0",
+    )?;
+    Ok(())
+}
+
+#[nixos_test]
+fn kata_agent_security_demo_cve_2022_0847_tcg(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_agent_security_demo_cve_2022_0847(nixos_shell, "tcg")
+}
+
+fn run_kata_image_launch_bench(nixos_shell: &mut Session, accel: &str) -> Result<(), Error> {
+    assert!(
+        matches!(accel, "kvm" | "tcg"),
+        "unsupported Kata QEMU accelerator: {accel}"
+    );
+    let launch_timeout_secs = 180;
+
+    // The debug launcher discovers its config from the system containerd process.
+    wait_for_containerd_ready(nixos_shell)?;
+    nixos_shell.run_cmd(
+        "rm -rf /tmp/kata-debug-out /tmp/kata-image-launch-* \
+         /tmp/containerd-debug.sock /tmp/containerd-root /tmp/containerd-state",
+    )?;
+    nixos_shell.run_cmd(&format!(
+        "KATA_QEMU_ACCEL={accel} KATA_QEMU_BOOT_DIAG=1 \
+         kata-debug-start-containerd \
+         > /tmp/kata-image-launch-containerd-{accel}.stdout 2>&1"
+    ))?;
+    nixos_shell.run_cmd_and_expect(
+        &format!(
+            "cat /tmp/kata-image-launch-containerd-{accel}.stdout; \
+             test -S /tmp/containerd-debug.sock && echo KATA_BENCH_CONTAINERD_READY"
+        ),
+        "KATA_BENCH_CONTAINERD_READY",
+    )?;
+    nixos_shell.run_cmd(&format!(
+        "import_start_ns=$(date +%s%N); \
+         timeout 120s ctr --address /tmp/containerd-debug.sock image import \
+           /etc/kata-debug/busybox.tar \
+           > /tmp/kata-image-launch-import-{accel}.stdout 2>&1; \
+         import_status=$?; \
+         import_end_ns=$(date +%s%N); \
+         image_ref=$(ctr --address /tmp/containerd-debug.sock images ls -q \
+           2>/dev/null | grep -m1 busybox || true); \
+         test -n \"$image_ref\" || image_ref=busybox:latest; \
+         launch_start_ns=$(date +%s%N); \
+         ctr --debug --address /tmp/containerd-debug.sock run \
+           --detach --runtime io.containerd.kata.v2 \
+           \"$image_ref\" kata-image-launch-{accel} \
+           /bin/sh -c 'echo ready > /kata-bench-ready' \
+           > /tmp/kata-image-launch-run-{accel}.stdout 2>&1 & \
+         ctr_pid=$!; \
+         launch_status=124; \
+         launch_deadline_s=$(( $(date +%s) + {launch_timeout_secs} )); \
+         while [ \"$(date +%s)\" -lt \"$launch_deadline_s\" ]; do \
+           ready_marker=$(find /tmp/containerd-root \
+             -path '*/snapshots/*/fs/kata-bench-ready' \
+             -type f -print -quit 2>/dev/null); \
+           if [ -n \"$ready_marker\" ]; then \
+             launch_status=0; \
+             break; \
+           fi; \
+           if ! kill -0 \"$ctr_pid\" 2>/dev/null; then \
+             wait \"$ctr_pid\"; \
+             launch_status=$?; \
+             break; \
+           fi; \
+           sleep 0.2; \
+         done; \
+         launch_end_ns=$(date +%s%N); \
+         kill -KILL \"$ctr_pid\" >/dev/null 2>&1 || true; \
+         import_ms=$(( (import_end_ns - import_start_ns) / 1000000 )); \
+         launch_ms=$(( (launch_end_ns - launch_start_ns) / 1000000 )); \
+         printf 'mode\\timport_ms\\timport_status\\tlaunch_ms\\tlaunch_status\\n{accel}\\t%s\\t%s\\t%s\\t%s\\n' \
+           \"$import_ms\" \"$import_status\" \"$launch_ms\" \"$launch_status\" \
+           > /tmp/kata-image-launch-{accel}.tsv"
+    ))?;
+    nixos_shell.run_cmd_and_expect(
+        &format!(
+            "cat /tmp/kata-image-launch-{accel}.tsv; \
+             tail -80 /tmp/kata-image-launch-containerd-{accel}.stdout; \
+             tail -120 /tmp/kata-image-launch-run-{accel}.stdout; \
+             find /tmp/containerd-root -name kata-bench-ready -print \
+               2>/dev/null || true; \
+             for log in /tmp/kata-debug-out/qemu-wrapper-*.stderr \
+                        /tmp/kata-debug-out/qemu-wrapper-*.boot-serial.log; do \
+               test -e \"$log\" || continue; \
+               echo --- \"$log\"; \
+               tail -160 \"$log\"; \
+             done; \
+             for log in /tmp/kata-debug-out/qemu-wrapper-*.effective-argv \
+                        /tmp/kata-debug-out/qemu-wrapper-*.qemu-debug.log; do \
+               test -e \"$log\" || continue; \
+               echo --- \"$log\"; \
+               tail -240 \"$log\"; \
+             done; \
+             tail -160 /tmp/kata-debug-out/containerd.log 2>/dev/null || true; \
+             echo KATA_IMAGE_LAUNCH_BENCH_OUTPUT_END"
+        ),
+        "KATA_IMAGE_LAUNCH_BENCH_OUTPUT_END",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        &format!(
+            "awk -F '\\t' 'NR == 2 && $1 == \"{accel}\" && $3 == 0 && $5 == 0 \
+             {{ print \"KATA_IMAGE_LAUNCH_BENCH_OK\" }}' \
+             /tmp/kata-image-launch-{accel}.tsv"
+        ),
+        "KATA_IMAGE_LAUNCH_BENCH_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect(
+        &format!(
+            "cat /tmp/kata-debug-out/qemu-wrapper-*.mode 2>/dev/null || true; \
+             cat /tmp/kata-debug-out/qemu-wrapper-*.effective-argv 2>/dev/null || true"
+        ),
+        &format!("KATA_QEMU_ACCEL={accel}"),
+    )?;
+    Ok(())
+}
+
+#[nixos_test]
+fn kata_image_launch_bench_kvm(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_image_launch_bench(nixos_shell, "kvm")
+}
+
+#[nixos_test]
+fn kata_image_launch_bench_tcg(nixos_shell: &mut Session) -> Result<(), Error> {
+    run_kata_image_launch_bench(nixos_shell, "tcg")
 }
 
 /// Validates the online registry path: pull busybox through the guest network,

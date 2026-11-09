@@ -44,6 +44,7 @@ const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const HOST_CID: u64 = 2;
 const KATA_AGENT_SERVER_PORT: u32 = 1024;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
+const VIRTQ_DESC_F_WRITE: u16 = 2;
 const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 const VHOST_VSOCK_MAX_TX_CHAIN_BYTES: usize = 1024 * 1024;
 
@@ -858,25 +859,26 @@ fn inject_packet(
         return_errno_with_message!(Errno::EINVAL, "vhost-vsock head index out of range");
     }
 
-    // 3) read desc[head]
-    let mut desc = VirtqDesc::default();
-    let mut writer = VmWriter::from(desc.as_mut_bytes()).to_fallible();
-    vmar.read_alien(
-        addr.desc_user_addr as usize + head * size_of::<VirtqDesc>(),
-        &mut writer,
-    )
-    .map_err(|(e, _)| e)?;
+    // 3) read the writable RX descriptor chain. QEMU commonly publishes
+    // this as an indirect descriptor whose outer entry is only a 32-byte
+    // table, not the packet buffer itself.
+    let rx_buffers = read_rx_chain(vmar, addr, &inputs.mem_regions, num, head)?;
 
     let packet_len = VIRTIO_VSOCK_HDR_SIZE
         .checked_add(packet.payload.len())
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "vhost-vsock packet too large"))?;
-    if (desc.len as usize) < packet_len {
+    let rx_capacity = rx_buffers.iter().try_fold(0usize, |total, buffer| {
+        total
+            .checked_add(buffer.len as usize)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "vhost-vsock RX chain too large"))
+    })?;
+    if rx_capacity < packet_len {
         error!(
             "vhost-vsock RX buffer too small op={}({}) payload_len={} desc_len={} packet_len={}",
             packet.op,
             vsock_op_name(packet.op),
             packet.payload.len(),
-            desc.len,
+            rx_capacity,
             packet_len
         );
         return_errno_with_message!(Errno::EINVAL, "vhost-vsock RX buffer too small");
@@ -895,25 +897,15 @@ fn inject_packet(
         buf_alloc: packet.buf_alloc,
         fwd_cnt: packet.fwd_cnt,
     };
-    let buf_uva = gpa_to_uva(&inputs.mem_regions, desc.addr, packet_len).ok_or_else(|| {
-        Error::with_message(
-            Errno::EFAULT,
-            "vhost-vsock RX desc.addr not covered by mem table",
-        )
-    })?;
-    let bytes = hdr.to_bytes();
-    let mut reader = VmReader::from(bytes.as_slice()).to_fallible();
-    vmar.write_alien(buf_uva, &mut reader).map_err(|(e, _)| e)?;
-    if !packet.payload.is_empty() {
-        let mut reader = VmReader::from(packet.payload).to_fallible();
-        vmar.write_alien(buf_uva + VIRTIO_VSOCK_HDR_SIZE, &mut reader)
-            .map_err(|(e, _)| e)?;
-    }
+    let mut bytes = Vec::with_capacity(packet_len);
+    bytes.extend_from_slice(&hdr.to_bytes());
+    bytes.extend_from_slice(packet.payload);
+    write_rx_bytes(vmar, &inputs.mem_regions, &rx_buffers, &bytes)?;
     if hdr.op == VIRTIO_VSOCK_OP_RW {
         debug!(
             "vhost-vsock RX inject RW head={} desc_len={} payload_len={} src={}:{} dst={}:{} buf_alloc={} fwd_cnt={}",
             head,
-            desc.len,
+            rx_capacity,
             packet.payload.len(),
             hdr.src_cid,
             hdr.src_port,
@@ -924,12 +916,11 @@ fn inject_packet(
         );
     } else {
         debug!(
-            "vhost-vsock inject: head={}, desc.addr={:#x} -> uva={:#x}, desc.len={}, \
+            "vhost-vsock inject: head={}, desc.addr={:#x}, desc.len={}, \
              op={}({}) payload_len={}, hdr={:?}",
             head,
-            desc.addr,
-            buf_uva,
-            desc.len,
+            rx_buffers[0].addr,
+            rx_capacity,
             hdr.op,
             vsock_op_name(hdr.op),
             packet.payload.len(),
@@ -967,6 +958,120 @@ fn inject_packet(
     let mut reader = VmReader::from(counter.as_bytes()).to_fallible();
     call.write(&mut reader)?;
 
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RxBuffer {
+    addr: u64,
+    len: u32,
+}
+
+fn read_rx_chain(
+    vmar: &Vmar,
+    addr: VhostVringAddr,
+    mem_regions: &[VhostMemoryRegion],
+    num: usize,
+    head: usize,
+) -> Result<Vec<RxBuffer>> {
+    let first_desc = read_vring_desc(vmar, addr.desc_user_addr as usize, num, head)?;
+    if first_desc.flags & VIRTQ_DESC_F_INDIRECT != 0 {
+        let table_len = first_desc.len as usize;
+        if table_len == 0 || table_len % size_of::<VirtqDesc>() != 0 {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "vhost-vsock RX indirect descriptor table has invalid length"
+            );
+        }
+        let table_num = table_len / size_of::<VirtqDesc>();
+        let table_uva = gpa_to_uva(mem_regions, first_desc.addr, table_len).ok_or_else(|| {
+            Error::with_message(
+                Errno::EFAULT,
+                "vhost-vsock RX indirect table not covered by mem table",
+            )
+        })?;
+        let first_indirect_desc = read_indirect_desc(vmar, table_uva, table_num, 0)?;
+        return read_rx_desc_chain(mem_regions, first_indirect_desc, table_num, |index| {
+            read_indirect_desc(vmar, table_uva, table_num, index)
+        });
+    }
+
+    read_rx_desc_chain(mem_regions, first_desc, num, |index| {
+        read_vring_desc(vmar, addr.desc_user_addr as usize, num, index)
+    })
+}
+
+fn read_rx_desc_chain(
+    mem_regions: &[VhostMemoryRegion],
+    first_desc: VirtqDesc,
+    num: usize,
+    mut read_desc: impl FnMut(usize) -> Result<VirtqDesc>,
+) -> Result<Vec<RxBuffer>> {
+    let mut buffers = Vec::new();
+    let mut desc = first_desc;
+
+    for _ in 0..num {
+        if desc.flags & VIRTQ_DESC_F_INDIRECT != 0 {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "vhost-vsock RX nested indirect descriptor is unsupported"
+            );
+        }
+        if desc.flags & VIRTQ_DESC_F_WRITE == 0 {
+            return_errno_with_message!(Errno::EINVAL, "vhost-vsock RX descriptor is not writable");
+        }
+        gpa_to_uva(mem_regions, desc.addr, desc.len as usize).ok_or_else(|| {
+            Error::with_message(
+                Errno::EFAULT,
+                "vhost-vsock RX desc.addr not covered by mem table",
+            )
+        })?;
+        buffers.push(RxBuffer {
+            addr: desc.addr,
+            len: desc.len,
+        });
+
+        if desc.flags & VIRTQ_DESC_F_NEXT == 0 {
+            return Ok(buffers);
+        }
+        let next = desc.next as usize;
+        if next >= num {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "vhost-vsock RX chain next index out of range"
+            );
+        }
+        desc = read_desc(next)?;
+    }
+
+    return_errno_with_message!(Errno::EINVAL, "vhost-vsock RX descriptor chain loop");
+}
+
+fn write_rx_bytes(
+    vmar: &Vmar,
+    mem_regions: &[VhostMemoryRegion],
+    buffers: &[RxBuffer],
+    bytes: &[u8],
+) -> Result<()> {
+    let mut offset = 0;
+    for buffer in buffers {
+        if offset == bytes.len() {
+            break;
+        }
+        let write_len = (buffer.len as usize).min(bytes.len() - offset);
+        let uva = gpa_to_uva(mem_regions, buffer.addr, write_len).ok_or_else(|| {
+            Error::with_message(
+                Errno::EFAULT,
+                "vhost-vsock RX desc.addr not covered by mem table",
+            )
+        })?;
+        let mut reader = VmReader::from(&bytes[offset..offset + write_len]).to_fallible();
+        vmar.write_alien(uva, &mut reader).map_err(|(e, _)| e)?;
+        offset += write_len;
+    }
+    if offset != bytes.len() {
+        return_errno_with_message!(Errno::EINVAL, "vhost-vsock RX buffers are too small");
+    }
     Ok(())
 }
 

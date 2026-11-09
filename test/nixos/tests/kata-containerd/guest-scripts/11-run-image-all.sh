@@ -25,7 +25,13 @@ sh "$DIR/20-run-image-probe.sh"
 echo
 echo "=== collect logs ==="
 sleep 2
-sh "$DIR/04-collect-logs.sh"
+COLLECT_TIMEOUT=${KATA_DEBUG_COLLECT_TIMEOUT:-60s}
+timeout "$COLLECT_TIMEOUT" sh "$DIR/04-collect-logs.sh" \
+  > "$OUT_DIR/collect.stdout.log" 2>&1
+COLLECT_STATUS=$?
+echo "collect-timeout:$COLLECT_TIMEOUT status:$COLLECT_STATUS" \
+  | tee -a "$OUT_DIR/collect.stdout.log"
+tail -240 "$OUT_DIR/collect.stdout.log" 2>/dev/null || true
 
 echo
 echo "done; outputs are under $OUT_DIR"

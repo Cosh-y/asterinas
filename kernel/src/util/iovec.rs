@@ -176,9 +176,9 @@ fn prefault_current_user_range(base: Vaddr, len: usize, perms: VmPerms) -> Resul
 
     let task = ostd::task::Task::current()
         .ok_or_else(|| Error::with_message(Errno::EFAULT, "there is no current task"))?;
-    let thread_local = crate::process::posix_thread::AsThreadLocal::as_thread_local(&task)
+    let thread_local = AsThreadLocal::as_thread_local(&task)
         .ok_or_else(|| Error::with_message(Errno::EFAULT, "there is no current user space"))?;
-    let user_space = crate::context::CurrentUserSpace::new(thread_local);
+    let user_space = CurrentUserSpace::new(thread_local);
     prefault_user_range(user_space.vmar(), base, len, perms)
 }
 

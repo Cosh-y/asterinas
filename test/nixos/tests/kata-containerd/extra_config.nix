@@ -1,6 +1,16 @@
 { config, lib, pkgs, ... }:
 
 let
+  cveGuestKernel = builtins.path {
+    path = /. + "/workspace/target/cve-lab/linux-5.15.24/arch/x86/boot/bzImage";
+    name = "linux-5.15.24-cve-2022-0847-guest";
+  };
+
+  dirtyPipePayload = builtins.path {
+    path = /. + "/workspace/target/cve-lab/docker-context/dirty-pipe";
+    name = "dirty-pipe-cve-2022-0847";
+  };
+
   busyboxRoot = pkgs.runCommand "kata-busybox-root" { } ''
     mkdir -p "$out/bin"
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
@@ -17,30 +27,106 @@ let
     };
   };
 
+  securityDemoRoot = pkgs.runCommand "kata-security-demo-root" { } ''
+    mkdir -p "$out/bin" "$out/opt" "$out/tmp"
+    chmod 1777 "$out/tmp"
+    cp ${pkgs.pkgsStatic.busybox}/bin/busybox "$out/bin/busybox"
+    chmod 0755 "$out/bin/busybox"
+    for applet in sh id uname hostname tee mkdir; do
+      ln -s busybox "$out/bin/$applet"
+    done
+    cp ${dirtyPipePayload} "$out/opt/dirty-pipe"
+    chmod 0555 "$out/opt/dirty-pipe"
+    printf 'guest-canary-original\n' > "$out/opt/guest-canary"
+    chmod 0444 "$out/opt/guest-canary"
+    cp ${extraFileDir + "/security-demo/agent-task.sh"} "$out/opt/agent-task.sh"
+    chmod 0555 "$out/opt/agent-task.sh"
+  '';
+
+  securityDemoImage = pkgs.dockerTools.buildImage {
+    name = "agent-security-demo";
+    tag = "fixture-v1";
+    copyToRoot = securityDemoRoot;
+    config = {
+      Entrypoint = [ "/opt/agent-task.sh" ];
+      User = "1000:1000";
+    };
+  };
+
   registryProxy = "http://10.0.2.2:18089";
   registryNoProxy = "localhost,127.0.0.1,::1,10.0.2.2";
   registryPullImages = "docker.io/library/busybox:latest docker.m.daocloud.io/library/busybox:latest";
+  kataQemuAccel = "kvm";
+  kataQemuBootDiag = "1";
 
   qemuWrapper = pkgs.writeShellScriptBin "kata-qemu-wrapper" ''
     out_dir="''${KATA_DEBUG_OUT:-/tmp/kata-debug-out}"
     mkdir -p "$out_dir" 2>/dev/null || out_dir=/tmp
     stamp=$(${pkgs.coreutils}/bin/date +%s 2>/dev/null || echo now)
     base="$out_dir/qemu-wrapper-$stamp-$$"
+    accel="''${KATA_QEMU_ACCEL:-kvm}"
+    case "$accel" in
+      kvm|tcg) ;;
+      *)
+        echo "unsupported KATA_QEMU_ACCEL=$accel" > "$base.stderr"
+        exit 2
+        ;;
+    esac
+    printf 'KATA_QEMU_ACCEL=%s\n' "$accel" > "$base.mode" 2>/dev/null || true
 
     args=()
+    append_arg=0
+    q35_machine=0
     for arg in "$@"; do
+      if [ "$append_arg" = 1 ]; then
+        if [ "''${KATA_QEMU_BOOT_DIAG:-0}" = 1 ]; then
+          args+=("$arg console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200n8 ignore_loglevel")
+        else
+          args+=("$arg")
+        fi
+        append_arg=0
+        continue
+      fi
+
       case "$arg" in
+        -append)
+          args+=("$arg")
+          append_arg=1
+          ;;
+        q35|q35,*)
+          q35_machine=1
+          if [ "$accel" = tcg ]; then
+            args+=("''${arg/accel=kvm/accel=tcg}")
+          else
+            args+=("$arg")
+          fi
+          ;;
         *accel=kvm*)
-          args+=("''${arg/accel=kvm/accel=tcg}")
+          if [ "$accel" = tcg ]; then
+            args+=("''${arg/accel=kvm/accel=tcg}")
+          else
+            args+=("$arg")
+          fi
           ;;
         host|host,*)
-          args+=("max")
+          if [ "$accel" = tcg ]; then
+            args+=("max")
+          else
+            args+=("$arg")
+          fi
           ;;
         *)
           args+=("$arg")
           ;;
       esac
     done
+    if [ "''${KATA_QEMU_BOOT_DIAG:-0}" = 1 ] && [ "$q35_machine" = 1 ]; then
+      args+=(
+        -serial "file:$base.boot-serial.log"
+        -d guest_errors,cpu_reset
+        -D "$base.qemu-debug.log"
+      )
+    fi
 
     {
       printf '%s\n' "${pkgs.qemu_test}/bin/qemu-system-x86_64"
@@ -84,6 +170,9 @@ let
 
     postPatch = ''
       chmod -R u+w ..
+      patch -p1 < ${extraFileDir + "/runtime-rs-qemu-pci-coldplug.patch"}
+      patch -d .. -p1 < ${extraFileDir + "/runtime-rs-qemu-microvm-mmio.patch"}
+      patch -p1 < ${extraFileDir + "/runtime-rs-qemu-qmp-timeout.patch"}
       substituteInPlace crates/runtimes/virt_container/Cargo.toml \
         --replace 'default = ["cloud-hypervisor"]' \
                   'default = []'
@@ -130,12 +219,48 @@ let
           print "path = \"${qemuWrapper}/bin/kata-qemu-wrapper\""
           next
         }
+        section == "qemu" && /^kernel = / {
+          print "kernel = \"${cveGuestKernel}\""
+          next
+        }
         section == "qemu" && /^valid_hypervisor_paths = / {
           print "valid_hypervisor_paths = [\"${qemuWrapper}/bin/kata-qemu-wrapper\"]"
           next
         }
+        section == "qemu" && /^vm_rootfs_driver = / {
+          print "vm_rootfs_driver = \"virtio-blk-pci\""
+          next
+        }
+        section == "qemu" && /^machine_type = / {
+          print "machine_type = \"q35\""
+          next
+        }
+        section == "qemu" && /^machine_accelerators=/ {
+          print "machine_accelerators=\"kernel-irqchip=on,pit=off,pic=off,acpi=off\""
+          next
+        }
+        section == "qemu" && /^block_device_driver = / {
+          print "block_device_driver = \"virtio-blk-pci\""
+          next
+        }
+        section == "qemu" && /^#?disable_block_device_use = / {
+          print "disable_block_device_use = false"
+          next
+        }
+        section == "qemu" && /^#?disable_image_nvdimm = / {
+          print "disable_image_nvdimm = true"
+          next
+        }
         section == "qemu" && /^#?default_vcpus = / {
           print "default_vcpus = 1"
+          next
+        }
+        section == "qemu" && /^default_memory = / {
+          print "default_memory = 256"
+          next
+        }
+        section == "qemu" && /^default_maxmemory = / {
+          print "default_maxmemory = 512"
           next
         }
         section == "qemu" && /^#?default_maxvcpus = / {
@@ -201,6 +326,9 @@ in
     (writeShellScriptBin "kata-debug-run-image" ''
       exec sh /etc/kata-debug/guest/11-run-image-all.sh "$@"
     '')
+    (writeShellScriptBin "kata-debug-run-security-demo" ''
+      exec sh /etc/kata-debug/guest/30-run-security-demo.sh "$@"
+    '')
     (writeShellScriptBin "kata-debug-pull-image" ''
       exec sh /etc/kata-debug/guest/21-pull-image.sh "$@"
     '')
@@ -214,6 +342,8 @@ in
     HTTPS_PROXY = registryProxy;
     ALL_PROXY = registryProxy;
     KATA_PULL_IMAGES = registryPullImages;
+    KATA_QEMU_ACCEL = kataQemuAccel;
+    KATA_QEMU_BOOT_DIAG = kataQemuBootDiag;
     NO_PROXY = registryNoProxy;
     http_proxy = registryProxy;
     https_proxy = registryProxy;
@@ -230,6 +360,7 @@ in
 
   environment.etc."kata-debug/guest".source = extraFileDir + "/guest-scripts";
   environment.etc."kata-debug/busybox.tar".source = busyboxImage;
+  environment.etc."kata-debug/security-demo.tar".source = securityDemoImage;
 
   systemd.services.containerd = {
     environment = {
@@ -238,6 +369,8 @@ in
       HTTPS_PROXY = registryProxy;
       ALL_PROXY = registryProxy;
       KATA_PULL_IMAGES = registryPullImages;
+      KATA_QEMU_ACCEL = kataQemuAccel;
+      KATA_QEMU_BOOT_DIAG = kataQemuBootDiag;
       NO_PROXY = registryNoProxy;
       http_proxy = registryProxy;
       https_proxy = registryProxy;

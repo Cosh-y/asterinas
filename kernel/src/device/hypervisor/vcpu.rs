@@ -1,5 +1,5 @@
 use ostd::{
-    arch::vm::{GuestContext, GuestExitInfo, VcpuRunState, VmxExitReason},
+    arch::vm::{GuestContext, GuestExitInfo, VcpuRunState, VmxExitReason, X86GprIndex},
     task::Task,
     vm::{GuestMode, GuestRunResult},
 };
@@ -17,8 +17,10 @@ use super::{
 };
 use crate::prelude::*;
 
-const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 10_000;
+// Use the validated 1 ms HLT wakeup polling interval for nested KVM.
+const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 1_000;
 const HLT_WAKEUP_WAIT_FALLBACK_TICKS: u64 = 250_000;
+const KVM_ENOSYS: i64 = 1000;
 const MAX_PIO_IOEVENTFD_BATCH_BYTES: usize = PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +163,12 @@ impl Vcpu {
                 }
                 Ok(VmxExitReason::CR_ACCESS) => {
                     cr::emulate_cr_access(self, &exit_info)?;
+                    None
+                }
+                Ok(VmxExitReason::VMCALL) => {
+                    let mut context = self.guest_context();
+                    context.set_gpr(X86GprIndex::Rax, 8, (-KVM_ENOSYS) as u64);
+                    context.advance_rip(u64::from(exit_info.instruction_len));
                     None
                 }
                 Ok(VmxExitReason::HLT) => {

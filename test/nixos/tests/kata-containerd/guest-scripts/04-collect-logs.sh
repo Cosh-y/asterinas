@@ -81,6 +81,14 @@ done
   done
 
   echo
+  echo "=== qemu wrapper mode ==="
+  for log in "$OUT_DIR"/qemu-wrapper-*.mode; do
+    [ -e "$log" ] || continue
+    echo "--- $log ---"
+    cat "$log" 2>/dev/null || true
+  done
+
+  echo
   echo "=== qemu wrapper argv ==="
   for log in "$OUT_DIR"/qemu-wrapper-*.argv; do
     [ -e "$log" ] || continue
@@ -97,6 +105,28 @@ done
     cat "$log" 2>/dev/null || true
     echo
   done
+
+  echo
+  echo "=== nested qemu boot serial ==="
+  for log in "$OUT_DIR"/qemu-wrapper-*.boot-serial.log; do
+    [ -e "$log" ] || continue
+    echo "--- $log ---"
+    cat "$log" 2>/dev/null || true
+    echo
+  done
+
+  echo
+  echo "=== nested qemu debug ==="
+  for log in "$OUT_DIR"/qemu-wrapper-*.qemu-debug.log; do
+    [ -e "$log" ] || continue
+    echo "--- $log ---"
+    tail -160 "$log" 2>/dev/null || true
+    echo
+  done
+
+  echo
+  echo "=== nested virtio console watcher ==="
+  cat "$OUT_DIR/qemu-serial.log" 2>/dev/null || true
 
   echo
   echo "=== process state ==="

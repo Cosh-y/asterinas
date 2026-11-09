@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use aster_bigtcp::socket::ReceiveBehavior;
-use aster_virtio::device::socket::{header::VirtioVsockOp, packet::RxPacket};
+use aster_virtio::device::socket::header::VirtioVsockOp;
 
 use crate::{
     net::socket::{

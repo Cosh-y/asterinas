@@ -59,6 +59,44 @@ log_path_state() {
   } >> "$OUT_DIR/image-probe.log" 2>&1
 }
 
+collect_live_state() {
+  label=$1
+  {
+    echo
+    echo "=== live run state: $label $(date) ==="
+    echo "--- guest processes ---"
+    ps -ef 2>&1 | grep -Ei 'containerd|kata|qemu|virtiofsd|shim' | grep -v grep || true
+    echo "--- qemu process command lines ---"
+    for pid in $(pidof qemu-system-x86_64 2>/dev/null || true); do
+      echo "pid=$pid"
+      tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+      echo
+    done
+    echo "--- containerd task state ---"
+    find "$STATE/io.containerd.runtime.v2.task/default/$CID" \
+      -maxdepth 6 -ls 2>&1 || true
+    echo "--- Kata state and sockets ---"
+    find "$STATE" /run/kata /run/kata-containers -maxdepth 8 \
+      -ls 2>&1 | grep -Ei 'sandbox|console|qmp|vsock|virtiofsd|\.sock$' || true
+    ss -xlpn 2>&1 || true
+    echo "--- guest vsock state ---"
+    cat /proc/net/vsock 2>&1 || true
+    echo "--- wrapper mode/effective argv/serial/stderr/debug ---"
+    for suffix in mode effective-argv boot-serial.log stderr qemu-debug.log; do
+      for log in "$OUT_DIR"/qemu-wrapper-*.$suffix; do
+        [ -e "$log" ] || continue
+        echo "--- $log ---"
+        case "$suffix" in
+          mode|effective-argv) cat "$log" 2>&1 || true ;;
+          *) tail -120 "$log" 2>&1 || true ;;
+        esac
+      done
+    done
+    echo "--- containerd log tail ---"
+    tail -180 "$OUT_DIR/containerd.log" 2>&1 || true
+  } >> "$OUT_DIR/image-live-state.log" 2>&1
+}
+
 resolve_image_command() {
   IMAGE_CMD_SOURCE=default
 
@@ -123,16 +161,11 @@ fi
 (
   i=0
   while [ "$i" -lt "$IMAGE_LIVE_SAMPLES" ]; do
+    collect_live_state "import-$i"
     {
-      echo "=== live $i $(date) ==="
-      echo "--- snapshots ---"
+      echo "--- snapshot tree ---"
       find "$ROOT/io.containerd.snapshotter.v1.overlayfs/snapshots" \
         -maxdepth 3 -ls 2>&1 || true
-      echo "--- containerd task state ---"
-      find "$STATE/io.containerd.runtime.v2.task/default/$CID" \
-        -maxdepth 4 -ls 2>&1 || true
-      echo "--- kata state ---"
-      find /run/kata /run/kata-containers -maxdepth 5 -ls 2>&1 || true
       if [ "$IMAGE_LIVE_HEAVY" = "1" ]; then
         echo "--- imported images ---"
         ctr --address "$ADDR" images ls 2>&1 || true
@@ -182,15 +215,33 @@ resolve_image_command
 log "image command final: $IMAGE_CMD source=$IMAGE_CMD_SOURCE"
 log "image run start: $(date)"
 
-timeout "$IMAGE_RUN_TIMEOUT" ctr --debug \
-  --address "$ADDR" \
-  run \
-  --runtime io.containerd.kata.v2 \
-  "$IMAGE_REF" \
-  "$CID" \
-  "$IMAGE_CMD" -c 'echo HI-IMG; exit 7' \
-  > /tmp/kata-image-run.txt 2>&1
-STATUS=$?
+RUN_STATUS_FILE=/tmp/kata-image-run-status.txt
+RUN_PID_FILE=/tmp/kata-image-run.pid
+rm -f "$RUN_STATUS_FILE" "$RUN_PID_FILE"
+(
+  timeout "$IMAGE_RUN_TIMEOUT" ctr --debug \
+    --address "$ADDR" \
+    run \
+    --runtime io.containerd.kata.v2 \
+    "$IMAGE_REF" \
+    "$CID" \
+    "$IMAGE_CMD" -c 'echo HI-IMG; exit 7' \
+    > /tmp/kata-image-run.txt 2>&1
+  printf '%s\n' "$?" > "$RUN_STATUS_FILE"
+) &
+RUN_PID=$!
+printf '%s\n' "$RUN_PID" > "$RUN_PID_FILE"
+log "image run background pid: $RUN_PID"
+
+sample=0
+while [ ! -s "$RUN_STATUS_FILE" ]; do
+  collect_live_state "run-$sample"
+  sample=$((sample + 1))
+  sleep "$IMAGE_LIVE_INTERVAL"
+done
+wait "$RUN_PID" 2>/dev/null || true
+STATUS=$(cat "$RUN_STATUS_FILE" 2>/dev/null || echo 125)
+collect_live_state "run-final"
 log "image run exit: $STATUS at $(date)"
 
 kill "$SNAP_PID" >/dev/null 2>&1 || true

@@ -800,7 +800,7 @@ fn clone_pidfd(
                 file_table_locked.close_file(fd)
             };
             if let Some(file) = &closed_file {
-                crate::fs::file::file_table::FileTable::release_range_locks_for_close(file);
+                FileTable::release_range_locks_for_close(file);
             }
             Err(err.into())
         }
