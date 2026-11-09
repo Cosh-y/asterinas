@@ -37,6 +37,7 @@ pub(super) const KVM_CAP_NR_VCPUS: usize = 9;
 pub(super) const KVM_CAP_NR_MEMSLOTS: usize = 10;
 pub(super) const KVM_CAP_MP_STATE: usize = 14;
 pub(super) const KVM_CAP_COALESCED_MMIO: usize = 15;
+pub(super) const KVM_CAP_SYNC_MMU: usize = 16;
 pub(super) const KVM_CAP_DESTROY_MEMORY_REGION_WORKS: usize = 21;
 pub(super) const KVM_CAP_IRQ_ROUTING: usize = 25;
 pub(super) const KVM_CAP_IRQ_INJECT_STATUS: usize = 26;
@@ -208,6 +209,7 @@ pub(super) fn check_extension(raw_ioctl: RawIoctl) -> i32 {
         | KVM_CAP_VAPIC
         | KVM_CAP_EXT_CPUID
         | KVM_CAP_MP_STATE
+        | KVM_CAP_SYNC_MMU
         | KVM_CAP_DESTROY_MEMORY_REGION_WORKS
         | KVM_CAP_IRQ_INJECT_STATUS
         | KVM_CAP_JOIN_MEMORY_REGIONS_WORKS

@@ -1,5 +1,11 @@
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
 use ostd::{
-    arch::vm::{GuestContext, GuestExitInfo, VcpuRunState, VmxExitReason},
+    arch::vm::{GuestContext, GuestExitInfo, VcpuRunState, VmxExitReason, X86GprIndex},
+    sync::WaitQueue,
     task::Task,
     vm::{GuestMode, GuestRunResult},
 };
@@ -17,8 +23,11 @@ use super::{
 };
 use crate::prelude::*;
 
-const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 10_000;
-const HLT_WAKEUP_WAIT_FALLBACK_TICKS: u64 = 250_000;
+const HLT_WAKEUP_WAIT_TSC_DIVISOR: u64 = 1_000;
+const HLT_WAKEUP_WAIT_FALLBACK_TICKS: u64 = 2_500_000;
+const HLT_BUSY_POLL_WINDOW: Duration = Duration::from_millis(1);
+const HLT_EVENT_RECHECK_MAX: Duration = Duration::from_millis(10);
+const KVM_ENOSYS: i64 = 1000;
 const MAX_PIO_IOEVENTFD_BATCH_BYTES: usize = PAGE_SIZE;
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +53,8 @@ pub struct Vcpu {
     pub(super) guest_context: Mutex<GuestContext>,
     guest_mode: GuestMode,
     run_lock: Mutex<()>,
+    hlt_wakeup_generation: AtomicU64,
+    hlt_wait_queue: WaitQueue,
     pub(super) lapic: LapicPort,
     kvmclock: Mutex<KvmClock>,
     cpuid_entries: Mutex<Vec<VcpuCpuidEntry2>>,
@@ -57,6 +68,8 @@ impl Vcpu {
             guest_context: Mutex::new(GuestContext::new(id)?),
             guest_mode: GuestMode::new()?,
             run_lock: Mutex::new(()),
+            hlt_wakeup_generation: AtomicU64::new(0),
+            hlt_wait_queue: WaitQueue::new(),
             lapic: LapicPort::new(lapic),
             kvmclock: Mutex::new(KvmClock::default()),
             cpuid_entries: Mutex::new(cpuid::default_cpuid_entries()),
@@ -163,10 +176,17 @@ impl Vcpu {
                     cr::emulate_cr_access(self, &exit_info)?;
                     None
                 }
+                Ok(VmxExitReason::VMCALL) => {
+                    let mut context = self.guest_context();
+                    context.set_gpr(X86GprIndex::Rax, 8, (-KVM_ENOSYS) as u64);
+                    context.advance_rip(u64::from(exit_info.instruction_len));
+                    None
+                }
                 Ok(VmxExitReason::HLT) => {
                     self.guest_context()
                         .advance_rip(exit_info.instruction_len as _);
                     loop {
+                        let wakeup_generation = self.hlt_wakeup_generation.load(Ordering::Acquire);
                         if immediate_exit()? {
                             return Ok(None);
                         }
@@ -174,8 +194,22 @@ impl Vcpu {
                             break None;
                         }
 
-                        // TODO: Use a more efficient wait mechanism instead of busy-waiting.
-                        Task::yield_now();
+                        if self.hlt_wakeup_generation.load(Ordering::Acquire) != wakeup_generation {
+                            continue;
+                        }
+
+                        let sleep_duration = self.next_hlt_sleep_duration();
+                        if sleep_duration.is_zero() {
+                            continue;
+                        }
+                        let _ = self.hlt_wait_queue.wait_until_or_timeout(
+                            || {
+                                (self.hlt_wakeup_generation.load(Ordering::Acquire)
+                                    != wakeup_generation)
+                                    .then_some(())
+                            },
+                            &sleep_duration,
+                        );
                     }
                 }
                 Ok(VmxExitReason::PAUSE_INSTRUCTION) => None,
@@ -462,6 +496,8 @@ impl Vcpu {
             context.run_state(),
             context.sregs().apic_base
         );
+        drop(context);
+        self.notify_hlt_wakeup();
     }
 
     pub fn receive_init(&self) {
@@ -474,6 +510,9 @@ impl Vcpu {
         reset_lapic.ldr = default_lapic_ldr(self.id);
         reset_lapic.lvt_lint0 = default_lapic_lvt_lint0(self.id);
         *lapic = reset_lapic;
+        drop(lapic);
+        drop(context);
+        self.notify_hlt_wakeup();
     }
 
     pub(super) fn wait_for_sipi_wakeup(&self) -> bool {
@@ -509,6 +548,37 @@ impl Vcpu {
 
             core::hint::spin_loop();
         }
+    }
+
+    fn next_hlt_sleep_duration(&self) -> Duration {
+        use ostd::arch::tsc_freq;
+
+        let guest_tsc = self.guest_context().guest_tsc();
+        let deadline_tsc = self.lapic.lock().timer.deadline_tsc;
+        let Some(remaining_ticks) = deadline_tsc.map(|deadline| deadline.saturating_sub(guest_tsc))
+        else {
+            return HLT_EVENT_RECHECK_MAX;
+        };
+        let freq = tsc_freq();
+        if freq == 0 {
+            return HLT_BUSY_POLL_WINDOW;
+        }
+
+        let nanos = u128::from(remaining_ticks)
+            .saturating_mul(1_000_000_000)
+            .div_ceil(u128::from(freq))
+            .min(u128::from(u64::MAX)) as u64;
+        let remaining = Duration::from_nanos(nanos.max(1));
+        if remaining <= HLT_BUSY_POLL_WINDOW {
+            Duration::ZERO
+        } else {
+            remaining.min(HLT_EVENT_RECHECK_MAX)
+        }
+    }
+
+    pub(super) fn notify_hlt_wakeup(&self) {
+        self.hlt_wakeup_generation.fetch_add(1, Ordering::Release);
+        self.hlt_wait_queue.wake_all();
     }
 }
 

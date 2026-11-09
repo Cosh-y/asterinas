@@ -28,17 +28,37 @@ rm -rf "$ROOTFS" /tmp/kata-run.txt \
 
 mkdir -p "$ROOTFS/bin"
 
-SH=$(readlink -f /run/current-system/sw/bin/sh)
-mkdir -p "$ROOTFS$(dirname "$SH")"
-cp "$SH" "$ROOTFS$SH"
-cp "$SH" "$ROOTFS/bin/sh"
+copy_binary_with_deps() {
+  binary=$(readlink -f "$1")
+  destination=${2:-$binary}
 
-ldd "$SH" \
-  | sed -n 's/.*=> \(\/nix\/store\/[^ ]*\).*/\1/p; s/^[[:space:]]*\(\/nix\/store\/[^ ]*\).*/\1/p' \
-  | while read -r dep; do
-      mkdir -p "$ROOTFS$(dirname "$dep")"
-      cp "$dep" "$ROOTFS$dep"
-    done
+  mkdir -p "$ROOTFS$(dirname "$binary")" "$ROOTFS$(dirname "$destination")"
+  cp "$binary" "$ROOTFS$binary"
+  if [ "$destination" != "$binary" ]; then
+    cp "$binary" "$ROOTFS$destination"
+  fi
+
+  ldd "$binary" \
+    | sed -n 's/.*=> \(\/nix\/store\/[^ ]*\).*/\1/p; s/^[[:space:]]*\(\/nix\/store\/[^ ]*\).*/\1/p' \
+    | while read -r dep; do
+        mkdir -p "$ROOTFS$(dirname "$dep")"
+        cp "$dep" "$ROOTFS$dep"
+      done
+}
+
+SH=$(readlink -f /run/current-system/sw/bin/sh)
+copy_binary_with_deps "$SH" /bin/sh
+
+for name in ${KATA_ROOTFS_EXTRA_BINARIES:-}; do
+  binary=$(command -v "$name" 2>/dev/null || true)
+  if [ -z "$binary" ]; then
+    echo "extra rootfs binary not found: $name" | tee -a "$OUT_DIR/probe.log"
+    exit 1
+  fi
+  echo "extra rootfs binary: $name -> $(readlink -f "$binary")" \
+    | tee -a "$OUT_DIR/probe.log"
+  copy_binary_with_deps "$binary" "/bin/$name"
+done
 
 # PT_INTERP detection (no readelf on minimal NixOS) + lib/lib64 mirror.
 INTERP=$(LC_ALL=C tr '\0' '\n' < "$SH" 2>/dev/null | grep -m1 '/ld-linux' || true)

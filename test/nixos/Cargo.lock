@@ -332,6 +332,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-containerd-runc"
+version = "0.1.0"
+dependencies = [
+ "nixos-test-framework",
+]
+
+[[package]]
 name = "test-containerization-and-virtualization"
 version = "0.1.0"
 dependencies = [
@@ -382,6 +389,13 @@ dependencies = [
 
 [[package]]
 name = "test-hello"
+version = "0.1.0"
+dependencies = [
+ "nixos-test-framework",
+]
+
+[[package]]
+name = "test-kata-containerd"
 version = "0.1.0"
 dependencies = [
  "nixos-test-framework",

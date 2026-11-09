@@ -258,7 +258,12 @@ impl Vm {
             .lock()
             .get(&irq_level.irq)
             .cloned()
-            .unwrap_or([IrqRoute::Ioapic { pin: usize::try_from(irq_level.irq)? }].to_vec());
+            .unwrap_or(
+                [IrqRoute::Ioapic {
+                    pin: usize::try_from(irq_level.irq)?,
+                }]
+                .to_vec(),
+            );
 
         let mut delivered = false;
         for route in routes {
@@ -466,10 +471,7 @@ impl Vm {
         let delivery_mode = ((data >> 8) & 0x7) as u8;
         let trigger_mode = (data >> 15) & 1;
         let vector = (data & 0xff) as u8;
-        if delivery_mode != APIC_DELIVERY_MODE_FIXED
-            || trigger_mode != 0
-            || vector < 16
-        {
+        if delivery_mode != APIC_DELIVERY_MODE_FIXED || trigger_mode != 0 || vector < 16 {
             return_errno_with_message!(Errno::EINVAL, "unsupported MSI message");
         }
 
@@ -485,9 +487,17 @@ impl Vm {
         let vcpus = self.vcpus.lock().values().cloned().collect::<Vec<_>>();
         let mut delivered = false;
         for vcpu in vcpus {
-            let mut lapic = vcpu.lapic();
-            if icr_matches_destination(&lapic, &icr) {
-                lapic.add_pending_interrupt(vector, TriggerMode::Edge);
+            let matches = {
+                let mut lapic = vcpu.lapic();
+                if !icr_matches_destination(&lapic, &icr) {
+                    false
+                } else {
+                    lapic.add_pending_interrupt(vector, TriggerMode::Edge);
+                    true
+                }
+            };
+            if matches {
+                vcpu.notify_hlt_wakeup();
                 delivered = true;
             }
         }
@@ -515,6 +525,13 @@ impl Vm {
         let mut ioapic = self.ioapic.lock();
         let delivered =
             ioapic.set_pin_level(lapics.iter_mut().map(|lapic| &mut **lapic), pin, line_level);
+        drop(ioapic);
+        drop(lapics);
+        if delivered {
+            for vcpu in &vcpus {
+                vcpu.notify_hlt_wakeup();
+            }
+        }
         Ok(delivered)
     }
 
@@ -529,6 +546,13 @@ impl Vm {
                 continue;
             }
             ioapic.inject_irq_line(lapics.iter_mut().map(|lapic| &mut **lapic), pin);
+        }
+        drop(ioapic);
+        drop(lapics);
+        if redelivery_pins != 0 {
+            for vcpu in &vcpus {
+                vcpu.notify_hlt_wakeup();
+            }
         }
     }
 
@@ -579,6 +603,7 @@ impl Vm {
                     );
                 }
             }
+            vcpu.notify_hlt_wakeup();
         }
 
         Ok(())
